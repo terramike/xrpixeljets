@@ -1,15 +1,13 @@
-// server/index.js
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { randomUUID } from 'crypto';
 
-// ---------- Config ----------
-const PORT = process.env.PORT || 8787; // Render injects PORT
+// ---- Config ----
+const PORT = process.env.PORT || 8787;
 const HOST = '0.0.0.0';
 const ORIGINS = (process.env.ALLOW_ORIGIN || 'http://localhost:8000,https://mykeygo.io')
-  .split(',').map(s => s.trim()).filter(Boolean);
+  .split(',').map(s=>s.trim()).filter(Boolean);
 
-// ---------- App ----------
 const app = Fastify({ logger: true });
 
 await app.register(cors, {
@@ -18,21 +16,21 @@ await app.register(cors, {
     if (ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error('CORS not allowed: ' + origin), false);
   },
-  methods: ['GET','POST','OPTIONS'],
+  methods: ['GET','POST','OPTIONS']
 });
 
-// ---------- In-memory “DB” ----------
+// ---- In-memory store ----
 const profiles = Object.create(null);
 
 const DEFAULT_MS = {
   base:    { health: 20, energyCap: 100, regenPerMin: 1.0 },
   current: { health: 20, energyCap: 100, regenPerMin: 1.0 },
-  level:   { health: 0,  energyCap: 0,   regenPerMin: 0   },
+  level:   { health: 0,  energyCap: 0,   regenPerMin: 0 }
 };
 const DEFAULT_PCT = { hit: 0, crit: 10, dodge: 0 };
 
 function ensureProfile(address){
-  if (!profiles[address]) {
+  if (!profiles[address]){
     profiles[address] = {
       nonce: randomUUID().slice(0,8),
       jetFuel: 100,
@@ -40,48 +38,60 @@ function ensureProfile(address){
       energy: 100,
       ms: JSON.parse(JSON.stringify(DEFAULT_MS)),
       pct: { ...DEFAULT_PCT },
-      lastTick: Date.now(),
+      lastTick: Date.now()
     };
   }
   return profiles[address];
 }
+
 function tickEnergy(p){
   const now = Date.now();
   const dt = now - (p.lastTick || now);
   if (dt <= 0) return;
   const perSec = (p.ms.current.regenPerMin ?? 1) / 60;
-  p.energy = Math.min(p.energy + perSec * (dt/1000), p.ms.current.energyCap);
+  p.energy = Math.min(p.energy + perSec*(dt/1000), p.ms.current.energyCap);
   p.lastTick = now;
 }
-function authOrThrow(address, nonce){
+
+function auth(address, nonce){
   if (!address) { const e=new Error('missing address'); e.statusCode=400; throw e; }
   const p = ensureProfile(address);
   if (nonce && p.nonce !== nonce) { const e=new Error('bad nonce'); e.statusCode=401; throw e; }
   return p;
 }
-function toClientProfile(p){
+
+function profileOut(p){
   return {
     ms: p.ms,
     energy: Math.floor(p.energy),
     energyCap: p.ms.current.energyCap,
     unlockedLevel: p.unlockedLevel,
     jetFuel: p.jetFuel,
-    pct: p.pct,
+    pct: p.pct
   };
 }
-function upgradeCost(stat, lvNext){
-  switch(stat){
-    case 'health':      return 10 * lvNext * lvNext;
-    case 'energyCap':   return 12 * lvNext * lvNext;
-    case 'regenPerMin': return 15 * lvNext * lvNext;
-    case 'hit':         return 10 * lvNext * lvNext;
-    case 'crit':        return 14 * lvNext * lvNext;
-    case 'dodge':       return 12 * lvNext * lvNext;
-    default: return 9999;
-  }
+
+// ---- Costs/caps (aligned with client) ----
+// Start every stat at 100 JF and scale gently.
+function baseCost(stat){ return 100; }
+function costForLevel(stat, lvNext){
+  // lvNext is 1,2,3,... (the next level being purchased)
+  // gentle curve: base * lv^1.2 (rounded)
+  const cost = baseCost(stat) * Math.pow(lvNext, 1.2);
+  return Math.round(cost);
 }
 
-// ---------- Routes ----------
+// caps per your spec
+const CAPS = {
+  health: Infinity,       // no cap
+  energyCap: 450,
+  regenPerMin: 5.0,
+  hit: Infinity,
+  crit: Infinity,
+  dodge: 33               // 33% cap
+};
+
+// ---- Routes ----
 app.get('/', async ()=>({ ok:true, service:'XRPixelJets API' }));
 app.get('/health', async ()=>({ ok:true }));
 
@@ -89,7 +99,7 @@ app.post('/session/start', async (req, reply)=>{
   const { address } = req.body || {};
   if (!address) return reply.code(400).send({ error:'missing address' });
   const p = ensureProfile(address);
-  p.nonce = randomUUID().slice(0,8); // rotate per session
+  p.nonce = randomUUID().slice(0,8);
   return { nonce: p.nonce };
 });
 
@@ -98,63 +108,53 @@ app.get('/profile', async (req, reply)=>{
   if (!address) return reply.code(400).send({ error:'missing address' });
   const p = ensureProfile(address);
   tickEnergy(p);
-  return toClientProfile(p);
+  return profileOut(p);
 });
 
-// Reserve 10 energy to start battle
 app.post('/battle/start', async (req, reply)=>{
   const { address, nonce } = req.body || {};
-  try {
-    const p = authOrThrow(address, nonce);
+  try{
+    const p = auth(address, nonce);
     tickEnergy(p);
-    if (Math.floor(p.energy) < 10) {
+    if (Math.floor(p.energy) < 10)
       return reply.code(400).send({ error:'insufficient energy', need:10, have: Math.floor(p.energy) });
-    }
     p.energy -= 10;
     return { ok:true, energy: Math.floor(p.energy) };
-  } catch(e){
+  }catch(e){
     return reply.code(e.statusCode||400).send({ error: e.message||'bad request' });
   }
 });
 
-// Finish battle: apply rewards; if client omits, compute sane defaults
 app.post('/battle/finish', async (req, reply)=>{
-  const { address, nonce, win, wave, turns, rewardJF, energyRefill } = req.body || {};
-  try {
-    const p = authOrThrow(address, nonce);
+  const { address, nonce, win, wave, rewardJF, energyRefill } = req.body || {};
+  try{
+    const p = auth(address, nonce);
     tickEnergy(p);
 
     const w = Math.max(1, Math.floor(wave ?? 1));
-    // default rewards: base 100 JF, +1% per wave after 5, min refill 3-9(win) / 1-2(loss)
     const scale = w <= 5 ? 1 : 1 + 0.01*(w-5);
-    const jfAward = Number.isFinite(rewardJF) ? Math.max(0, Math.floor(rewardJF)) : Math.floor(100 * scale);
-    const refill  = Number.isFinite(energyRefill)
-      ? Math.max(0, Math.floor(energyRefill))
-      : (win ? (3 + Math.floor(Math.random()*7)) : (1 + Math.floor(Math.random()*2)));
+    const jf = Number.isFinite(rewardJF) ? Math.max(0, Math.floor(rewardJF)) : Math.floor(100 * scale);
+    const ef = Number.isFinite(energyRefill) ? Math.max(0, Math.floor(energyRefill))
+             : (win ? (3 + Math.floor(Math.random()*7)) : (1 + Math.floor(Math.random()*2)));
 
-    if (win) {
-      p.jetFuel += jfAward;
-      p.energy  = Math.min(p.energy + refill, p.ms.current.energyCap);
+    if (win){
+      p.jetFuel += jf;
+      p.energy = Math.min(p.energy + ef, p.ms.current.energyCap);
       if (w > p.unlockedLevel) p.unlockedLevel = w;
-    } else {
-      p.energy  = Math.min(p.energy + refill, p.ms.current.energyCap);
+    }else{
+      p.energy = Math.min(p.energy + ef, p.ms.current.energyCap);
     }
 
-    return reply.send({
-      ok: true,
-      award: { jetFuel: jfAward, energy: refill, wave: w },
-      profile: toClientProfile(p),
-    });
-  } catch(e){
+    return reply.send({ ok:true, award:{ jetFuel:jf, energy:ef, wave:w }, profile: profileOut(p) });
+  }catch(e){
     return reply.code(e.statusCode||400).send({ error: e.message||'bad request' });
   }
 });
 
-// Apply upgrades (queued)
 app.post('/ms/upgrade', async (req, reply)=>{
   const { address, nonce, ops } = req.body || {};
-  try {
-    const p = authOrThrow(address, nonce);
+  try{
+    const p = auth(address, nonce);
     tickEnergy(p);
 
     const apply = {
@@ -163,85 +163,83 @@ app.post('/ms/upgrade', async (req, reply)=>{
       regenPerMin: Math.max(0, ops?.regenPerMin|0),
       hit:         Math.max(0, ops?.hit|0),
       crit:        Math.max(0, ops?.crit|0),
-      dodge:       Math.max(0, ops?.dodge|0),
+      dodge:       Math.max(0, ops?.dodge|0)
     };
 
-    // compute progressive cost
-    let cost = 0;
-    const nextLv = {
-      health:      p.ms.level.health + 1,
-      energyCap:   p.ms.level.energyCap + 1,
+    // progressive cost per-stat using next levels
+    let totalCost = 0;
+    const next = {
+      health: p.ms.level.health + 1,
+      energyCap: p.ms.level.energyCap + 1,
       regenPerMin: p.ms.level.regenPerMin + 1,
-      hit:         (p.pct.hitLevel   || 0) + 1,
-      crit:        (p.pct.critLevel  || 0) + 1,
-      dodge:       (p.pct.dodgeLevel || 0) + 1,
+      hit: (p.pct.hitLevel||0) + 1,
+      crit: (p.pct.critLevel||0) + 1,
+      dodge: (p.pct.dodgeLevel||0) + 1
     };
-    const addCost=(stat,times)=>{ for(let i=0;i<times;i++){ cost += upgradeCost(stat, nextLv[stat]); nextLv[stat]++; } };
-    addCost('health', apply.health);
-    addCost('energyCap', apply.energyCap);
-    addCost('regenPerMin', apply.regenPerMin);
-    addCost('hit', apply.hit);
-    addCost('crit', apply.crit);
-    addCost('dodge', apply.dodge);
+    const add = (stat, times)=>{ for(let i=0;i<times;i++){ totalCost += costForLevel(stat, next[stat]); next[stat]++; } };
+    add('health', apply.health);
+    add('energyCap', apply.energyCap);
+    add('regenPerMin', apply.regenPerMin);
+    add('hit', apply.hit);
+    add('crit', apply.crit);
+    add('dodge', apply.dodge);
 
-    if (p.jetFuel < cost) return reply.code(400).send({ error:'insufficient JetFuel', need: cost, have: p.jetFuel });
+    if (p.jetFuel < totalCost) return reply.code(400).send({ error:'insufficient JetFuel', need: totalCost, have: p.jetFuel });
 
-    p.jetFuel -= cost;
+    // Deduct and apply (report the exact spend for this Apply click)
+    p.jetFuel -= totalCost;
 
-    // apply base stats (your requested small steps)
     if (apply.health){
       p.ms.level.health += apply.health;
-      p.ms.current.health = Math.min(p.ms.current.health + (1 * apply.health), 90);
+      p.ms.current.health = Math.min(p.ms.current.health + (1 * apply.health), CAPS.health);
     }
     if (apply.energyCap){
       p.ms.level.energyCap += apply.energyCap;
-      p.ms.current.energyCap = Math.min(p.ms.current.energyCap + (2 * apply.energyCap), 450);
+      p.ms.current.energyCap = Math.min(p.ms.current.energyCap + (2 * apply.energyCap), CAPS.energyCap);
       p.energy = Math.min(p.energy, p.ms.current.energyCap);
     }
     if (apply.regenPerMin){
       p.ms.level.regenPerMin += apply.regenPerMin;
       p.ms.current.regenPerMin = Math.min(
-        Math.round((p.ms.current.regenPerMin + 0.1 * apply.regenPerMin) * 10) / 10,
-        5.0
+        Math.round((p.ms.current.regenPerMin + 0.1 * apply.regenPerMin) * 10)/10,
+        CAPS.regenPerMin
       );
     }
-    // pct stats (+1% per level)
-    if (apply.hit){   p.pct.hitLevel   = (p.pct.hitLevel   || 0) + apply.hit;   p.pct.hit   = Math.min(100, p.pct.hit   + 1 * apply.hit); }
-    if (apply.crit){  p.pct.critLevel  = (p.pct.critLevel  || 0) + apply.crit;  p.pct.crit  = Math.min(100, p.pct.crit  + 1 * apply.crit); }
-    if (apply.dodge){ p.pct.dodgeLevel = (p.pct.dodgeLevel || 0) + apply.dodge; p.pct.dodge = Math.min(90,  p.pct.dodge + 1 * apply.dodge); }
+    if (apply.hit){
+      p.pct.hitLevel = (p.pct.hitLevel||0) + apply.hit;
+      p.pct.hit = Math.min(100, (p.pct.hit||0) + 1*apply.hit);
+    }
+    if (apply.crit){
+      p.pct.critLevel = (p.pct.critLevel||0) + apply.crit;
+      p.pct.crit = (p.pct.crit||0) + 1*apply.crit; // no cap
+    }
+    if (apply.dodge){
+      p.pct.dodgeLevel = (p.pct.dodgeLevel||0) + apply.dodge;
+      p.pct.dodge = Math.min(CAPS.dodge, (p.pct.dodge||0) + 1*apply.dodge);
+    }
 
-    // friendly labels for the client log
-    const labels = {
-      health:'HP', energyCap:'ENERGY', regenPerMin:'REGEN',
-      hit:'HIT', crit:'CRIT', dodge:'DODGE'
-    };
-    const appliedPretty = Object.fromEntries(Object.entries(apply).filter(([_,v])=>v>0).map(([k,v])=>[labels[k]||k, v]));
+    const labels = { health:'HP', energyCap:'ENERGY', regenPerMin:'REGEN', hit:'HIT', crit:'CRIT', dodge:'DODGE' };
+    const pretty = Object.fromEntries(Object.entries(apply).filter(([_,v])=>v>0).map(([k,v])=>[labels[k], v]));
 
-    return reply.send({
-      ok: true,
-      applied: appliedPretty, // e.g. { REGEN:1, ENERGY:1 }
-      cost,
-      profile: toClientProfile(p),
-    });
-  } catch(e){
+    return reply.send({ ok:true, applied: pretty, spent: totalCost, profile: profileOut(p) });
+  }catch(e){
     return reply.code(e.statusCode||400).send({ error: e.message||'bad request' });
   }
 });
 
-// server-side regen tick
+// server regen
 setInterval(()=>{
   const now = Date.now();
-  for(const addr of Object.keys(profiles)){
+  for (const addr of Object.keys(profiles)){
     const p = profiles[addr];
     const dt = now - (p.lastTick || now);
     if (dt <= 0){ p.lastTick = now; continue; }
-    const perSec = (p.ms.current.regenPerMin ?? 1) / 60;
+    const perSec = (p.ms.current.regenPerMin ?? 1)/60;
     p.energy = Math.min(p.energy + perSec*(dt/1000), p.ms.current.energyCap);
     p.lastTick = now;
   }
 }, 1000);
 
-// start
 app.listen({ port: PORT, host: HOST }).then(()=>{
   app.log.info(`API listening on http://${HOST}:${PORT}`);
   app.log.info(`Allowed origins: ${ORIGINS.join(', ')}`);
