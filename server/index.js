@@ -1,9 +1,10 @@
+// server/index.js
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
-import { randomUUID } from 'uuid';
+import { randomUUID } from 'crypto'; // ✅ built-in in Node 16+
 
 // ---------- Config ----------
-const PORT = process.env.PORT || 8787;        // Render injects PORT
+const PORT = process.env.PORT || 8787; // Render injects PORT
 const HOST = '0.0.0.0';
 const ORIGINS = (process.env.ALLOW_ORIGIN || 'http://localhost:8000,https://mykeygo.io')
   .split(',')
@@ -15,7 +16,7 @@ const app = Fastify({ logger: true });
 
 await app.register(cors, {
   origin: (origin, cb) => {
-    // allow no-origin (curl, health checks), or exact matches
+    // allow no-origin (Render health checks, curl) or exact matches
     if (!origin) return cb(null, true);
     if (ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error('CORS not allowed: ' + origin), false);
@@ -28,15 +29,12 @@ await app.register(cors, {
 /**
  * profiles[address] = {
  *   nonce, jetFuel, unlockedLevel,
- *   energy, energyCap, regenPerMin,
- *   ms: { base, current, level },
- *   pct: { hit, crit, dodge },
- *   lastTick: epoch ms
+ *   energy, ms:{base,current,level}, pct:{hit,crit,dodge},
+ *   lastTick
  * }
  */
 const profiles = Object.create(null);
 
-// defaults
 const DEFAULT_MS = {
   base: { health: 20, energyCap: 100, regenPerMin: 1.0 },
   current: { health: 20, energyCap: 100, regenPerMin: 1.0 },
@@ -44,16 +42,13 @@ const DEFAULT_MS = {
 };
 const DEFAULT_PCT = { hit: 0, crit: 10, dodge: 0 };
 
-// ---------- Helpers ----------
 function ensureProfile(address) {
   if (!profiles[address]) {
     profiles[address] = {
       nonce: randomUUID().slice(0, 8),
-      jetFuel: 100,               // starter JF
-      unlockedLevel: 5,           // first 5 missions unlocked
+      jetFuel: 100,
+      unlockedLevel: 5,
       energy: 100,
-      energyCap: 100,
-      regenPerMin: 1.0,
       ms: JSON.parse(JSON.stringify(DEFAULT_MS)),
       pct: { ...DEFAULT_PCT },
       lastTick: Date.now()
@@ -66,23 +61,20 @@ function tickEnergy(p) {
   const now = Date.now();
   const dtMs = now - (p.lastTick || now);
   if (dtMs <= 0) return;
-  const perSec = (p.ms.current.regenPerMin ?? p.regenPerMin ?? 1) / 60;
+  const perSec = (p.ms.current.regenPerMin ?? 1) / 60;
   const gained = perSec * (dtMs / 1000);
   p.energy = Math.min(p.energy + gained, p.ms.current.energyCap);
   p.lastTick = now;
 }
 
 function authOrThrow(address, nonce) {
-  if (!address) throw new Error('missing address');
+  if (!address) { const e = new Error('missing address'); e.statusCode = 400; throw e; }
   const p = ensureProfile(address);
-  if (nonce && p.nonce !== nonce) {
-    const e = new Error('bad nonce'); e.statusCode = 401; throw e;
-  }
+  if (nonce && p.nonce !== nonce) { const e = new Error('bad nonce'); e.statusCode = 401; throw e; }
   return p;
 }
 
 function toClientProfile(p) {
-  // round energy to integer for the client
   return {
     ms: p.ms,
     energy: Math.floor(p.energy),
@@ -94,7 +86,6 @@ function toClientProfile(p) {
 }
 
 function upgradeCost(stat, lvNext) {
-  // simple curves; adjust freely later
   switch (stat) {
     case 'health':     return 10 * lvNext * lvNext;
     case 'energyCap':  return 12 * lvNext * lvNext;
@@ -110,17 +101,14 @@ function upgradeCost(stat, lvNext) {
 app.get('/', async () => ({ ok: true, service: 'XRPixelJets API' }));
 app.get('/health', async () => ({ ok: true }));
 
-// Start / bind a session (mock “login”)
 app.post('/session/start', async (req, reply) => {
   const { address } = req.body || {};
   if (!address) return reply.code(400).send({ error: 'missing address' });
   const p = ensureProfile(address);
-  // rotate nonce each start to mirror signature challenge style
-  p.nonce = randomUUID().slice(0, 8);
+  p.nonce = randomUUID().slice(0, 8); // rotate
   return { nonce: p.nonce };
 });
 
-// Authoritative profile
 app.get('/profile', async (req, reply) => {
   const { address } = req.query || {};
   if (!address) return reply.code(400).send({ error: 'missing address' });
@@ -129,7 +117,6 @@ app.get('/profile', async (req, reply) => {
   return toClientProfile(p);
 });
 
-// Battle start: reserve energy 10
 app.post('/battle/start', async (req, reply) => {
   const { address, nonce } = req.body || {};
   try {
@@ -145,33 +132,26 @@ app.post('/battle/start', async (req, reply) => {
   }
 });
 
-// Battle finish: apply rewards
 app.post('/battle/finish', async (req, reply) => {
-  const { address, nonce, win, wave, turns, rewardJF, energyRefill } = req.body || {};
+  const { address, nonce, win, wave, rewardJF, energyRefill } = req.body || {};
   try {
     const p = authOrThrow(address, nonce);
     tickEnergy(p);
-
-    // basic sanity
     const jf = Math.max(0, Math.floor(rewardJF ?? 0));
     const refill = Math.max(0, Math.floor(energyRefill ?? 0));
-
     if (win) {
       p.jetFuel += jf;
       p.energy = Math.min(p.energy + refill, p.ms.current.energyCap);
-      // unlock next wave if > current unlocked
       if (wave && wave > p.unlockedLevel) p.unlockedLevel = wave;
     } else {
       p.energy = Math.min(p.energy + refill, p.ms.current.energyCap);
     }
-
     return { ok: true, profile: toClientProfile(p) };
   } catch (e) {
     return reply.code(e.statusCode || 400).send({ error: e.message || 'bad request' });
   }
 });
 
-// Upgrades (queued ops)
 app.post('/ms/upgrade', async (req, reply) => {
   const { address, nonce, ops } = req.body || {};
   try {
@@ -187,7 +167,6 @@ app.post('/ms/upgrade', async (req, reply) => {
       dodge: Math.max(0, ops?.dodge|0),
     };
 
-    // compute total cost using per-stat next levels
     let cost = 0;
     const nextLv = {
       health: p.ms.level.health + 1,
@@ -197,12 +176,8 @@ app.post('/ms/upgrade', async (req, reply) => {
       crit: (p.pct.critLevel || 0) + 1,
       dodge: (p.pct.dodgeLevel || 0) + 1
     };
-
     const addCost = (stat, times) => {
-      for (let i = 0; i < times; i++) {
-        cost += upgradeCost(stat, nextLv[stat]);
-        nextLv[stat] += 1;
-      }
+      for (let i = 0; i < times; i++) { cost += upgradeCost(stat, nextLv[stat]); nextLv[stat]++; }
     };
     addCost('health', apply.health);
     addCost('energyCap', apply.energyCap);
@@ -211,22 +186,17 @@ app.post('/ms/upgrade', async (req, reply) => {
     addCost('crit', apply.crit);
     addCost('dodge', apply.dodge);
 
-    if (p.jetFuel < cost) {
-      return reply.code(400).send({ error: 'insufficient JetFuel', need: cost, have: p.jetFuel });
-    }
+    if (p.jetFuel < cost) return reply.code(400).send({ error: 'insufficient JetFuel', need: cost, have: p.jetFuel });
 
-    // deduct JetFuel
     p.jetFuel -= cost;
 
-    // apply base stat upgrades (small steps as requested)
     if (apply.health) {
       p.ms.level.health += apply.health;
-      p.ms.current.health = Math.min(p.ms.current.health + (1 * apply.health), 90); // cap example
+      p.ms.current.health = Math.min(p.ms.current.health + (1 * apply.health), 90);
     }
     if (apply.energyCap) {
       p.ms.level.energyCap += apply.energyCap;
       p.ms.current.energyCap = Math.min(p.ms.current.energyCap + (2 * apply.energyCap), 450);
-      // clamp energy to new cap
       p.energy = Math.min(p.energy, p.ms.current.energyCap);
     }
     if (apply.regenPerMin) {
@@ -237,23 +207,17 @@ app.post('/ms/upgrade', async (req, reply) => {
       );
     }
 
-    // apply pct upgrades
-    if (apply.hit)   { p.pct.hitLevel = (p.pct.hitLevel || 0) + apply.hit;   p.pct.hit   = Math.min(100, p.pct.hit   + 1 * apply.hit); }
-    if (apply.crit)  { p.pct.critLevel= (p.pct.critLevel|| 0) + apply.crit;  p.pct.crit  = Math.min(100, p.pct.crit  + 1 * apply.crit); }
-    if (apply.dodge) { p.pct.dodgeLevel=(p.pct.dodgeLevel||0)+ apply.dodge;  p.pct.dodge = Math.min(90,  p.pct.dodge + 1 * apply.dodge); }
+    if (apply.hit)   { p.pct.hitLevel   = (p.pct.hitLevel   || 0) + apply.hit;   p.pct.hit   = Math.min(100, p.pct.hit   + 1 * apply.hit); }
+    if (apply.crit)  { p.pct.critLevel  = (p.pct.critLevel  || 0) + apply.crit;  p.pct.crit  = Math.min(100, p.pct.crit  + 1 * apply.crit); }
+    if (apply.dodge) { p.pct.dodgeLevel = (p.pct.dodgeLevel || 0) + apply.dodge; p.pct.dodge = Math.min(90,  p.pct.dodge + 1 * apply.dodge); }
 
-    return reply.send({
-      ok: true,
-      applied: apply,
-      cost,
-      profile: toClientProfile(p)
-    });
+    return reply.send({ ok: true, applied: apply, cost, profile: toClientProfile(p) });
   } catch (e) {
     return reply.code(e.statusCode || 400).send({ error: e.message || 'bad request' });
   }
 });
 
-// ---------- Regen ticker (server side) ----------
+// ---------- Regen ticker ----------
 setInterval(() => {
   const now = Date.now();
   for (const addr of Object.keys(profiles)) {
