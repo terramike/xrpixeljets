@@ -1,0 +1,49 @@
+:root{
+  --bg:#0a0f1a; --panel:#0f1627; --border:#2a3757; --accent:#49f3ff;
+  --good:#41ff93; --bad:#ff5a8a; --text:#e9f1ff;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:"Press Start 2P",monospace;letter-spacing:.3px}
+.wrap{max-width:820px;margin:12px auto;padding:0 10px}
+#game-root{width:800px;height:600px;margin:0 auto;border:2px solid var(--border);border-radius:10px;overflow:hidden;background:#000;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.panel{width:800px;margin:10px auto;background:linear-gradient(180deg,rgba(39,60,95,.25),rgba(15,21,34,.7));border:2px solid var(--border);border-radius:12px;padding:10px}
+h1{font-size:18px;margin:0 0 10px;color:var(--accent)}
+.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+button,select{font-family:"Press Start 2P",monospace;font-size:12px;padding:8px 10px;border:2px solid var(--border);border-radius:8px;background:#0f1627;color:var(--text);cursor:pointer}
+button:hover{border-color:var(--accent)}
+.tiny{font-size:10px;opacity:.85}
+.muted{opacity:.8}
+.badge{font-size:10px;padding:2px 6px;border:1px solid var(--border);border-radius:6px}
+.energybar{height:16px;width:100%;background:#0a1223;border:2px solid var(--border);border-radius:8px;overflow:hidden}
+.energyfill{height:100%;width:0%;background:linear-gradient(90deg,#44ccff,#41ff93);transition:width .3s}
+.hpbar{height:12px;width:100%;background:#0a1223;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.youfill{height:100%;width:100%;background:linear-gradient(90deg,#41ff93,#44ccff)}
+.enemyfill{height:100%;width:100%;background:linear-gradient(90deg,#ff6a8a,#ffb3c4)}
+.selector{background:#0f1627;border:2px solid var(--border);border-radius:10px;padding:10px}
+.selector h3{margin:0 0 8px;font-size:12px;color:var(--accent)}
+
+/* Bigger cards: 4 columns, larger image */
+.jet-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;max-height:300px;overflow:auto}
+.jet-card{border:1px solid var(--border);border-radius:10px;padding:8px;text-align:left;background:#0b1326;display:flex;flex-direction:column;gap:6px}
+.jet-card img{width:100%;height:120px;object-fit:contain;image-rendering:pixelated;background:#000;border-radius:8px}
+.jet-name{font-size:10px}
+.jet-stats{font-size:10px;opacity:.9}
+.guns{font-size:10px;color:#aad7ff}
+.jet-actions{display:flex;gap:6px;justify-content:space-between}
+
+.pick-row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.pick{flex:1;min-height:60px;border:1px dashed var(--border);border-radius:8px;padding:6px;display:flex;align-items:center;gap:6px}
+.pick img{width:58px;height:58px;object-fit:contain;image-rendering:pixelated}
+#hud{display:grid;grid-template-columns:1fr;gap:8px}
+#hud .row-tight{gap:6px}
+#log{height:160px;overflow:auto;background:#061024;border:2px solid var(--border);border-radius:8px;padding:8px;font-size:11px}
+
+/* Squad stats card */
+.squad-card{margin-top:6px;border:1px solid var(--border);border-radius:10px;padding:8px;background:#0b142b}
+.squad-card h4{margin:0 0 6px;font-size:12px;color:var(--accent)}
+.statline{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.pill{display:flex;align-items:center;justify-content:space-between;background:#0f1838;border:1px solid var(--border);border-radius:10px;padding:6px 8px}
+.pill .k{font-size:10px;opacity:.8}
+.pill .v{font-size:13px}
+.synergy-ok{color:var(--good)}
+.synergy-bad{opacity:.7}

@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>XRPixel Jets: Mothership Mode</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Font -->
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <!-- Phaser -->
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
+
+  <style>
+    :root{
+      --bg:#0b0f1a; --panel:#0f1524; --line:#2a3550;
+      --ink:#e6f3ff; --muted:#9db0c4; --good:#65f0a0; --bad:#ff6e86; --accent:#49f3ff;
+    }
+    *{ box-sizing:border-box }
+    html,body{ margin:0; background:var(--bg); color:var(--ink); font-family:"Press Start 2P", monospace }
+    a{ color:var(--accent); text-decoration:none }
+
+    .wrap{ max-width:800px; margin:8px auto 64px; padding:0 8px }
+    #game-root{ width:100%; height:600px; margin:0 auto; border:1px solid var(--line); background:#000; border-radius:10px }
+
+    /* stacked UI (tight) */
+    .stack{ display:flex; flex-direction:column; gap:6px; margin-top:8px }
+    .box{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:6px }
+    .row{ display:flex; gap:6px; align-items:center }
+    .row.wrap{ flex-wrap:wrap }
+    .col{ display:flex; flex-direction:column; gap:4px }
+
+    .tiny{ font-size:10px; line-height:1.2; color:var(--muted) }
+    h4{ margin:0 0 4px 0; font-size:12px }
+
+    /* pills & buttons */
+    .pill{ display:inline-flex; gap:6px; align-items:center; background:#0b1120; border:1px solid var(--line); border-radius:8px; padding:4px 6px }
+    .k{ color:var(--muted) } .v{ color:var(--ink) }
+    button{ font-family:inherit; font-size:11px; background:#10182a; color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:6px 8px; cursor:pointer }
+    button.primary{ background:linear-gradient(180deg,#1a2440,#121a30) }
+    button:disabled{ opacity:.5; cursor:not-allowed }
+    .danger{ color:#ff9aa3; background:#16111a; border-color:#4f2a3a }
+
+    /* bars */
+    .bar{ position:relative; height:12px; border:1px solid var(--line); border-radius:7px; background:#091020; overflow:hidden }
+    .fill{ position:absolute; left:0; top:0; bottom:0; width:0%; transition:width .25s ease }
+    .energyfill{ background:linear-gradient(90deg,#3de1ff,#49f3ff) }
+    .youfill{ background:linear-gradient(90deg,#65f0a0,#38e48e) }
+    .enemyfill{ background:linear-gradient(90deg,#ff99ab,#ff6e86) }
+
+    /* log */
+    #log{ height:130px; overflow:auto; background:#0b1120; border:1px solid var(--line); border-radius:8px; padding:6px }
+    .log-line{ margin:2px 0; font-size:11px }
+    .log-line.good{ color:var(--good) }
+    .log-line.bad{ color:var(--bad) }
+
+    /* jets grid — HARD image cap */
+    .jet-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(84px,1fr)); gap:6px }
+    .jet-tile{ background:#0f1729; border:1px solid var(--line); border-radius:8px; padding:5px; cursor:pointer }
+    .jet-grid img,
+    #jet-grid img,
+    #jets img{
+      width:100% !important;
+      height:66px !important;
+      max-height:66px !important;
+      object-fit:contain !important;
+      image-rendering:pixelated;
+      display:block;
+    }
+
+    /* selected cards — HARD cap */
+    #squad-cards{ display:grid; grid-template-columns:1fr 1fr; gap:8px; width:100% }
+    #squad-cards .card{ background:#0b1120; border:1px solid var(--line); border-radius:8px; padding:6px; display:flex; gap:8px; align-items:center }
+    #squad-cards img{
+      width:54px !important;
+      height:54px !important;
+      max-height:54px !important;
+      object-fit:contain !important;
+      image-rendering:pixelated;
+      display:block;
+    }
+
+    /* subtle divider inside MS box */
+    .sep{ height:1px; background:#13203a; border-radius:1px; margin:2px 0 }
+    .ms-section{ display:flex; gap:6px; align-items:center; flex-wrap:wrap }
+    .ms-compact{ display:flex; gap:6px; align-items:center; flex-wrap:wrap; justify-content:space-between }
+    .grow{ flex:1 }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <!-- Phaser Canvas -->
+    <div id="game-root"></div>
+
+    <div class="stack">
+      <!-- A) Mission + battle buttons -->
+      <div class="box row wrap">
+        <div class="row">
+          <label class="tiny">Mission</label>
+          <select id="sel-mission"></select>
+        </div>
+        <div class="row" style="margin-left:auto">
+          <button id="btn-start" class="primary">Start (10⚡)</button>
+          <button id="btn-next">Next Turn (1⚡)</button>
+          <button id="btn-restart">Restart</button>
+        </div>
+      </div>
+
+      <!-- B) Energy + HP (compact farming cluster) -->
+      <div class="box col">
+        <div class="row">
+          <div class="tiny" style="min-width:56px">Energy ⚡</div>
+          <div class="bar" style="flex:1"><div class="fill energyfill"></div></div>
+          <div id="energy-text" class="tiny">Energy ⚡: —/— +0/min</div>
+        </div>
+        <div class="row">
+          <div class="tiny" style="min-width:56px">You ❤️</div>
+          <div class="bar" style="flex:1"><div class="fill youfill"></div></div>
+          <div id="you-hp-text" class="tiny">—/—</div>
+        </div>
+        <div class="row">
+          <div class="tiny" style="min-width:56px">Enemy ❤️</div>
+          <div class="bar" style="flex:1"><div class="fill enemyfill"></div></div>
+          <div id="enemy-hp-text" class="tiny">—/—</div>
+        </div>
+      </div>
+
+      <!-- C) Combat log directly under bars -->
+      <div class="box"><div id="log"></div></div>
+
+      <!-- D) Mothership box — reorganized & compact -->
+      <div class="box col">
+        <!-- 1) Name + core stats -->
+        <div class="ms-section">
+          <span class="pill"><span class="k">Mothership</span><span id="ms-name" class="v">Starter Mothership</span></span>
+          <span class="pill"><span class="k">HP ❤️</span><span id="ms-health" class="v">—</span></span>
+          <span class="pill"><span class="k">ENERGY ⚡</span><span id="ms-cap" class="v">—</span></span>
+          <span class="pill"><span class="k">REGEN 🔌</span><span id="ms-regen" class="v">—</span></span>
+          <span class="pill"><span class="k">JetFuel 🚀</span><span id="jetfuel" class="v">0</span></span>
+        </div>
+
+        <!-- 2) Upgrades row (buttons + queue + total) -->
+        <div class="ms-compact">
+          <div class="row wrap">
+            <button id="btn-up-hp">+ HP ❤️</button>
+            <button id="btn-up-cap">+ ENERGY ⚡</button>
+            <button id="btn-up-reg">+ REGEN 🔌</button>
+            <button id="btn-up-hit">+ HIT%</button>
+            <button id="btn-up-crit">+ CRIT%</button>
+            <button id="btn-up-dodge">+ DODGE%</button>
+          </div>
+          <div class="row tiny" style="margin-left:auto">
+            <span>Queued → HP:<span id="q-hp">0</span> ENERGY:<span id="q-cap">0</span> REGEN:<span id="q-reg">0</span> HIT:<span id="q-hit">0</span> CRIT:<span id="q-crit">0</span> DODGE:<span id="q-dodge">0</span></span>
+            <span style="margin-left:10px">Total Cost: <span id="q-cost">0</span> JF 🚀</span>
+          </div>
+        </div>
+
+        <!-- 3) Percent readouts + Apply/Clear -->
+        <div class="ms-compact">
+          <div class="row wrap">
+            <span class="pill"><span class="k">HIT</span><span id="ms-hit" class="v">0%</span></span>
+            <span class="pill"><span class="k">CRIT</span><span id="ms-crit" class="v">10%</span></span>
+            <span class="pill"><span class="k">DODGE</span><span id="ms-dodge" class="v">0%</span></span>
+          </div>
+          <div class="row" style="margin-left:auto">
+            <button id="btn-apply" class="primary">Apply Upgrades</button>
+            <button id="btn-clear-q" class="danger">Clear</button>
+          </div>
+        </div>
+
+        <div class="sep"></div>
+
+        <!-- 4) Selected Main/Wing cards — compact two-up grid -->
+        <div id="squad-cards"></div>
+      </div>
+
+      <!-- E) Squad stats -->
+      <div class="box col">
+        <h4>Squad Stats –</h4>
+        <div class="row wrap">
+          <span class="pill"><span class="k">Attack</span> <span id="sq-atk" class="v">—</span></span>
+          <span class="pill"><span class="k">Speed</span>  <span id="sq-spd" class="v">—</span></span>
+          <span class="pill"><span class="k">Defense</span><span id="sq-def" class="v">—</span></span>
+          <span class="pill"><span class="k">Synergy</span><span id="sq-syn" class="v">—</span></span>
+          <span class="tiny" style="margin-left:auto">Set: <span id="squad-detail">—</span></span>
+        </div>
+        <div class="tiny">Solo bonus: +50% ATK, +20% SPD</div>
+      </div>
+
+      <!-- F) Jet selection (Connect Wallet here) -->
+      <div class="box col">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <h4 style="margin:0">Your Jets</h4>
+          <button id="btn-connect" class="primary">Connect Wallet (mock)</button>
+        </div>
+        <div id="jet-grid" class="jet-grid"></div>
+        <div id="jets" class="jet-grid"></div>
+        <div class="row" style="justify-content:flex-end;margin-top:2px">
+          <button id="btn-clear-wing" class="danger">Clear Wingman</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modular scripts (unchanged IDs) -->
+  <script type="module" src="js/constants.js"></script>
+  <script type="module" src="js/state.js"></script>
+  <script type="module" src="js/utils.js"></script>
+  <script type="module" src="js/time.js"></script>
+  <script type="module" src="js/missions.js"></script>
+  <script type="module" src="js/mothership.js"></script>
+  <script type="module" src="js/jets.js"></script>
+  <script type="module" src="js/serverApi.js"></script>
+  <script type="module" src="js/ui.js"></script>
+  <script type="module" src="js/scene.js"></script>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
