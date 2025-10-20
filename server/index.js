@@ -71,25 +71,12 @@ function profileOut(p){
   };
 }
 
-// ---- Costs/caps (aligned with client) ----
-// Start every stat at 100 JF and scale gently.
-function baseCost(stat){ return 100; }
+// ---- Costs/caps (match client) ----
+function baseCost(){ return 100; }
 function costForLevel(stat, lvNext){
-  // lvNext is 1,2,3,... (the next level being purchased)
-  // gentle curve: base * lv^1.2 (rounded)
-  const cost = baseCost(stat) * Math.pow(lvNext, 1.2);
-  return Math.round(cost);
+  return Math.round(baseCost(stat) * Math.pow(lvNext, 1.2));
 }
-
-// caps per your spec
-const CAPS = {
-  health: Infinity,       // no cap
-  energyCap: 450,
-  regenPerMin: 5.0,
-  hit: Infinity,
-  crit: Infinity,
-  dodge: 33               // 33% cap
-};
+const CAPS = { health: Infinity, energyCap: 450, regenPerMin: 5.0, hit: Infinity, crit: Infinity, dodge: 33 };
 
 // ---- Routes ----
 app.get('/', async ()=>({ ok:true, service:'XRPixelJets API' }));
@@ -111,6 +98,7 @@ app.get('/profile', async (req, reply)=>{
   return profileOut(p);
 });
 
+// Reserve 10 energy at start
 app.post('/battle/start', async (req, reply)=>{
   const { address, nonce } = req.body || {};
   try{
@@ -125,17 +113,37 @@ app.post('/battle/start', async (req, reply)=>{
   }
 });
 
+// NEW: per-turn energy deduction (1 ⚡)
+app.post('/battle/turn', async (req, reply)=>{
+  const { address, nonce } = req.body || {};
+  try{
+    const p = auth(address, nonce);
+    tickEnergy(p);
+    if (Math.floor(p.energy) < 1)
+      return reply.code(400).send({ error:'insufficient energy', need:1, have: Math.floor(p.energy) });
+    p.energy -= 1;
+    return { ok:true, energy: Math.floor(p.energy) };
+  }catch(e){
+    return reply.code(e.statusCode||400).send({ error: e.message||'bad request' });
+  }
+});
+
+// Finish battle: apply rewards (JF + energy refill)
 app.post('/battle/finish', async (req, reply)=>{
-  const { address, nonce, win, wave, rewardJF, energyRefill } = req.body || {};
+  const { address, nonce, win, wave, turns } = req.body || {};
   try{
     const p = auth(address, nonce);
     tickEnergy(p);
 
     const w = Math.max(1, Math.floor(wave ?? 1));
-    const scale = w <= 5 ? 1 : 1 + 0.01*(w-5);
-    const jf = Number.isFinite(rewardJF) ? Math.max(0, Math.floor(rewardJF)) : Math.floor(100 * scale);
-    const ef = Number.isFinite(energyRefill) ? Math.max(0, Math.floor(energyRefill))
-             : (win ? (3 + Math.floor(Math.random()*7)) : (1 + Math.floor(Math.random()*2)));
+    // +5% per wave after 5
+    const scale = w <= 5 ? 1 : 1 + 0.05*(w-5);
+    const jf = Math.floor(100 * scale);
+
+    // energy refill on win: 3–6, loss: 1–2
+    const ef = win
+      ? (3 + Math.floor(Math.random()*4)) // 3,4,5,6
+      : (1 + Math.floor(Math.random()*2)); // 1,2
 
     if (win){
       p.jetFuel += jf;
@@ -145,12 +153,13 @@ app.post('/battle/finish', async (req, reply)=>{
       p.energy = Math.min(p.energy + ef, p.ms.current.energyCap);
     }
 
-    return reply.send({ ok:true, award:{ jetFuel:jf, energy:ef, wave:w }, profile: profileOut(p) });
+    return reply.send({ ok:true, award:{ jetFuel:jf, energy:ef, wave:w, turns: turns|0 }, profile: profileOut(p) });
   }catch(e){
     return reply.code(e.statusCode||400).send({ error: e.message||'bad request' });
   }
 });
 
+// Upgrades
 app.post('/ms/upgrade', async (req, reply)=>{
   const { address, nonce, ops } = req.body || {};
   try{
@@ -166,7 +175,6 @@ app.post('/ms/upgrade', async (req, reply)=>{
       dodge:       Math.max(0, ops?.dodge|0)
     };
 
-    // progressive cost per-stat using next levels
     let totalCost = 0;
     const next = {
       health: p.ms.level.health + 1,
@@ -176,7 +184,7 @@ app.post('/ms/upgrade', async (req, reply)=>{
       crit: (p.pct.critLevel||0) + 1,
       dodge: (p.pct.dodgeLevel||0) + 1
     };
-    const add = (stat, times)=>{ for(let i=0;i<times;i++){ totalCost += costForLevel(stat, next[stat]); next[stat]++; } };
+    const add=(stat,times)=>{ for(let i=0;i<(times|0);i++){ totalCost += costForLevel(stat, next[stat]); next[stat]++; } };
     add('health', apply.health);
     add('energyCap', apply.energyCap);
     add('regenPerMin', apply.regenPerMin);
@@ -186,7 +194,6 @@ app.post('/ms/upgrade', async (req, reply)=>{
 
     if (p.jetFuel < totalCost) return reply.code(400).send({ error:'insufficient JetFuel', need: totalCost, have: p.jetFuel });
 
-    // Deduct and apply (report the exact spend for this Apply click)
     p.jetFuel -= totalCost;
 
     if (apply.health){
@@ -205,18 +212,9 @@ app.post('/ms/upgrade', async (req, reply)=>{
         CAPS.regenPerMin
       );
     }
-    if (apply.hit){
-      p.pct.hitLevel = (p.pct.hitLevel||0) + apply.hit;
-      p.pct.hit = Math.min(100, (p.pct.hit||0) + 1*apply.hit);
-    }
-    if (apply.crit){
-      p.pct.critLevel = (p.pct.critLevel||0) + apply.crit;
-      p.pct.crit = (p.pct.crit||0) + 1*apply.crit; // no cap
-    }
-    if (apply.dodge){
-      p.pct.dodgeLevel = (p.pct.dodgeLevel||0) + apply.dodge;
-      p.pct.dodge = Math.min(CAPS.dodge, (p.pct.dodge||0) + 1*apply.dodge);
-    }
+    if (apply.hit){   p.pct.hitLevel = (p.pct.hitLevel||0)+apply.hit;     p.pct.hit   = Math.min(100, (p.pct.hit||0)   + 1*apply.hit); }
+    if (apply.crit){  p.pct.critLevel= (p.pct.critLevel||0)+apply.crit;   p.pct.crit  =                 (p.pct.crit||0) + 1*apply.crit; }
+    if (apply.dodge){ p.pct.dodgeLevel=(p.pct.dodgeLevel||0)+apply.dodge; p.pct.dodge = Math.min(CAPS.dodge, (p.pct.dodge||0)+ 1*apply.dodge); }
 
     const labels = { health:'HP', energyCap:'ENERGY', regenPerMin:'REGEN', hit:'HIT', crit:'CRIT', dodge:'DODGE' };
     const pretty = Object.fromEntries(Object.entries(apply).filter(([_,v])=>v>0).map(([k,v])=>[labels[k], v]));
