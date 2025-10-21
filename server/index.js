@@ -1,7 +1,7 @@
-// server/index.js — XRPixel Jets MKG (2025-10-21-pctsplit)
-// Fully paste‑ready Fastify API. Implements ms_hit/ms_crit/ms_dodge columns,
-// keeps /profile response backward‑compatible via pct:{hit,crit,dodge}.
-// Cost formula: 100 + 30*level for all stats. Server is authoritative.
+// server/index.js — XRPixel Jets MKG (2025-10-21-regen-split)
+// Adds server-side ENERGY REGEN on every profile/battle route
+// and splits pct → ms_hit/ms_crit/ms_dodge (back-compatible /profile).
+// Cost formula: 100 + 30*level. Server-authoritative balances.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -21,7 +21,6 @@ const pool = new Pool({
 });
 
 const app = Fastify({ logger: true });
-
 await app.register(cors, { origin: ORIGIN.length ? ORIGIN : true });
 
 // ---------- Helpers ----------
@@ -35,7 +34,7 @@ async function ensureProfile(wallet) {
   await pool.query(q, [wallet]);
 }
 
-async function getProfile(wallet) {
+async function getProfileRaw(wallet) {
   const { rows } = await pool.query(
     `select wallet, jet_fuel, energy, energy_cap,
             ms_base, ms_level, ms_current,
@@ -69,6 +68,54 @@ function toClient(p) {
   };
 }
 
+async function applyRegen(wallet, row) {
+  // Recompute energy based on elapsed time since updated_at
+  const p = row || await getProfileRaw(wallet);
+  if (!p) return null;
+
+  const cur = recomputeCurrent(p.ms_base, p.ms_level);
+  const cap = (p.energy_cap|0) || (cur.energyCap|0) || 100;
+  const regenPerMin = cur.regenPerMin|0; // total regen stat
+
+  const updatedAt = p.updated_at ? new Date(p.updated_at) : null;
+  const now = new Date();
+  let newEnergy = p.energy|0;
+
+  if (updatedAt && regenPerMin > 0) {
+    const dtMs = now.getTime() - updatedAt.getTime();
+    if (dtMs > 0) {
+      const minutes = dtMs / 60000; // fractional minutes
+      const gained = Math.floor(minutes * regenPerMin);
+      if (gained > 0) {
+        newEnergy = clamp(newEnergy + gained, 0, cap);
+      }
+    }
+  }
+
+  // If energy increased, persist + bump updated_at so we don't overcount next time
+  if (newEnergy !== (p.energy|0)) {
+    const { rows } = await pool.query(
+      `update player_profiles set energy = $2, energy_cap = $3, ms_current = $4, updated_at = now()
+         where wallet = $1
+       returning wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
+                 ms_hit, ms_crit, ms_dodge, unlocked_level, updated_at`,
+      [wallet, newEnergy, cap, cur]
+    );
+    return rows[0];
+  }
+  // Make sure current and cap reflect latest levels even if no regen happened
+  if ((cap !== (p.energy_cap|0)) || JSON.stringify(p.ms_current||{}) !== JSON.stringify(cur)) {
+    const { rows } = await pool.query(
+      `update player_profiles set energy_cap = $2, ms_current = $3, updated_at = updated_at where wallet = $1
+       returning wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
+                 ms_hit, ms_crit, ms_dodge, unlocked_level, updated_at`,
+      [wallet, cap, cur]
+    );
+    return rows[0];
+  }
+  return p; // no change
+}
+
 // ---------- Routes ----------
 app.post('/session/start', async (req, reply) => {
   const { address } = req.body || {};
@@ -76,7 +123,6 @@ app.post('/session/start', async (req, reply) => {
     return reply.code(400).send({ error: 'invalid address' });
   }
   await ensureProfile(address);
-  // Return a simple nonce stub for future signing flow
   return reply.send({ nonce: 'demo-nonce' });
 });
 
@@ -91,14 +137,16 @@ app.addHook('onRequest', async (req, reply) => {
 });
 
 app.get('/profile', async (req, reply) => {
-  const p = await getProfile(req.wallet);
-  if (!p) return reply.code(404).send({ error: 'not found' });
+  const p0 = await getProfileRaw(req.wallet);
+  if (!p0) return reply.code(404).send({ error: 'not found' });
+  const p = await applyRegen(req.wallet, p0) || p0;
   return reply.send(toClient(p));
 });
 
 app.get('/ms/costs', async (req, reply) => {
-  const p = await getProfile(req.wallet);
-  if (!p) return reply.code(404).send({ error: 'not found' });
+  const p0 = await getProfileRaw(req.wallet);
+  if (!p0) return reply.code(404).send({ error: 'not found' });
+  const p = await applyRegen(req.wallet, p0) || p0;
   const lv = p.ms_level || { health:0, energyCap:0, regenPerMin:0 };
   const out = {
     levels: {
@@ -123,8 +171,9 @@ app.get('/ms/costs', async (req, reply) => {
 
 app.post('/ms/upgrade', async (req, reply) => {
   const deltas = req.body || {};
-  const p = await getProfile(req.wallet);
-  if (!p) return reply.code(404).send({ error: 'not found' });
+  const p0 = await getProfileRaw(req.wallet);
+  if (!p0) return reply.code(404).send({ error: 'not found' });
+  const p = await applyRegen(req.wallet, p0) || p0; // regen before spending
 
   let jf = p.jet_fuel|0;
   const applied = { health:0, energyCap:0, regenPerMin:0, hit:0, crit:0, dodge:0 };
@@ -148,12 +197,10 @@ app.post('/ms/upgrade', async (req, reply) => {
 
   const spent = (p.jet_fuel|0) - jf;
 
-  // Recompute current + energy cap
   const current = recomputeCurrent(p.ms_base, lv);
   const newCap = current.energyCap|0;
   const newEnergy = clamp(p.energy|0, 0, newCap);
 
-  // Persist
   const { rows } = await pool.query(
     `update player_profiles set
        jet_fuel = $2,
@@ -167,7 +214,7 @@ app.post('/ms/upgrade', async (req, reply) => {
        updated_at = now()
      where wallet = $1
      returning wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
-               ms_hit, ms_crit, ms_dodge, unlocked_level`,
+               ms_hit, ms_crit, ms_dodge, unlocked_level, updated_at`,
     [req.wallet, jf, lv, current, newCap, newEnergy, h, c, d]
   );
 
@@ -176,8 +223,9 @@ app.post('/ms/upgrade', async (req, reply) => {
 });
 
 app.post('/battle/start', async (req, reply) => {
-  const p = await getProfile(req.wallet);
-  if (!p) return reply.code(404).send({ error: 'not found' });
+  const p0 = await getProfileRaw(req.wallet);
+  if (!p0) return reply.code(404).send({ error: 'not found' });
+  const p = await applyRegen(req.wallet, p0) || p0; // regen first
   const need = 10;
   if ((p.energy|0) < need) return reply.code(400).send({ error: 'insufficient energy' });
   const newEnergy = (p.energy|0) - need;
@@ -186,8 +234,9 @@ app.post('/battle/start', async (req, reply) => {
 });
 
 app.post('/battle/turn', async (req, reply) => {
-  const p = await getProfile(req.wallet);
-  if (!p) return reply.code(404).send({ error: 'not found' });
+  const p0 = await getProfileRaw(req.wallet);
+  if (!p0) return reply.code(404).send({ error: 'not found' });
+  const p = await applyRegen(req.wallet, p0) || p0; // regen first
   if ((p.energy|0) <= 0) return reply.code(400).send({ error: 'no energy' });
   const newEnergy = (p.energy|0) - 1;
   await pool.query(`update player_profiles set energy = $2, updated_at = now() where wallet = $1`, [req.wallet, newEnergy]);
@@ -196,8 +245,9 @@ app.post('/battle/turn', async (req, reply) => {
 
 app.post('/battle/finish', async (req, reply) => {
   const { victory, wave, jf, energyReward } = req.body || {};
-  const p = await getProfile(req.wallet);
-  if (!p) return reply.code(404).send({ error: 'not found' });
+  const p0 = await getProfileRaw(req.wallet);
+  if (!p0) return reply.code(404).send({ error: 'not found' });
+  const p = await applyRegen(req.wallet, p0) || p0;
 
   const addJF = Math.max(0, parseInt(jf || 0, 10));
   const addE = Math.max(0, parseInt(energyReward || 0, 10));
@@ -207,7 +257,8 @@ app.post('/battle/finish', async (req, reply) => {
     energy: clamp((p.energy|0) + addE, 0, cap)
   };
 
-  const nextUnlocked = Math.max(p.unlocked_level|0, Math.max(5, parseInt(wave||0,10)));
+  const waveN = Math.max(0, parseInt(wave || 0, 10));
+  const nextUnlocked = Math.max(p.unlocked_level|0, Math.max(5, waveN + (victory ? 1 : 0)));
 
   const { rows } = await pool.query(
     `update player_profiles set
@@ -217,7 +268,7 @@ app.post('/battle/finish', async (req, reply) => {
        updated_at = now()
      where wallet = $1
      returning wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
-               ms_hit, ms_crit, ms_dodge, unlocked_level`,
+               ms_hit, ms_crit, ms_dodge, unlocked_level, updated_at`,
     [req.wallet, merged.jet_fuel, merged.energy, nextUnlocked]
   );
 
