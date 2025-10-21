@@ -3,9 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server/index.js",
-    "build": "echo \"(client is static on WP)\""
+    "build": "npm install --prefix server || true"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",
