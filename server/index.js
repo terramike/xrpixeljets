@@ -1,16 +1,15 @@
-// server/index.js — XRPixel Jets MKG (2025-10-23 JFUEL wired)
+// server/index.js — XRPixel Jets MKG (2025-10-23 JFUEL wired, migrations fixed)
+//
 // Features:
-//  - Startup migrations (safe): adds last_claim_at and ms_hit/ms_crit/ms_dodge if missing
+//  - Startup migrations (idempotent) using valid Postgres syntax
 //  - Regen upgrade costs +50% (still base 100)
 //  - Session/Profile/MS costs & upgrades
-//  - Battle start/turn/finish energy accounting (matches baseline)
+//  - Battle start/turn/finish
 //  - JFUEL claim: POST /claim/start (uses ./claimJetFuel.js)
 //  - JFUEL import: POST /import/onchain (simple balance import — see notes)
 //
-// Requirements:
-//  - ENV: DATABASE_URL, CORS_ORIGIN, ISSUER_ADDR, CURRENCY_CODE, XRPL_WSS, HOT_SEED, CLAIM_COOLDOWN_HOURS
-//  - Node 18+ (global fetch). If Node <18, uncomment next line & add dep:
-//      import fetch from 'node-fetch';
+// ENV required: DATABASE_URL, CORS_ORIGIN, ISSUER_ADDR, CURRENCY_CODE, XRPL_WSS, HOT_SEED, CLAIM_COOLDOWN_HOURS
+// Node 18+ required (global fetch available). If using older Node, add node-fetch.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -36,63 +35,47 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Startup migrations (idempotent)
+// Startup migrations (idempotent, valid syntax)
 await pool.query(`
-  alter table if not exists player_profiles
-    add column if not exists last_claim_at timestamptz;
+  ALTER TABLE player_profiles
+    ADD COLUMN IF NOT EXISTS last_claim_at timestamptz;
 
-  -- add stat columns if not present (we'll mirror pct jsonb if you used it before)
-  do $$
-  begin
-    if not exists(
-      select 1 from information_schema.columns
-      where table_name='player_profiles' and column_name='ms_hit'
-    ) then
-      alter table player_profiles add column ms_hit integer not null default 0;
-    end if;
-    if not exists(
-      select 1 from information_schema.columns
-      where table_name='player_profiles' and column_name='ms_crit'
-    ) then
-      alter table player_profiles add column ms_crit integer not null default 10;
-    end if;
-    if not exists(
-      select 1 from information_schema.columns
-      where table_name='player_profiles' and column_name='ms_dodge'
-    ) then
-      alter table player_profiles add column ms_dodge integer not null default 0;
-    end if;
-  end$$;
+  ALTER TABLE player_profiles
+    ADD COLUMN IF NOT EXISTS ms_hit integer NOT NULL DEFAULT 0;
+
+  ALTER TABLE player_profiles
+    ADD COLUMN IF NOT EXISTS ms_crit integer NOT NULL DEFAULT 10;
+
+  ALTER TABLE player_profiles
+    ADD COLUMN IF NOT EXISTS ms_dodge integer NOT NULL DEFAULT 0;
 `);
 
 // --------------------- Helpers --------------------
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 const isClassic = (a) => /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test((a || '').trim());
 
-// Cost model
 const BASE_COST = (lv) => 100 + 30 * lv;
 // regen +50%
 const COST_FOR = (stat, lv) => stat === 'regenPerMin'
   ? Math.round(BASE_COST(lv) * 1.5)
   : BASE_COST(lv);
 
-// Ensure profile exists
 async function ensureProfile(wallet) {
   await pool.query(
-    `insert into player_profiles (wallet)
-     values ($1)
-     on conflict (wallet) do nothing`,
+    `INSERT INTO player_profiles (wallet)
+     VALUES ($1)
+     ON CONFLICT (wallet) DO NOTHING`,
     [wallet]
   );
 }
 
 async function getProfileRow(wallet) {
   const { rows } = await pool.query(
-    `select wallet, jet_fuel, energy, energy_cap,
+    `SELECT wallet, jet_fuel, energy, energy_cap,
             ms_base, ms_level, ms_current,
             ms_hit, ms_crit, ms_dodge,
             unlocked_level, last_claim_at, updated_at, created_at
-       from player_profiles where wallet = $1`,
+       FROM player_profiles WHERE wallet = $1`,
     [wallet]
   );
   return rows[0] || null;
@@ -119,7 +102,7 @@ function toClient(row) {
   };
 }
 
-// Regen on read (server-authoritative tick)
+// Regen tick on read
 async function applyRegen(wallet, rowIn) {
   const row = rowIn || await getProfileRow(wallet);
   if (!row) return null;
@@ -129,9 +112,9 @@ async function applyRegen(wallet, rowIn) {
   const regen = current.regenPerMin | 0;
 
   let newEnergy = row.energy | 0;
-
   const updatedAt = row.updated_at ? new Date(row.updated_at) : null;
   const now = new Date();
+
   if (updatedAt && regen > 0) {
     const dtMs = now.getTime() - updatedAt.getTime();
     if (dtMs > 0) {
@@ -149,13 +132,13 @@ async function applyRegen(wallet, rowIn) {
   if (!needsSave) return row;
 
   const { rows } = await pool.query(
-    `update player_profiles
-        set energy = $2,
+    `UPDATE player_profiles
+        SET energy = $2,
             energy_cap = $3,
             ms_current = $4,
             updated_at = now()
-      where wallet = $1
-      returning wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
+      WHERE wallet = $1
+      RETURNING wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
                 ms_hit, ms_crit, ms_dodge, unlocked_level, last_claim_at, updated_at`,
     [wallet, newEnergy, cap, current]
   );
@@ -175,7 +158,7 @@ app.addHook('onRequest', async (req, reply) => {
 
 // ---------------------- Routes --------------------
 
-// Session bootstrap – create/ensure a profile
+// Session
 app.post('/session/start', async (req, reply) => {
   const { address } = req.body || {};
   if (!isClassic(address)) return reply.code(400).send({ error: 'invalid address' });
@@ -183,18 +166,18 @@ app.post('/session/start', async (req, reply) => {
   return reply.send({ nonce: 'demo-nonce' });
 });
 
-// Read profile (applies regen)
+// Profile
 app.get('/profile', async (req, reply) => {
   const p0 = await getProfileRow(req.wallet);
-  if (!p0) return reply.code(404).send({ error: 'not found' });
+  if (!p0) return reply.code(404).send({ error: 'not_found' });
   const p = await applyRegen(req.wallet, p0) || p0;
   return reply.send(toClient(p));
 });
 
-// Get mothership costs (+50% regen)
+// MS costs
 app.get('/ms/costs', async (req, reply) => {
   const p0 = await getProfileRow(req.wallet);
-  if (!p0) return reply.code(404).send({ error: 'not found' });
+  if (!p0) return reply.code(404).send({ error: 'not_found' });
   const p = await applyRegen(req.wallet, p0) || p0;
 
   const lv = p.ms_level || { health: 0, energyCap: 0, regenPerMin: 0 };
@@ -219,11 +202,11 @@ app.get('/ms/costs', async (req, reply) => {
   return reply.send(out);
 });
 
-// Apply queued upgrades (server-authoritative)
+// MS upgrade
 app.post('/ms/upgrade', async (req, reply) => {
   const deltas = req.body || {};
   const p0 = await getProfileRow(req.wallet);
-  if (!p0) return reply.code(404).send({ error: 'not found' });
+  if (!p0) return reply.code(404).send({ error: 'not_found' });
   const p = await applyRegen(req.wallet, p0) || p0;
 
   let jf = p.jet_fuel | 0;
@@ -252,14 +235,13 @@ app.post('/ms/upgrade', async (req, reply) => {
 
   ['health', 'energyCap', 'regenPerMin', 'hit', 'crit', 'dodge'].forEach(applyStat);
 
-  const spent = (p.jet_fuel | 0) - jf;
-
   const current = recomputeCurrent(p.ms_base, lv);
   const newCap = current.energyCap | 0;
   const newEnergy = clamp(p.energy | 0, 0, newCap);
+  const spent = (p.jet_fuel | 0) - jf;
 
   const { rows } = await pool.query(
-    `update player_profiles set
+    `UPDATE player_profiles SET
        jet_fuel = $2,
        ms_level = $3,
        ms_current = $4,
@@ -269,8 +251,8 @@ app.post('/ms/upgrade', async (req, reply) => {
        ms_crit = $8,
        ms_dodge = $9,
        updated_at = now()
-     where wallet = $1
-     returning wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
+     WHERE wallet = $1
+     RETURNING wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
                ms_hit, ms_crit, ms_dodge, unlocked_level, last_claim_at, updated_at`,
     [req.wallet, jf, lv, current, newCap, newEnergy, hit, crit, dodge]
   );
@@ -278,18 +260,19 @@ app.post('/ms/upgrade', async (req, reply) => {
   return reply.send({ applied, spent, profile: toClient(rows[0]) });
 });
 
-// Battle endpoints (minimal energy logic consistent with baseline)
+// Battle
 app.post('/battle/start', async (req, reply) => {
   const p0 = await getProfileRow(req.wallet);
-  if (!p0) return reply.code(404).send({ error: 'not found' });
+  if (!p0) return reply.code(404).send({ error: 'not_found' });
   const p = await applyRegen(req.wallet, p0) || p0;
 
   if ((p.energy | 0) < 10) return reply.code(400).send({ error: 'not_enough_energy' });
 
   const { rows } = await pool.query(
-    `update player_profiles set energy = energy - 10, updated_at = now()
-       where wallet = $1
-       returning energy`,
+    `UPDATE player_profiles
+        SET energy = energy - 10, updated_at = now()
+      WHERE wallet = $1
+      RETURNING energy`,
     [req.wallet]
   );
   return reply.send({ ok: true, energy: rows[0].energy | 0 });
@@ -297,34 +280,34 @@ app.post('/battle/start', async (req, reply) => {
 
 app.post('/battle/turn', async (req, reply) => {
   const p0 = await getProfileRow(req.wallet);
-  if (!p0) return reply.code(404).send({ error: 'not found' });
+  if (!p0) return reply.code(404).send({ error: 'not_found' });
   const p = await applyRegen(req.wallet, p0) || p0;
 
   if ((p.energy | 0) < 1) return reply.code(400).send({ error: 'not_enough_energy' });
 
   const { rows } = await pool.query(
-    `update player_profiles set energy = energy - 1, updated_at = now()
-       where wallet = $1
-       returning energy`,
+    `UPDATE player_profiles
+        SET energy = energy - 1, updated_at = now()
+      WHERE wallet = $1
+      RETURNING energy`,
     [req.wallet]
   );
   return reply.send({ ok: true, energy: rows[0].energy | 0 });
 });
 
 app.post('/battle/finish', async (req, reply) => {
-  // Body may contain: { victory, wave, jf, energyReward }
   const { victory, jf = 0, energyReward = 0 } = req.body || {};
   const p0 = await getProfileRow(req.wallet);
-  if (!p0) return reply.code(404).send({ error: 'not found' });
-  await applyRegen(req.wallet, p0); // settle regen before credit
+  if (!p0) return reply.code(404).send({ error: 'not_found' });
+  await applyRegen(req.wallet, p0);
 
   const { rows } = await pool.query(
-    `update player_profiles
-        set jet_fuel = jet_fuel + $2,
-            energy   = least(energy_cap, energy + $3),
+    `UPDATE player_profiles
+        SET jet_fuel = jet_fuel + $2,
+            energy   = LEAST(energy_cap, energy + $3),
             updated_at = now()
-      where wallet = $1
-      returning wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
+      WHERE wallet = $1
+      RETURNING wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
                 ms_hit, ms_crit, ms_dodge, unlocked_level, last_claim_at, updated_at`,
     [req.wallet, Math.max(0, jf | 0), Math.max(0, energyReward | 0)]
   );
@@ -342,7 +325,6 @@ app.post('/claim/start', async (req, reply) => {
   const p0 = await getProfileRow(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
 
-  // cooldown
   const now = new Date();
   if (p0.last_claim_at) {
     const next = new Date(new Date(p0.last_claim_at).getTime() + COOLDOWN_HOURS * 3600 * 1000);
@@ -352,19 +334,17 @@ app.post('/claim/start', async (req, reply) => {
     }
   }
 
-  // balance check
   if ((p0.jet_fuel | 0) < amt) return reply.code(400).send({ error: 'insufficient_jet_fuel' });
 
   try {
     const txid = await claim.sendJetFuel(req.wallet, amt);
-    // deduct on success
     const { rows } = await pool.query(
-      `update player_profiles
-         set jet_fuel = jet_fuel - $2,
+      `UPDATE player_profiles
+         SET jet_fuel = jet_fuel - $2,
              last_claim_at = now(),
              updated_at = now()
-       where wallet = $1
-       returning wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
+       WHERE wallet = $1
+       RETURNING wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
                  ms_hit, ms_crit, ms_dodge, unlocked_level, last_claim_at, updated_at`,
       [req.wallet, amt]
     );
@@ -376,8 +356,8 @@ app.post('/claim/start', async (req, reply) => {
 });
 
 // --------- Import on-chain JFUEL into off-chain balance ----------
-// NOTE: Convenience import. It trusts the current on-chain balance and credits off-chain.
-// For production economics, consider "burn-for-credit" instead.
+// NOTE: Convenience import — trusts current on-chain balance, credits off-chain.
+// Consider a burn-for-credit model for production economics.
 app.post('/import/onchain', async (req, reply) => {
   const wallet = req.wallet;
   const ISSUER = process.env.ISSUER_ADDR;
@@ -398,20 +378,19 @@ app.post('/import/onchain', async (req, reply) => {
     const j = await r.json();
     const lines = j?.result?.lines || [];
 
-    // Prefer exact issuer + CODE match, fallback to hex currency includes
     let line = lines.find(l => l.account === ISSUER && l.currency === CODE);
     if (!line) line = lines.find(l => l.account === ISSUER && (l.currency || '').toUpperCase().includes(CODE));
 
     const onchain = line ? Number(line.balance || 0) : 0;
-    const importAmt = Math.floor(onchain); // off-chain uses integer JF
+    const importAmt = Math.floor(onchain);
     if (!importAmt) return reply.send({ ok: false, message: 'no_onchain_balance' });
 
     const { rows } = await pool.query(
-      `update player_profiles
-         set jet_fuel = jet_fuel + $2,
+      `UPDATE player_profiles
+         SET jet_fuel = jet_fuel + $2,
              updated_at = now()
-       where wallet = $1
-       returning wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
+       WHERE wallet = $1
+       RETURNING wallet, jet_fuel, energy, energy_cap, ms_base, ms_level, ms_current,
                  ms_hit, ms_crit, ms_dodge, unlocked_level, last_claim_at, updated_at`,
       [wallet, importAmt]
     );
