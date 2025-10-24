@@ -1,9 +1,11 @@
-// server/index.js — XRPixel Jets MKG (2025-10-24CORS)
+// server/index.js — XRPixel Jets MKG (2025-10-24CORS2)
 // - Fastify + PG
-// - CORS allowlist for mykeygo.io (and localhost dev)
+// - CORS allowlist (array, robust preflight)
 // - Simple rate limiter (ip|wallet)
-// - Server-authoritative rewards/unlocks in /battle/finish
-// - Regen-on-read, MS upgrade costs, claim passthrough
+// - Regen-on-read
+// - Server-authoritative /battle/finish
+// - MS upgrade costs and apply
+// - Claim passthrough
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -13,6 +15,7 @@ import * as claim from './claimJetFuel.js';
 const { Pool } = pkg;
 
 const PORT = process.env.PORT || 10000;
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -22,31 +25,26 @@ function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
 
 const app = Fastify({ logger: true });
 
-// --- CORS (allow mykeygo.io, www, and local dev) ---
+// ---------- CORS (allowlist) ----------
 const ORIGIN_LIST = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeygo.io,http://localhost:8000')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
+// NOTE: Using array form is the least error-prone way to pass allowlist.
+// We also include common headers + relax strictPreflight to avoid rejects on unknown headers.
 await app.register(cors, {
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);                   // allow curl/SSR
-    if (ORIGIN_LIST.includes(origin)) return cb(null, true);
-    // Optionally allow subdomains:
-    // if (origin.endsWith('.mykeygo.io')) return cb(null, true);
-    cb(new Error('CORS: origin not allowed'));
-  },
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','X-Wallet'],
-  exposedHeaders: [],
+  origin: ORIGIN_LIST,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept', 'Origin', 'X-Requested-With', 'X-Wallet'],
   credentials: false,
   maxAge: 86400,
   preflight: true,
-  strictPreflight: true,
+  strictPreflight: false,   // reflect headers the browser asks for instead of 400
   hideOptionsRoute: false,
 });
 
-// ---- helpers ---- //
+// ---------- Helpers ----------
 async function ensureProfile(wallet){
   const { rows } = await pool.query(
     `insert into player_profiles (wallet)
@@ -113,19 +111,18 @@ async function applyRegen(wallet, row) {
         return rows[0];
       }
     }
-  } catch(e) {
-    // non-fatal
-    app.log.warn({ err:e }, 'regen_failed_nonfatal');
+  } catch (e) {
+    app.log.warn({ err:e }, 'regen_nonfatal');
   }
   return row;
 }
 
-// ---- rate limiter (in-memory; good enough for now) ----
+// ---------- Simple rate limiter ----------
 const RATE = { windowMs: 10_000, maxPerWindow: 30 };
 const bucket = new Map(); // key = ip|wallet -> {count, ts}
 
 app.addHook('onRequest', async (req, reply) => {
-  if (req.raw.url === '/session/start') return; // open endpoint
+  if (req.raw.url === '/session/start') return; // open
   const w = req.headers['x-wallet'];
   if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
     return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
@@ -143,9 +140,9 @@ app.addHook('onRequest', async (req, reply) => {
   }
 });
 
-// ----- routes ----- //
+// ---------- Routes ----------
 
-// open: ensure profile row exists
+// Open: ensure profile exists (CORS applies here too)
 app.post('/session/start', async (req, reply) => {
   const { address } = req.body || {};
   if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) {
@@ -197,7 +194,7 @@ app.post('/ms/upgrade', async (req, reply) => {
   function nextCost(stat, idx){
     const raw = base[stat] + step[stat] * idx;
     return (stat === 'regenPerMin') ? Math.round(1.5 * raw) : raw;
-  }
+    }
 
   let spend = 0;
   let applied = { health:0, energyCap:0, regenPerMin:0, hit:0, crit:0, dodge:0 };
@@ -266,7 +263,7 @@ app.post('/battle/turn', async (req, reply) => {
   return reply.send({ ok:true, energy: rows[0].energy|0 });
 });
 
-// SERVER-AUTHORITATIVE finish (prevents LS tamper for unlock/reward)
+// Server-authoritative finish (prevents LS tamper for unlock/reward)
 app.post('/battle/finish', async (req, reply) => {
   const { victory, wave } = req.body || {};
   const lvl = Math.max(1, parseInt(wave || 1, 10));
@@ -306,7 +303,7 @@ app.post('/battle/finish', async (req, reply) => {
   return reply.send({ ok:true, profile: toClient(rows[0]) });
 });
 
-// claim JFUEL via XRPL hot wallet (kept)
+// Claim via XRPL hot wallet
 app.post('/claim/start', async (req, reply) => {
   const { amount } = req.body || {};
   const amt = Math.max(1, parseInt(amount||0, 10));
@@ -321,11 +318,11 @@ app.post('/claim/start', async (req, reply) => {
 
   try {
     const txid = await claim.sendIssued(req.wallet, amt);
-    const { rows } = await pool.query(
-      `update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1 returning *`,
+    await pool.query(
+      `update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1`,
       [req.wallet]
     );
-    return reply.send({ ok:true, txid, profile: toClient(rows[0]) });
+    return reply.send({ ok:true, txid });
   } catch (e) {
     req.log.error({ err:e }, 'claim_send_failed');
     return reply.code(502).send({ error: 'send_failed', message: e.message || String(e) });
