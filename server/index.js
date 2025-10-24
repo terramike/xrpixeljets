@@ -1,10 +1,11 @@
-// server/index.js — XRPixel Jets MKG (2025-10-24CORS2)
+// server/index.js — XRPixel Jets MKG (2025-10-24 econ-0.10 + pct-scaling)
 // - Fastify + PG
 // - CORS allowlist (array, robust preflight)
 // - Simple rate limiter (ip|wallet)
 // - Regen-on-read
-// - Server-authoritative /battle/finish
-// - MS upgrade costs and apply
+// - Server-authoritative rewards with ECON_SCALE
+// - MS upgrade costs (HP/Cap/Regen + HIT/CRIT/DODGE) scale by current levels
+// - Costs and rewards scaled by ECON_SCALE (env or per-request econScale)
 // - Claim passthrough
 
 import Fastify from 'fastify';
@@ -23,6 +24,16 @@ const pool = new Pool({
 
 function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
 
+// ===== Economy scale =====
+const ECON_SCALE_DEFAULT = Number(process.env.ECON_SCALE || 0.10);
+function pickScale(req){
+  const q = Number(req.query?.econScale);
+  const b = Number(req.body?.econScale);
+  const s = Number.isFinite(b) && b > 0 ? b : (Number.isFinite(q) && q > 0 ? q : ECON_SCALE_DEFAULT);
+  return s;
+}
+function scaled(n, s){ return Math.max(1, Math.round((Number(n)||0) * s)); }
+
 const app = Fastify({ logger: true });
 
 // ---------- CORS (allowlist) ----------
@@ -32,7 +43,6 @@ const ORIGIN_LIST = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.
   .filter(Boolean);
 
 // NOTE: Using array form is the least error-prone way to pass allowlist.
-// We also include common headers + relax strictPreflight to avoid rejects on unknown headers.
 await app.register(cors, {
   origin: ORIGIN_LIST,
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -40,7 +50,7 @@ await app.register(cors, {
   credentials: false,
   maxAge: 86400,
   preflight: true,
-  strictPreflight: false,   // reflect headers the browser asks for instead of 400
+  strictPreflight: false,
   hideOptionsRoute: false,
 });
 
@@ -159,21 +169,46 @@ app.get('/profile', async (req, reply) => {
   return reply.send(toClient(p));
 });
 
+// --- Cost formulae (level-scaled) ---
+function nextCostLinear(base, step, idx){ // idx = next level number (1-based)
+  const raw = base + step * idx;
+  return raw;
+}
+
+// HP/Cap/Regen baseline
+const baseCore = { health: 50, energyCap: 60, regenPerMin: 80 };
+const stepCore = { health: 25, energyCap: 30, regenPerMin: 45 };
+
+// Pct stats: scale by current ms_* levels too
+// (chosen steps so high levels are “pricey” like core stats)
+const basePct = { hit: 100, crit: 120, dodge: 110 };
+const stepPct = { hit: 40,  crit: 48,  dodge: 44  };
+
 app.get('/ms/costs', async (req, reply) => {
+  const scale = pickScale(req);
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
-  const msLevel = p0.ms_level || { health:0, energyCap:0, regenPerMin:0 };
-  const base = { health: 50, energyCap: 60, regenPerMin: 80 };
-  const step = { health: 25, energyCap: 30, regenPerMin: 45 };
-  const nextCosts = {
-    health: base.health + step.health * ((msLevel.health|0) + 1),
-    energyCap: base.energyCap + step.energyCap * ((msLevel.energyCap|0) + 1),
-    regenPerMin: Math.round(1.5 * (base.regenPerMin + step.regenPerMin * ((msLevel.regenPerMin|0) + 1))),
+
+  const lvCore = p0.ms_level || { health:0, energyCap:0, regenPerMin:0 };
+  const lvPct  = { hit: p0.ms_hit|0, crit: p0.ms_crit|0, dodge: p0.ms_dodge|0 };
+
+  const costsCore = {
+    health:      scaled(nextCostLinear(baseCore.health,     stepCore.health,     (lvCore.health|0)     + 1), scale),
+    energyCap:   scaled(nextCostLinear(baseCore.energyCap,  stepCore.energyCap,  (lvCore.energyCap|0)  + 1), scale),
+    regenPerMin: scaled(Math.round(1.5 * nextCostLinear(baseCore.regenPerMin, stepCore.regenPerMin, (lvCore.regenPerMin|0) + 1)), scale),
   };
-  return reply.send({ ok:true, levels: msLevel, costs: nextCosts });
+  const costsPct = {
+    hit:   scaled(nextCostLinear(basePct.hit,   stepPct.hit,   (lvPct.hit|0)   + 1), scale),
+    crit:  scaled(nextCostLinear(basePct.crit,  stepPct.crit,  (lvPct.crit|0)  + 1), scale),
+    dodge: scaled(nextCostLinear(basePct.dodge, stepPct.dodge, (lvPct.dodge|0) + 1), scale),
+  };
+
+  const nextCosts = { ...costsCore, ...costsPct };
+  return reply.send({ ok:true, levels: { ...lvCore, ...lvPct }, costs: nextCosts, scale });
 });
 
 app.post('/ms/upgrade', async (req, reply) => {
+  const scale = pickScale(req);
   const body = req.body || {};
   const deltas = {
     health: (body.health|0) || 0,
@@ -187,56 +222,58 @@ app.post('/ms/upgrade', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
 
-  const levels = p0.ms_level || { health:0, energyCap:0, regenPerMin:0 };
-  const base = { health: 50, energyCap: 60, regenPerMin: 80 };
-  const step = { health: 25, energyCap: 30, regenPerMin: 45 };
-
-  function nextCost(stat, idx){
-    const raw = base[stat] + step[stat] * idx;
-    return (stat === 'regenPerMin') ? Math.round(1.5 * raw) : raw;
-    }
+  const lvCore = { ...(p0.ms_level || { health:0, energyCap:0, regenPerMin:0 }) };
+  const lvPct  = { hit: p0.ms_hit|0, crit: p0.ms_crit|0, dodge: p0.ms_dodge|0 };
 
   let spend = 0;
   let applied = { health:0, energyCap:0, regenPerMin:0, hit:0, crit:0, dodge:0 };
-  let lv = { ...levels };
 
+  // Core stats — level-scaled + scaled by ECON_SCALE
   for (const stat of ['health','energyCap','regenPerMin']) {
     const want = Math.max(0, deltas[stat]|0);
     for (let i = 0; i < want; i++) {
-      const cost = nextCost(stat, (lv[stat]|0) + 1);
+      const idx = (lvCore[stat]|0) + 1; // next level number
+      let cost = nextCostLinear(baseCore[stat], stepCore[stat], idx);
+      if (stat === 'regenPerMin') cost = Math.round(1.5 * cost);
+      cost = scaled(cost, scale);
       if ((p0.jet_fuel|0) - spend < cost) break;
-      spend += cost; applied[stat] += 1; lv[stat] = (lv[stat]|0) + 1;
+      spend += cost; applied[stat] += 1; lvCore[stat] = (lvCore[stat]|0) + 1;
     }
   }
 
-  const pctCost = { hit: 100, crit: 120, dodge: 110 };
+  // Pct stats — level-scaled + scaled by ECON_SCALE using ms_hit/ms_crit/ms_dodge
   for (const stat of ['hit','crit','dodge']) {
     const want = Math.max(0, deltas[stat]|0);
     for (let i = 0; i < want; i++) {
-      const cost = pctCost[stat];
+      const idx = (lvPct[stat]|0) + 1;
+      const base = basePct[stat], step = stepPct[stat];
+      const raw = nextCostLinear(base, step, idx);
+      const cost = scaled(raw, scale);
       if ((p0.jet_fuel|0) - spend < cost) break;
-      spend += cost; applied[stat] += 1;
+      spend += cost; applied[stat] += 1; lvPct[stat] = (lvPct[stat]|0) + 1;
     }
   }
 
-  const ms_current = recomputeCurrent(p0.ms_base, lv);
+  // Apply
+  const ms_current = recomputeCurrent(p0.ms_base, lvCore);
   const energyCapped = clamp(p0.energy|0, 0, (p0.energy_cap|0) || ms_current.energyCap || 100);
+
   const { rows } = await pool.query(
     `update player_profiles set
        jet_fuel = jet_fuel - $2,
        ms_level = $3,
        ms_current = $4,
-       ms_hit = coalesce(ms_hit,0) + $5,
-       ms_crit = coalesce(ms_crit,10) + $6,
-       ms_dodge = coalesce(ms_dodge,0) + $7,
+       ms_hit = $5,
+       ms_crit = $6,
+       ms_dodge = $7,
        energy = $8,
        updated_at = now()
      where wallet = $1
      returning *`,
-    [req.wallet, spend, lv, ms_current, applied.hit|0, applied.crit|0, applied.dodge|0, energyCapped]
+    [req.wallet, spend, lvCore, ms_current, lvPct.hit|0, lvPct.crit|0, lvPct.dodge|0, energyCapped]
   );
 
-  return reply.send({ ok:true, applied, spent: spend, profile: toClient(rows[0]) });
+  return reply.send({ ok:true, applied, spent: spend, profile: toClient(rows[0]), scale });
 });
 
 app.post('/battle/start', async (req, reply) => {
@@ -263,8 +300,9 @@ app.post('/battle/turn', async (req, reply) => {
   return reply.send({ ok:true, energy: rows[0].energy|0 });
 });
 
-// Server-authoritative finish (prevents LS tamper for unlock/reward)
+// Server-authoritative finish (scaled rewards)
 app.post('/battle/finish', async (req, reply) => {
+  const scale = pickScale(req);
   const { victory, wave } = req.body || {};
   const lvl = Math.max(1, parseInt(wave || 1, 10));
 
@@ -272,15 +310,16 @@ app.post('/battle/finish', async (req, reply) => {
   if (!p0) return reply.code(404).send({ error: 'not_found' });
   const p = await applyRegen(req.wallet, p0) || p0;
 
-  const base = (lvl <= 5)
+  // Base JF table then gentle growth; scaled down by ECON_SCALE
+  const baseRaw = (lvl <= 5)
     ? [0,100,150,200,250,300][lvl]
     : Math.round(300 * Math.pow(1.01, (lvl - 5)));
 
-  const jfEarned = victory ? base : 0;
+  const jfEarned = victory ? scaled(baseRaw, scale) : 0;
   const energyReward = victory ? (3 + Math.floor(Math.random()*4)) : (1 + Math.floor(Math.random()*2));
 
   // Allow finishing current unlocked or the very next
-  const srvUnlocked = p.unlocked_level | 0; // defaults to 5 on new profiles
+  const srvUnlocked = p.unlocked_level | 0;
   if (lvl > Math.max(1, srvUnlocked + 1)) {
     return reply.code(400).send({ error: 'wave_not_unlocked' });
   }
@@ -300,7 +339,7 @@ app.post('/battle/finish', async (req, reply) => {
      returning *`,
     [req.wallet, newJF, newEnergy, nextUnlocked]
   );
-  return reply.send({ ok:true, profile: toClient(rows[0]) });
+  return reply.send({ ok:true, profile: toClient(rows[0]), scale, jfEarned, energyReward });
 });
 
 // Claim via XRPL hot wallet
@@ -334,5 +373,5 @@ app.listen({ port: PORT, host: '0.0.0.0' }, (err, addr) => {
     app.log.error(err);
     process.exit(1);
   }
-  app.log.info(`Server listening at ${addr}`);
+  app.log.info(`Server listening at ${addr} (ECON_SCALE=${ECON_SCALE_DEFAULT})`);
 });
