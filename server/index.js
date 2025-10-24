@@ -1,7 +1,9 @@
-// server/index.js — XRPixel Jets MKG (2025-10-24r)
-// Adds: simple rate limiter, server-authoritative /battle/finish,
-// preserves your claim endpoint via claimJetFuel.js, regen, costs, upgrades.
-// NOTE: Requires DATABASE_URL and CORS_ORIGIN env vars (as before).
+// server/index.js — XRPixel Jets MKG (2025-10-24CORS)
+// - Fastify + PG
+// - CORS allowlist for mykeygo.io (and localhost dev)
+// - Simple rate limiter (ip|wallet)
+// - Server-authoritative rewards/unlocks in /battle/finish
+// - Regen-on-read, MS upgrade costs, claim passthrough
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -11,33 +13,40 @@ import * as claim from './claimJetFuel.js';
 const { Pool } = pkg;
 
 const PORT = process.env.PORT || 10000;
-const ORIGIN = (process.env.CORS_ORIGIN || '*')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
 });
 
 function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
 
-// ---- rate limiter (in-memory; fine for small scale) ----
-const RATE = { windowMs: 10_000, maxPerWindow: 30 };
-const bucket = new Map(); // key = ip|wallet -> {count, ts}
-
 const app = Fastify({ logger: true });
+
+// --- CORS (allow mykeygo.io, www, and local dev) ---
+const ORIGIN_LIST = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeygo.io,http://localhost:8000')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
 await app.register(cors, {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (ORIGIN.includes('*') || ORIGIN.some(o => origin?.startsWith(o))) return cb(null, true);
-    cb(new Error('CORS'));
-  }
+    if (!origin) return cb(null, true);                   // allow curl/SSR
+    if (ORIGIN_LIST.includes(origin)) return cb(null, true);
+    // Optionally allow subdomains:
+    // if (origin.endsWith('.mykeygo.io')) return cb(null, true);
+    cb(new Error('CORS: origin not allowed'));
+  },
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','X-Wallet'],
+  exposedHeaders: [],
+  credentials: false,
+  maxAge: 86400,
+  preflight: true,
+  strictPreflight: true,
+  hideOptionsRoute: false,
 });
 
-// --- helpers --- //
+// ---- helpers ---- //
 async function ensureProfile(wallet){
   const { rows } = await pool.query(
     `insert into player_profiles (wallet)
@@ -64,11 +73,10 @@ async function getProfileRaw(wallet){
 function recomputeCurrent(base, level) {
   const b = base || { health:20, energyCap:100, regenPerMin:1 };
   const lv = level || { health:0, energyCap:0, regenPerMin:0 };
-  // additive levels → linear stats
   return {
     health: (b.health|0) + (lv.health|0),
     energyCap: (b.energyCap|0) + (lv.energyCap|0),
-    regenPerMin: (b.regenPerMin|0) + (lv.regenPerMin|0)
+    regenPerMin: (b.regenPerMin|0) + (lv.regenPerMin|0),
   };
 }
 
@@ -80,12 +88,11 @@ function toClient(row){
     jetFuel: row.jet_fuel|0,
     energy: row.energy|0,
     energyCap: row.energy_cap|0,
-    unlockedLevel: row.unlocked_level|0
+    unlockedLevel: row.unlocked_level|0,
   };
 }
 
 async function applyRegen(wallet, row) {
-  // Simple regen model: energy += regenPerMin * minutes since updated_at (capped to energy_cap)
   try {
     const now = new Date();
     const updated = new Date(row.updated_at);
@@ -108,20 +115,23 @@ async function applyRegen(wallet, row) {
     }
   } catch(e) {
     // non-fatal
+    app.log.warn({ err:e }, 'regen_failed_nonfatal');
   }
   return row;
 }
 
-// ----- request hook: wallet header + rate limit ----- //
+// ---- rate limiter (in-memory; good enough for now) ----
+const RATE = { windowMs: 10_000, maxPerWindow: 30 };
+const bucket = new Map(); // key = ip|wallet -> {count, ts}
+
 app.addHook('onRequest', async (req, reply) => {
-  if (req.raw.url === '/session/start') return; // open
+  if (req.raw.url === '/session/start') return; // open endpoint
   const w = req.headers['x-wallet'];
   if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
-    return reply.code(400).send({ error: 'missing X-Wallet' });
+    return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
   }
   req.wallet = w;
 
-  // rate limit
   const key = `${req.ip}|${w}`;
   const now = Date.now();
   const cur = bucket.get(key) || { count: 0, ts: now };
@@ -135,7 +145,7 @@ app.addHook('onRequest', async (req, reply) => {
 
 // ----- routes ----- //
 
-// open session; ensures profile row
+// open: ensure profile row exists
 app.post('/session/start', async (req, reply) => {
   const { address } = req.body || {};
   if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) {
@@ -156,13 +166,12 @@ app.get('/ms/costs', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
   const msLevel = p0.ms_level || { health:0, energyCap:0, regenPerMin:0 };
-  // simple cost curve: base + (level * step). regen is 50% more expensive.
   const base = { health: 50, energyCap: 60, regenPerMin: 80 };
   const step = { health: 25, energyCap: 30, regenPerMin: 45 };
   const nextCosts = {
     health: base.health + step.health * ((msLevel.health|0) + 1),
     energyCap: base.energyCap + step.energyCap * ((msLevel.energyCap|0) + 1),
-    regenPerMin: Math.round(1.5 * (base.regenPerMin + step.regenPerMin * ((msLevel.regenPerMin|0) + 1)))
+    regenPerMin: Math.round(1.5 * (base.regenPerMin + step.regenPerMin * ((msLevel.regenPerMin|0) + 1))),
   };
   return reply.send({ ok:true, levels: msLevel, costs: nextCosts });
 });
@@ -181,12 +190,11 @@ app.post('/ms/upgrade', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
 
-  // compute costs for requested deltas
   const levels = p0.ms_level || { health:0, energyCap:0, regenPerMin:0 };
   const base = { health: 50, energyCap: 60, regenPerMin: 80 };
   const step = { health: 25, energyCap: 30, regenPerMin: 45 };
 
-  function nextCost(stat, idx){ // idx starts at current+1, current+2, ...
+  function nextCost(stat, idx){
     const raw = base[stat] + step[stat] * idx;
     return (stat === 'regenPerMin') ? Math.round(1.5 * raw) : raw;
   }
@@ -195,7 +203,6 @@ app.post('/ms/upgrade', async (req, reply) => {
   let applied = { health:0, energyCap:0, regenPerMin:0, hit:0, crit:0, dodge:0 };
   let lv = { ...levels };
 
-  // Apply MS stat upgrades one-by-one up to available jet_fuel
   for (const stat of ['health','energyCap','regenPerMin']) {
     const want = Math.max(0, deltas[stat]|0);
     for (let i = 0; i < want; i++) {
@@ -205,7 +212,6 @@ app.post('/ms/upgrade', async (req, reply) => {
     }
   }
 
-  // Percent stats use linear cost 100 each (tunable)
   const pctCost = { hit: 100, crit: 120, dodge: 110 };
   for (const stat of ['hit','crit','dodge']) {
     const want = Math.max(0, deltas[stat]|0);
@@ -269,7 +275,6 @@ app.post('/battle/finish', async (req, reply) => {
   if (!p0) return reply.code(404).send({ error: 'not_found' });
   const p = await applyRegen(req.wallet, p0) || p0;
 
-  // Reward curve: 1–5 fixed-ish; 6+ gentle growth
   const base = (lvl <= 5)
     ? [0,100,150,200,250,300][lvl]
     : Math.round(300 * Math.pow(1.01, (lvl - 5)));
@@ -277,7 +282,7 @@ app.post('/battle/finish', async (req, reply) => {
   const jfEarned = victory ? base : 0;
   const energyReward = victory ? (3 + Math.floor(Math.random()*4)) : (1 + Math.floor(Math.random()*2));
 
-  // Validate progression: allow finishing current unlocked or next only
+  // Allow finishing current unlocked or the very next
   const srvUnlocked = p.unlocked_level | 0; // defaults to 5 on new profiles
   if (lvl > Math.max(1, srvUnlocked + 1)) {
     return reply.code(400).send({ error: 'wave_not_unlocked' });
@@ -301,14 +306,14 @@ app.post('/battle/finish', async (req, reply) => {
   return reply.send({ ok:true, profile: toClient(rows[0]) });
 });
 
-// claim JFUEL via XRPL hot wallet (kept from your build)
+// claim JFUEL via XRPL hot wallet (kept)
 app.post('/claim/start', async (req, reply) => {
   const { amount } = req.body || {};
   const amt = Math.max(1, parseInt(amount||0, 10));
+
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
 
-  // basic cooldown: 1 per 5 minutes
   const last = p0.last_claim_at ? new Date(p0.last_claim_at) : null;
   if (last && (Date.now() - last.getTime()) < 5*60*1000) {
     return reply.code(429).send({ error: 'cooldown' });
