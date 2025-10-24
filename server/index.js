@@ -1,7 +1,7 @@
-// server/index.js — XRPixel Jets MKG (2025-10-24 econ-0.10 + level-costs-30x)
-// Costs: next cost = scaled( BASE_PER_LEVEL * (currentLevel+1) )
-// With ECON_SCALE=0.10 and BASE_PER_LEVEL=300 -> 30, 60, 90, ...
-// Applies to: HP, EnergyCap, Regen, Hit, Crit, Dodge (pct stats use ms_hit/ms_crit/ms_dodge)
+// server/index.js — XRPixel Jets MKG (2025-10-24 pct+core upgrades aligned)
+// - Upgrades: health, energyCap, regenPerMin, hit, crit, dodge
+// - Next cost = scaled(BASE_PER_LEVEL * (level+1))  (ECON_SCALE default 0.10)
+// - Rewards remain scaled (tens). CORS + regen + rate limit unchanged.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -19,27 +19,24 @@ const pool = new Pool({
 
 function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
 
-// ===== Economy scale =====
+// ===== Economy =====
 const ECON_SCALE_DEFAULT = Number(process.env.ECON_SCALE || 0.10);
+const BASE_PER_LEVEL = Number(process.env.BASE_PER_LEVEL || 300); // 300 raw -> 30 visible w/scale 0.10
+
 function pickScale(req){
   const q = Number(req.query?.econScale);
   const b = Number(req.body?.econScale);
-  const s = Number.isFinite(b) && b > 0 ? b : (Number.isFinite(q) && q > 0 ? q : ECON_SCALE_DEFAULT);
-  return s;
+  return (Number.isFinite(b) && b > 0) ? b : (Number.isFinite(q) && q > 0 ? q : ECON_SCALE_DEFAULT);
 }
 function scaled(n, s){ return Math.max(1, Math.round((Number(n)||0) * s)); }
-
-// ===== Per-level cost (raw, before scale) =====
-const BASE_PER_LEVEL = Number(process.env.BASE_PER_LEVEL || 300); // 300 raw -> 30 after scale 0.10
 function rawCostForNextLevel(currentLevel) {
-  // currentLevel is the already-applied level; "next" is +1
   const idx = (Number(currentLevel) || 0) + 1;
   return BASE_PER_LEVEL * idx;
 }
 
 const app = Fastify({ logger: true });
 
-// ---------- CORS ----------
+// ===== CORS =====
 const ORIGIN_LIST = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeygo.io,http://localhost:8000')
   .split(',')
   .map(s => s.trim())
@@ -56,7 +53,7 @@ await app.register(cors, {
   hideOptionsRoute: false,
 });
 
-// ---------- Helpers ----------
+// ===== Helpers =====
 async function ensureProfile(wallet){
   const { rows } = await pool.query(
     `insert into player_profiles (wallet)
@@ -129,12 +126,12 @@ async function applyRegen(wallet, row) {
   return row;
 }
 
-// ---------- Simple rate limiter ----------
+// ===== Rate limit =====
 const RATE = { windowMs: 10_000, maxPerWindow: 30 };
-const bucket = new Map(); // key = ip|wallet -> {count, ts}
+const bucket = new Map();
 
 app.addHook('onRequest', async (req, reply) => {
-  if (req.raw.url === '/session/start') return; // open
+  if (req.raw.url === '/session/start') return;
   const w = req.headers['x-wallet'];
   if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
     return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
@@ -152,8 +149,7 @@ app.addHook('onRequest', async (req, reply) => {
   }
 });
 
-// ---------- Routes ----------
-
+// ===== Routes =====
 app.post('/session/start', async (req, reply) => {
   const { address } = req.body || {};
   if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) {
@@ -170,7 +166,7 @@ app.get('/profile', async (req, reply) => {
   return reply.send(toClient(p));
 });
 
-// ----- Costs (level-based, scaled to ECON_SCALE) -----
+// --- Costs for all 6 stats (scaled) ---
 app.get('/ms/costs', async (req, reply) => {
   const scale = pickScale(req);
   const p0 = await getProfileRaw(req.wallet);
@@ -191,7 +187,7 @@ app.get('/ms/costs', async (req, reply) => {
   return reply.send({ ok:true, levels: { ...lvCore, ...lvPct }, costs, scale });
 });
 
-// ----- Apply upgrades (deduct scaled, level-based cost; persist next level) -----
+// --- Apply upgrades (for all 6 stats) ---
 app.post('/ms/upgrade', async (req, reply) => {
   const scale = pickScale(req);
   const body = req.body || {};
@@ -213,7 +209,6 @@ app.post('/ms/upgrade', async (req, reply) => {
   let spend = 0;
   const applied = { health:0, energyCap:0, regenPerMin:0, hit:0, crit:0, dodge:0 };
 
-  // Core stats
   for (const stat of ['health','energyCap','regenPerMin']) {
     const want = Math.max(0, deltas[stat]|0);
     for (let i = 0; i < want; i++) {
@@ -224,7 +219,6 @@ app.post('/ms/upgrade', async (req, reply) => {
     }
   }
 
-  // Pct stats (via ms_hit/ms_crit/ms_dodge)
   for (const stat of ['hit','crit','dodge']) {
     const want = Math.max(0, deltas[stat]|0);
     for (let i = 0; i < want; i++) {
@@ -256,7 +250,7 @@ app.post('/ms/upgrade', async (req, reply) => {
   return reply.send({ ok:true, applied, spent: spend, profile: toClient(rows[0]), scale });
 });
 
-// ----- Energy endpoints -----
+// --- Energy endpoints ---
 app.post('/battle/start', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -281,7 +275,7 @@ app.post('/battle/turn', async (req, reply) => {
   return reply.send({ ok:true, energy: rows[0].energy|0 });
 });
 
-// ----- Rewards (kept at tens via econScale) -----
+// --- Rewards (scaled to tens) ---
 app.post('/battle/finish', async (req, reply) => {
   const scale = pickScale(req);
   const { victory, wave } = req.body || {};
@@ -321,7 +315,7 @@ app.post('/battle/finish', async (req, reply) => {
   return reply.send({ ok:true, profile: toClient(rows[0]), scale, jfEarned, energyReward });
 });
 
-// ----- Claim passthrough -----
+// --- Claim passthrough ---
 app.post('/claim/start', async (req, reply) => {
   const { amount } = req.body || {};
   const amt = Math.max(1, parseInt(amount||0, 10));
