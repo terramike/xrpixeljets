@@ -1,5 +1,6 @@
-// server/claimJetFuel.js — XRPixel Jets MKG (2025-10-25b)
-// IOU/XRP payouts + robust trustline detection + debug helpers.
+// server/claimJetFuel.js — XRPixel Jets MKG (2025-10-25c)
+// Fixes: use client.request({ command, ...flat args }) for xrpl.js
+// Robust IOU/XRP payout + trustline check + inspect + user-sign fallback.
 
 import xrpl from "xrpl";
 
@@ -28,28 +29,24 @@ const FALLBACK_TXJSON = process.env.CLAIM_FALLBACK_TXJSON === "1";
 
 function assertEnv() {
   if (!HOT_SEED) throw new Error("HOT_WALLET_SEED not set");
-  if (TOKEN_MODE === "IOU") {
-    if (!ISSUER) throw new Error("ISSUER_ADDRESS not set for IOU");
+  if (TOKEN_MODE === "IOU" && !ISSUER) {
+    throw new Error("ISSUER_ADDRESS not set for IOU");
   }
 }
 
-// Convert 40-hex → ASCII alias (strip trailing 0x00)
 function hexToAsciiAlias(hex) {
   if (!/^[A-F0-9]{40}$/i.test(hex || "")) return "";
   try {
     const buf = Buffer.from(hex, "hex");
-    const noZeros = buf.toString("ascii").replace(/\x00+$/g, "");
-    return noZeros;
+    return buf.toString("ascii").replace(/\x00+$/g, "");
   } catch {
     return "";
   }
 }
 
-// For IOU: pick the exact currency field we will use on txs
 function currencyField() {
   if (CODE_HEX && /^[A-F0-9]{40}$/i.test(CODE_HEX)) return CODE_HEX;
-  if (/^[A-Z0-9]{3}$/.test(CODE_ASCII)) return CODE_ASCII; // 3-char path
-  // Longer than 3 chars → 160-bit code (20 bytes, right-padded zeros)
+  if (/^[A-Z0-9]{3}$/.test(CODE_ASCII)) return CODE_ASCII;
   const hex = Buffer.from(CODE_ASCII, "ascii")
     .toString("hex")
     .padEnd(40, "0")
@@ -64,33 +61,32 @@ async function client() {
   return c;
 }
 
-// Robust trustline check: matches by issuer + (hex|alias)
+// ---------- Trustline check (flat request shape) ----------
 export async function hasTrustline({ account }) {
   if (TOKEN_MODE !== "IOU") return true;
-  const wantHex = currencyField();              // e.g., 4A4655... for "JFUEL"
-  const wantAlias = CODE_ASCII.toUpperCase();   // "JFUEL"
+  const wantHex = currencyField();
+  const wantAlias = CODE_ASCII.toUpperCase();
   const c = await client();
   try {
-    // Try filtered by peer first
     let lines = [];
     try {
       const r = await c.request({
-        method: "account_lines",
-        params: [{ account, peer: ISSUER, ledger_index: "validated" }],
+        command: "account_lines",
+        account,
+        peer: ISSUER,
+        ledger_index: "validated",
       });
       lines = r.result?.lines || [];
     } catch {
-      // Fallback without peer filter
       const r = await c.request({
-        method: "account_lines",
-        params: [{ account, ledger_index: "validated" }],
+        command: "account_lines",
+        account,
+        ledger_index: "validated",
       });
       lines = (r.result?.lines || []).filter(
         (l) => (l.account || l.issuer || l.peer) === ISSUER
       );
     }
-
-    // Accept match if currency equals HEX or alias, OR if the HEX decodes to alias
     return lines.some((l) => {
       const cur = (l.currency || "").toUpperCase();
       const alias = hexToAsciiAlias(cur).toUpperCase();
@@ -101,15 +97,16 @@ export async function hasTrustline({ account }) {
   }
 }
 
-// Debug helper: return what the server thinks
+// ---------- Inspect helper (flat request shape) ----------
 export async function inspectTrustlines({ account }) {
   const wantHex = currencyField();
   const wantAlias = CODE_ASCII.toUpperCase();
   const c = await client();
   try {
     const r = await c.request({
-      method: "account_lines",
-      params: [{ account, ledger_index: "validated" }],
+      command: "account_lines",
+      account,
+      ledger_index: "validated",
     });
     const rows = (r.result?.lines || []).map((l) => ({
       counterparty: l.account || l.issuer || l.peer || "",
@@ -122,10 +119,12 @@ export async function inspectTrustlines({ account }) {
     }));
     const matches = rows.filter(
       (l) =>
-        (l.counterparty === ISSUER) &&
-        (l.currency?.toUpperCase() === wantHex ||
-         l.currency?.toUpperCase() === wantAlias ||
-         (l.alias || "").toUpperCase() === wantAlias)
+        l.counterparty === ISSUER &&
+        (
+          (l.currency || "").toUpperCase() === wantHex ||
+          (l.currency || "").toUpperCase() === wantAlias ||
+          (l.alias || "").toUpperCase() === wantAlias
+        )
     );
     return {
       network: WSS,
@@ -142,7 +141,7 @@ export async function inspectTrustlines({ account }) {
   }
 }
 
-// Build unsigned tx for user-sign fallback
+// ---------- Prepare unsigned tx (user-sign fallback) ----------
 export async function prepareIssued({ to, amount }) {
   assertEnv();
   const c = await client();
@@ -164,7 +163,7 @@ export async function prepareIssued({ to, amount }) {
   }
 }
 
-// Server-send hot-wallet
+// ---------- Hot-wallet send ----------
 export async function sendIssued({ to, amount }) {
   assertEnv();
   if (!to || !to.startsWith("r")) throw new Error("bad_destination");
