@@ -1,13 +1,20 @@
-// server/index.js — XRPixel Jets MKG (2025-10-25e, unified)
-// - Restores /ms/costs (server-authoritative, econScale param)
-// - Uses claim_audit for daily cap + cooldown
-// - XRPL claim via claimJetFuel.js
-// - Admin: /debug/claim/inspect, /debug/claim/reset, /debug/claim/ping
+// server/index.js — XRPixel Jets (2025-10-25f, JWT+diagnostics+costs)
+// - CORS allowlist
+// - Simple rate limit (ip|wallet)
+// - Regen-on-read
+// - /ms/costs + /ms/upgrade authoritative
+// - Claim limits via claim_audit (daily + cooldown)
+// - XRPL payout w/ robust diagnostics
+// - Signed nonce → verify → JWT; /claim/start requires Bearer + X-Wallet
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import pkg from 'pg';
 import * as claim from './claimJetFuel.js';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const jwt = require('jsonwebtoken');
+const rippleKeypairs = require('ripple-keypairs'); // signature verify
 
 const { Pool } = pkg;
 
@@ -24,6 +31,7 @@ const CLAIM_COOLDOWN_SEC =
     ? Number(process.env.CLAIM_COOLDOWN_SEC)
     : Number(process.env.CLAIM_COOLDOWN_HOURS || 0) * 3600;
 const ADMIN_KEY = (process.env.ADMIN_KEY || '');
+const JWT_SECRET = (process.env.JWT_SECRET || 'change-me');
 
 if (!DATABASE_URL) { console.error('DATABASE_URL not set'); process.exit(1); }
 
@@ -52,6 +60,9 @@ await app.register(cors, {
 // ---------- helpers ----------
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n|0));
 const nowUTC = () => new Date();
+
+// in-memory nonce store
+const nonces = new Map(); // key=nonce -> { address, scope, ts, exp, used }
 
 function recomputeCurrent(base, level) {
   const b = base || { health:20, energyCap:100, regenPerMin:1 };
@@ -111,13 +122,10 @@ async function applyRegen(wallet, row) {
     const cap = Number(row.energy_cap ?? ms_cur.energyCap ?? 100);
     const rpm = Number(ms_cur.regenPerMin ?? 1);
     if (rpm <= 0) return row;
-
     const minutes = Math.floor((nowUTC() - updated) / 60000);
     if (minutes <= 0) return row;
-
     const gain = minutes * rpm;
     const nextEnergy = clamp((row.energy|0) + gain, 0, cap);
-
     if (nextEnergy !== (row.energy|0)) {
       const { rows: r2 } = await pool.query(
         `update player_profiles
@@ -139,7 +147,10 @@ const RATE = { windowMs: 10_000, maxPerWindow: 30 };
 const bucket = new Map();
 
 app.addHook('onRequest', async (req, reply) => {
-  if (req.raw.url === '/session/start') return;
+  // open routes
+  if (req.raw.url?.startsWith('/session/start')) return;
+  if (req.raw.url?.startsWith('/session/verify')) return;
+
   const w = req.headers['x-wallet'];
   if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
     return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
@@ -157,33 +168,72 @@ app.addHook('onRequest', async (req, reply) => {
   }
 });
 
-// ---------- routes ----------
-
-// open (no auth): ensure profile exists
+// ---------- Auth (signed nonce → JWT) ----------
 app.post('/session/start', async (req, reply) => {
   const address = (req.body?.address || '').trim();
   if (!address || !address.startsWith('r')) {
     return reply.code(400).send({ error: 'bad_address' });
   }
   await ensureProfile(address);
-  // seed defaults (best-effort)
-  await pool.query(
-    `update player_profiles
-        set ms_base = coalesce(ms_base,'{"health":20,"energyCap":100,"regenPerMin":1}'::jsonb),
-            ms_level = coalesce(ms_level,'{"health":0,"energyCap":0,"regenPerMin":0}'::jsonb),
-            ms_current = coalesce(ms_current,'{"health":20,"energyCap":100,"regenPerMin":1}'::jsonb),
-            energy = coalesce(energy, 100),
-            energy_cap = coalesce(energy_cap, 100),
-            jet_fuel = coalesce(jet_fuel, 0),
-            unlocked_level = coalesce(unlocked_level, 1),
-            updated_at = now()
-      where wallet=$1`,
-    [address]
-  );
-  return reply.send({ ok:true });
+
+  const nonce = [...crypto.getRandomValues(new Uint8Array(32))]
+    .map((b)=>b.toString(16).padStart(2,'0')).join('');
+  const scope = 'play,upgrade,claim';
+  const ts = Math.floor(Date.now()/1000);
+  const payload = `${nonce}||${scope}||${ts}||${address}`;
+  nonces.set(nonce, { address, scope, ts, exp: ts + 5*60, used: false });
+  return reply.send({ nonce, scope, ts, payload });
 });
 
-// regen on read
+app.post('/session/verify', async (req, reply) => {
+  const { address, signature, publicKey, payload } = req.body || {};
+  if (!address || !signature || !publicKey || !payload) {
+    return reply.code(400).send({ error: 'bad_signature' });
+  }
+  // payload must be nonce||scope||ts||address
+  const [nonce, scope, tsStr, addr] = String(payload).split('||');
+  if (!nonces.has(nonce)) return reply.code(400).send({ error: 'expired_nonce' });
+  const rec = nonces.get(nonce);
+  const now = Math.floor(Date.now()/1000);
+  if (rec.used || rec.address !== addr || rec.address !== address || now > rec.exp) {
+    nonces.delete(nonce);
+    return reply.code(400).send({ error: 'expired_nonce' });
+  }
+  // Verify with ripple-keypairs
+  try {
+    const ok = rippleKeypairs.verify(payload, signature, publicKey);
+    if (!ok) return reply.code(401).send({ error: 'bad_signature' });
+  } catch (e) {
+    return reply.code(401).send({ error: 'bad_signature' });
+  }
+  rec.used = true; nonces.set(nonce, rec);
+
+  const token = jwt.sign(
+    { sub: address, scope: 'play,upgrade,claim' },
+    JWT_SECRET,
+    { algorithm: 'HS256', expiresIn: '45m' }
+  );
+  return reply.send({ ok: true, jwt: token });
+});
+
+// Require JWT on protected routes (at least claim)
+app.addHook('preHandler', async (req, reply) => {
+  if (req.routerPath !== '/claim/start') return; // only enforce for claim now
+  const hdr = req.headers['authorization'] || '';
+  const m = hdr.match(/^Bearer\s+(.+)$/i);
+  if (!m) return reply.code(401).send({ error: 'unauthorized' });
+  try {
+    const decoded = jwt.verify(m[1], JWT_SECRET, { algorithms: ['HS256'] });
+    if (decoded.sub !== req.wallet) {
+      return reply.code(401).send({ error: 'unauthorized' });
+    }
+    req.jwt = decoded;
+  } catch (e) {
+    return reply.code(401).send({ error: 'unauthorized' });
+  }
+});
+
+// ---------- Gameplay ----------
 app.get('/profile', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -191,7 +241,6 @@ app.get('/profile', async (req, reply) => {
   return reply.send(toClient(p));
 });
 
-// server-authoritative costs (all 6 stats), supports econScale query
 app.get('/ms/costs', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -203,9 +252,7 @@ app.get('/ms/costs', async (req, reply) => {
     crit: Number(p0.ms_crit ?? 10),
     dodge: Number(p0.ms_dodge ?? 0),
   };
-
   const price = (n) => Math.max(1, Math.round(BASE_PER_LEVEL * (n + 1) * scale));
-
   const costs = {
     health: price(lv.health|0),
     energyCap: price(lv.energyCap|0),
@@ -214,11 +261,9 @@ app.get('/ms/costs', async (req, reply) => {
     crit: price(pct.crit|0),
     dodge: price(pct.dodge|0),
   };
-
   return reply.send({ costs, levels: { ...lv, ...pct }, scale });
 });
 
-// server-authoritative upgrade apply
 app.post('/ms/upgrade', async (req, reply) => {
   const body = req.body || {};
   const econScale = Math.max(0.01, Number(body.econScale || ECON_SCALE));
@@ -278,7 +323,7 @@ app.post('/ms/upgrade', async (req, reply) => {
   return reply.send({ ok:true, applied, spent: spend, profile: toClient(rows[0]), scale: econScale });
 });
 
-// battle minimal
+// Minimal battle
 app.post('/battle/start', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -294,7 +339,7 @@ app.post('/battle/turn', async (_req, reply) => reply.send({ ok:true }));
 app.post('/battle/finish', async (req, reply) => {
   const body = req.body || {};
   const victory = !!body.victory;
-  const wave = clamp(Number(body.wave || 1), 1, 9999);
+  const wave = Math.max(1, Number(body.wave || 1));
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
 
@@ -312,7 +357,7 @@ app.post('/battle/finish', async (req, reply) => {
   return reply.send({ ok:true, reward, profile: toClient(rows[0]) });
 });
 
-// ---------- CLAIM (audit-driven) ----------
+// ---------- CLAIM (audit-derived daily cap + cooldown) ----------
 app.post('/claim/start', async (req, reply) => {
   try {
     const wallet = (req.headers['x-wallet'] || '').trim();
@@ -325,7 +370,6 @@ app.post('/claim/start', async (req, reply) => {
     }
     await ensureProfile(wallet);
 
-    // derive day & cooldown from audit
     const { rows: agg } = await pool.query(
       `with today as (
          select coalesce(sum(amount),0)::int as sum_today
@@ -367,31 +411,56 @@ app.post('/claim/start', async (req, reply) => {
       [wallet, amount, txid || null]
     );
 
-    // Best-effort update last_claim_at if present
+    // best-effort profile stamp if column exists
     try { await pool.query(`update player_profiles set last_claim_at = now() where wallet=$1`, [wallet]); } catch {}
 
     return reply.send({ ok:true, txid, txJSON });
   } catch (e) {
-    req.log.error({ err:e }, 'claim_send_failed');
-    return reply.code(502).send({ error: 'send_failed', message: e.message || String(e) });
+    // normalize common XRPL preflight errors for clearer client logs
+    const m = String(e?.message || e);
+    if (m.includes('dest_account_not_found')) {
+      return reply.code(502).send({ error:'send_failed', message:'Destination account not found (network mismatch or unfunded address).' });
+    }
+    if (m.includes('issuer_account_not_found')) {
+      return reply.code(502).send({ error:'send_failed', message:'Issuer account not found on this network.' });
+    }
+    app.log.error({ err:e }, 'claim_send_failed');
+    return reply.code(502).send({ error: 'send_failed', message: m });
   }
 });
 
-// ---------- Admin: diagnostics/inspect/reset ----------
+// ---------- Admin: diagnostics / inspect / reset ----------
+app.get('/debug/claim/ping', async (req, reply) => {
+  if (!ADMIN_KEY || (req.headers['x-admin-key'] || '') !== ADMIN_KEY) {
+    return reply.code(401).send({ error: 'unauthorized' });
+  }
+  const wallet = (req.query.wallet || '').trim();
+  try {
+    const info = await claim.diagnostics({ dest: wallet || null });
+    return reply.send({ ok:true, info });
+  } catch (e) {
+    return reply.code(500).send({ error: 'ping_failed', message: e.message || String(e) });
+  }
+});
+
 app.get('/debug/claim/inspect', async (req, reply) => {
-  if (!ADMIN_KEY) return reply.code(500).send({ error: 'server_misconfig' });
-  if ((req.headers['x-admin-key'] || '') !== ADMIN_KEY) return reply.code(401).send({ error: 'unauthorized' });
+  if (!ADMIN_KEY || (req.headers['x-admin-key'] || '') !== ADMIN_KEY) {
+    return reply.code(401).send({ error: 'unauthorized' });
+  }
   const wallet = (req.query.wallet || '').trim();
   if (!wallet || !wallet.startsWith('r')) return reply.code(400).send({ error: 'missing_wallet' });
   try {
-    const info = await claim.inspectTrustlines({ account: wallet });
-    return reply.send({ ok:true, info });
-  } catch (e) { return reply.code(500).send({ error: 'inspect_failed', message: e.message || String(e) }); }
+    const info = await claim.hasTrustline({ account: wallet });
+    return reply.send({ ok:true, trustline: !!info });
+  } catch (e) {
+    return reply.code(500).send({ error: 'inspect_failed', message: e.message || String(e) });
+  }
 });
 
 app.post('/debug/claim/reset', async (req, reply) => {
-  if (!ADMIN_KEY) return reply.code(500).send({ error: 'server_misconfig' });
-  if ((req.headers['x-admin-key'] || '') !== ADMIN_KEY) return reply.code(401).send({ error: 'unauthorized' });
+  if (!ADMIN_KEY || (req.headers['x-admin-key'] || '') !== ADMIN_KEY) {
+    return reply.code(401).send({ error: 'unauthorized' });
+  }
   const wallet = (req.headers['x-wallet'] || req.body?.wallet || '').trim();
   if (!wallet || !wallet.startsWith('r')) return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
   try {
@@ -404,14 +473,6 @@ app.post('/debug/claim/reset', async (req, reply) => {
     );
     return reply.send({ ok:true });
   } catch (e) { return reply.code(500).send({ error: 'db_error' }); }
-});
-
-// Optional: verify network + accounts
-app.get('/debug/claim/ping', async (req, reply) => {
-  if (!ADMIN_KEY || (req.headers['x-admin-key'] || '') !== ADMIN_KEY) return reply.code(401).send({ error: 'unauthorized' });
-  const wallet = (req.query.wallet || '').trim();
-  try { const info = await claim.diagnostics({ dest: wallet || null }); return reply.send({ ok:true, info }); }
-  catch (e) { return reply.code(500).send({ error: 'ping_failed', message: e.message || String(e) }); }
 });
 
 app.listen({ port: PORT, host: '0.0.0.0' }, (err, addr) => {
