@@ -1,7 +1,7 @@
-// server/index.js — XRPixel Jets MKG (2025-10-24 pct+core upgrades aligned)
-// - Upgrades: health, energyCap, regenPerMin, hit, crit, dodge
-// - Next cost = scaled(BASE_PER_LEVEL * (level+1))  (ECON_SCALE default 0.10)
-// - Rewards remain scaled (tens). CORS + regen + rate limit unchanged.
+// server/index.js — XRPixel Jets MKG (2025-10-25 trustline+debug)
+// Fastify + PG, CORS allowlist, rate limiting, regen-on-read, MS costs/upgrades,
+// battle rewards in tens via econScale (server authoritative),
+// XRPL claim (IOU/XRP) with robust trustline check, and admin debug tools.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -10,71 +10,72 @@ import * as claim from './claimJetFuel.js';
 
 const { Pool } = pkg;
 
-const PORT = process.env.PORT || 10000;
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
-
-function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
-
-// ===== Economy =====
-const ECON_SCALE_DEFAULT = Number(process.env.ECON_SCALE || 0.10);
-const BASE_PER_LEVEL = Number(process.env.BASE_PER_LEVEL || 300); // 300 raw -> 30 visible w/scale 0.10
-
-function pickScale(req){
-  const q = Number(req.query?.econScale);
-  const b = Number(req.body?.econScale);
-  return (Number.isFinite(b) && b > 0) ? b : (Number.isFinite(q) && q > 0 ? q : ECON_SCALE_DEFAULT);
-}
-function scaled(n, s){ return Math.max(1, Math.round((Number(n)||0) * s)); }
-function rawCostForNextLevel(currentLevel) {
-  const idx = (Number(currentLevel) || 0) + 1;
-  return BASE_PER_LEVEL * idx;
-}
-
-const app = Fastify({ logger: true });
-
-// ===== CORS =====
-const ORIGIN_LIST = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeygo.io,http://localhost:8000')
+// ---- ENV ----
+const PORT = Number(process.env.PORT || 8080);
+const CORS_ORIGIN = (process.env.CORS_ORIGIN || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
+const DATABASE_URL = process.env.DATABASE_URL;
+const ECON_SCALE = Number(process.env.ECON_SCALE || '0.10');
+const BASE_PER_LEVEL = Number(process.env.BASE_PER_LEVEL || '300');
+const CLAIM_MAX_PER_24H = Number(process.env.CLAIM_MAX_PER_24H || '500'); // JFUEL units
+const CLAIM_COOLDOWN_SEC = Number(process.env.CLAIM_COOLDOWN_SEC || '300');
+const ADMIN_KEY = (process.env.ADMIN_KEY || '');
 
-await app.register(cors, {
-  origin: ORIGIN_LIST,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Accept', 'Origin', 'X-Requested-With', 'X-Wallet'],
-  credentials: false,
-  maxAge: 86400,
-  preflight: true,
-  strictPreflight: false,
-  hideOptionsRoute: false,
-});
-
-// ===== Helpers =====
-async function ensureProfile(wallet){
-  const { rows } = await pool.query(
-    `insert into player_profiles (wallet)
-     values ($1)
-     on conflict (wallet) do nothing
-     returning wallet`, [wallet]
-  );
-  return rows[0]?.wallet || wallet;
+if (!DATABASE_URL) {
+  console.error('DATABASE_URL not set');
+  process.exit(1);
 }
 
-async function getProfileRaw(wallet){
-  const { rows } = await pool.query(
-    `select wallet, jet_fuel, energy, energy_cap,
-            ms_base, ms_level, ms_current,
-            coalesce(ms_hit,0)::int as ms_hit,
-            coalesce(ms_crit,10)::int as ms_crit,
-            coalesce(ms_dodge,0)::int as ms_dodge,
-            unlocked_level, last_claim_at, updated_at, created_at
-       from player_profiles where wallet = $1`, [wallet]
-  );
-  return rows[0] || null;
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes('sslmode=require')
+    ? { rejectUnauthorized: false }
+    : (process.env.DB_SSL === '1' ? { rejectUnauthorized: false } : undefined),
+});
+
+const app = Fastify({ logger: true });
+
+// ---- CORS ----
+await app.register(cors, {
+  origin: (origin, cb) => {
+    // allow same-origin / non-browser
+    if (!origin) return cb(null, true);
+    if (CORS_ORIGIN.length === 0) return cb(null, true);
+    if (CORS_ORIGIN.includes(origin)) return cb(null, true);
+    cb(new Error('CORS blocked'), false);
+  },
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Wallet','X-Admin-Key'],
+  credentials: false,
+});
+
+// ---- utils ----
+const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n|0));
+const nowUTC = () => new Date();
+
+function toClient(row) {
+  // Shapes expected by client
+  const ms_base = row.ms_base || { health:20, energyCap:100, regenPerMin:1 };
+  const ms_level = row.ms_level || { health:0, energyCap:0, regenPerMin:0 };
+  const ms_current = row.ms_current || recomputeCurrent(ms_base, ms_level);
+  return {
+    ms: {
+      base: ms_base,
+      level: ms_level,
+      current: ms_current
+    },
+    pct: {
+      hit: Number(row.ms_hit ?? 0),
+      crit: Number(row.ms_crit ?? 10),
+      dodge: Number(row.ms_dodge ?? 0),
+    },
+    jetFuel: Number(row.jet_fuel ?? 0),
+    energy: Number(row.energy ?? 0),
+    energyCap: Number(row.energy_cap ?? ms_current.energyCap ?? 100),
+    unlockedLevel: Number(row.unlocked_level ?? 1),
+  };
 }
 
 function recomputeCurrent(base, level) {
@@ -87,38 +88,57 @@ function recomputeCurrent(base, level) {
   };
 }
 
-function toClient(row){
-  const ms_current = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
-  return {
-    ms: { base: row.ms_base, level: row.ms_level, current: ms_current },
-    pct: { hit: row.ms_hit|0, crit: row.ms_crit|0, dodge: row.ms_dodge|0 },
-    jetFuel: row.jet_fuel|0,
-    energy: row.energy|0,
-    energyCap: row.energy_cap|0,
-    unlockedLevel: row.unlocked_level|0,
-  };
+// ---- profile helpers ----
+async function ensureProfile(wallet) {
+  const { rows } = await pool.query(
+    `insert into player_profiles (wallet)
+       values ($1)
+       on conflict (wallet) do nothing
+     returning wallet`,
+    [wallet]
+  );
+  return rows[0]?.wallet || wallet;
+}
+
+async function getProfileRaw(wallet){
+  const { rows } = await pool.query(
+    `select wallet, jet_fuel, energy, energy_cap,
+            ms_base, ms_level, ms_current,
+            coalesce(ms_hit,0)::int as ms_hit,
+            coalesce(ms_crit,10)::int as ms_crit,
+            coalesce(ms_dodge,0)::int as ms_dodge,
+            coalesce(unlocked_level,1)::int as unlocked_level,
+            last_claim_at, updated_at, created_at
+       from player_profiles where wallet = $1`,
+    [wallet]
+  );
+  return rows[0] || null;
 }
 
 async function applyRegen(wallet, row) {
   try {
-    const now = new Date();
-    const updated = new Date(row.updated_at);
-    const minutes = Math.max(0, Math.floor((now - updated)/60000));
-    const ms = recomputeCurrent(row.ms_base, row.ms_level);
-    const regenPerMin = (ms.regenPerMin|0) || 1;
-    if (minutes > 0 && regenPerMin > 0) {
-      const cap = (row.energy_cap|0) || 100;
-      const next = clamp((row.energy|0) + minutes * regenPerMin, 0, cap);
-      if (next !== (row.energy|0)) {
-        const { rows } = await pool.query(
-          `update player_profiles
-             set energy = $2, ms_current = $3, updated_at = now()
-           where wallet = $1
-           returning *`,
-          [wallet, next, JSON.stringify(ms)]
-        );
-        return rows[0];
-      }
+    const updated = row.updated_at ? new Date(row.updated_at) : null;
+    if (!updated) return row;
+    const ms_cur = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
+    const cap = Number(row.energy_cap ?? ms_cur.energyCap ?? 100);
+    const rpm = Number(ms_cur.regenPerMin ?? 1);
+    if (rpm <= 0) return row;
+
+    const minutes = Math.floor((nowUTC() - updated) / 60000);
+    if (minutes <= 0) return row;
+
+    const gain = minutes * rpm;
+    const nextEnergy = clamp((row.energy|0) + gain, 0, cap);
+
+    if (nextEnergy !== (row.energy|0)) {
+      const { rows: r2 } = await pool.query(
+        `update player_profiles
+            set energy=$2, updated_at=now()
+          where wallet=$1
+          returning *`,
+        [wallet, nextEnergy]
+      );
+      return r2[0];
     }
   } catch (e) {
     app.log.warn({ err:e }, 'regen_nonfatal');
@@ -126,12 +146,14 @@ async function applyRegen(wallet, row) {
   return row;
 }
 
-// ===== Rate limit =====
+// ---- rate limiter (ip|wallet) ----
 const RATE = { windowMs: 10_000, maxPerWindow: 30 };
-const bucket = new Map();
+const bucket = new Map(); // key = ip|wallet -> {count, ts}
 
 app.addHook('onRequest', async (req, reply) => {
+  // open route
   if (req.raw.url === '/session/start') return;
+
   const w = req.headers['x-wallet'];
   if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
     return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
@@ -149,16 +171,33 @@ app.addHook('onRequest', async (req, reply) => {
   }
 });
 
-// ===== Routes =====
+// ---------- routes ----------
+
+// open: ensure profile exists (today no nonce/JWT)
 app.post('/session/start', async (req, reply) => {
-  const { address } = req.body || {};
-  if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) {
+  const address = (req.body?.address || '').trim();
+  if (!address || !address.startsWith('r')) {
     return reply.code(400).send({ error: 'bad_address' });
   }
   await ensureProfile(address);
-  return reply.send({ nonce: 'demo-nonce' });
+  // Optional: seed defaults on first run
+  await pool.query(
+    `update player_profiles
+        set ms_base = coalesce(ms_base,'{"health":20,"energyCap":100,"regenPerMin":1}'::jsonb),
+            ms_level = coalesce(ms_level,'{"health":0,"energyCap":0,"regenPerMin":0}'::jsonb),
+            ms_current = coalesce(ms_current,'{"health":20,"energyCap":100,"regenPerMin":1}'::jsonb),
+            energy = coalesce(energy, 100),
+            energy_cap = coalesce(energy_cap, 100),
+            jet_fuel = coalesce(jet_fuel, 0),
+            unlocked_level = coalesce(unlocked_level, 1),
+            updated_at = now()
+      where wallet=$1`,
+    [address]
+  );
+  return reply.send({ ok:true });
 });
 
+// regen on read
 app.get('/profile', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -166,178 +205,244 @@ app.get('/profile', async (req, reply) => {
   return reply.send(toClient(p));
 });
 
-// --- Costs for all 6 stats (scaled) ---
+// costs: BASE_PER_LEVEL * (level+1) * scale, min 1
 app.get('/ms/costs', async (req, reply) => {
-  const scale = pickScale(req);
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
-
-  const lvCore = p0.ms_level || { health:0, energyCap:0, regenPerMin:0 };
-  const lvPct  = { hit: p0.ms_hit|0, crit: p0.ms_crit|0, dodge: p0.ms_dodge|0 };
-
-  const costs = {
-    health:      scaled(rawCostForNextLevel(lvCore.health|0),      scale),
-    energyCap:   scaled(rawCostForNextLevel(lvCore.energyCap|0),   scale),
-    regenPerMin: scaled(rawCostForNextLevel(lvCore.regenPerMin|0), scale),
-    hit:         scaled(rawCostForNextLevel(lvPct.hit|0),          scale),
-    crit:        scaled(rawCostForNextLevel(lvPct.crit|0),         scale),
-    dodge:       scaled(rawCostForNextLevel(lvPct.dodge|0),        scale),
+  const scale = Math.max(0.01, Number(req.query?.econScale || ECON_SCALE));
+  const lv = p0.ms_level || { health:0, energyCap:0, regenPerMin:0 };
+  const pct = {
+    hit: Number(p0.ms_hit ?? 0),
+    crit: Number(p0.ms_crit ?? 10), // note: 'level' here is absolute points; treat +1 step cost as BASE*(lvl+1)
+    dodge: Number(p0.ms_dodge ?? 0),
   };
-
-  return reply.send({ ok:true, levels: { ...lvCore, ...lvPct }, costs, scale });
+  function nextCost(n) {
+    const raw = BASE_PER_LEVEL * (n + 1);
+    return Math.max(1, Math.round(raw * scale));
+  }
+  const costs = {
+    health: nextCost(lv.health|0),
+    energyCap: nextCost(lv.energyCap|0),
+    regenPerMin: nextCost(lv.regenPerMin|0),
+    hit: nextCost(pct.hit|0),
+    crit: nextCost(pct.crit|0),
+    dodge: nextCost(pct.dodge|0),
+  };
+  return reply.send({ costs, levels: { ...lv, ...pct }, scale });
 });
 
-// --- Apply upgrades (for all 6 stats) ---
+// server-authoritative upgrade apply (iterative per level)
 app.post('/ms/upgrade', async (req, reply) => {
-  const scale = pickScale(req);
   const body = req.body || {};
-  const deltas = {
-    health: (body.health|0) || 0,
-    energyCap: (body.energyCap|0) || 0,
-    regenPerMin: (body.regenPerMin|0) || 0,
-    hit: (body.hit|0) || 0,
-    crit: (body.crit|0) || 0,
-    dodge: (body.dodge|0) || 0
+  const econScale = Math.max(0.01, Number(body.econScale || ECON_SCALE));
+  const q = {
+    health: clamp(Number(body.health||0), 0, 9999),
+    energyCap: clamp(Number(body.energyCap||0), 0, 9999),
+    regenPerMin: clamp(Number(body.regenPerMin||0), 0, 9999),
+    hit: clamp(Number(body.hit||0), 0, 9999),
+    crit: clamp(Number(body.crit||0), 0, 9999),
+    dodge: clamp(Number(body.dodge||0), 0, 9999),
   };
 
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
 
-  const lvCore = { ...(p0.ms_level || { health:0, energyCap:0, regenPerMin:0 }) };
-  const lvPct  = { hit: p0.ms_hit|0, crit: p0.ms_crit|0, dodge: p0.ms_dodge|0 };
+  const lv0 = p0.ms_level || { health:0, energyCap:0, regenPerMin:0 };
+  const pct0 = {
+    hit: Number(p0.ms_hit ?? 0),
+    crit: Number(p0.ms_crit ?? 10),
+    dodge: Number(p0.ms_dodge ?? 0),
+  };
+
+  // Iterative price function
+  const priceAt = (n) => Math.max(1, Math.round(BASE_PER_LEVEL * (n + 1) * econScale));
 
   let spend = 0;
   const applied = { health:0, energyCap:0, regenPerMin:0, hit:0, crit:0, dodge:0 };
+  const lv = { ...lv0 };
 
-  for (const stat of ['health','energyCap','regenPerMin']) {
-    const want = Math.max(0, deltas[stat]|0);
-    for (let i = 0; i < want; i++) {
-      const raw = rawCostForNextLevel(lvCore[stat]|0);
-      const cost = scaled(raw, scale);
-      if ((p0.jet_fuel|0) - spend < cost) break;
-      spend += cost; applied[stat] += 1; lvCore[stat] = (lvCore[stat]|0) + 1;
-    }
-  }
+  // apply for core
+  for (let i=0;i<q.health;i++)  { const c=priceAt(lv.health);      if (spend+c > (p0.jet_fuel|0)) break; spend+=c; lv.health++; applied.health++; }
+  for (let i=0;i<q.energyCap;i++){ const c=priceAt(lv.energyCap);   if (spend+c > (p0.jet_fuel|0)) break; spend+=c; lv.energyCap++; applied.energyCap++; }
+  for (let i=0;i<q.regenPerMin;i++){ const c=priceAt(lv.regenPerMin);if (spend+c > (p0.jet_fuel|0)) break; spend+=c; lv.regenPerMin++; applied.regenPerMin++; }
 
-  for (const stat of ['hit','crit','dodge']) {
-    const want = Math.max(0, deltas[stat]|0);
-    for (let i = 0; i < want; i++) {
-      const raw = rawCostForNextLevel(lvPct[stat]|0);
-      const cost = scaled(raw, scale);
-      if ((p0.jet_fuel|0) - spend < cost) break;
-      spend += cost; applied[stat] += 1; lvPct[stat] = (lvPct[stat]|0) + 1;
-    }
-  }
+  // pct stats
+  let hit = pct0.hit, crit = pct0.crit, dodge = pct0.dodge;
+  for (let i=0;i<q.hit;i++)   { const c=priceAt(hit);   if (spend+c > (p0.jet_fuel|0)) break; spend+=c; hit++;   applied.hit++; }
+  for (let i=0;i<q.crit;i++)  { const c=priceAt(crit);  if (spend+c > (p0.jet_fuel|0)) break; spend+=c; crit++;  applied.crit++; }
+  for (let i=0;i<q.dodge;i++) { const c=priceAt(dodge); if (spend+c > (p0.jet_fuel|0)) break; spend+=c; dodge++; applied.dodge++; }
 
-  const ms_current = recomputeCurrent(p0.ms_base, lvCore);
-  const energyCapped = clamp(p0.energy|0, 0, (p0.energy_cap|0) || ms_current.energyCap || 100);
+  // recompute, clamp energy
+  const ms_current = recomputeCurrent(p0.ms_base, lv);
+  const cap = Number(p0.energy_cap ?? ms_current.energyCap ?? 100);
+  const energyCapped = clamp((p0.energy|0), 0, cap);
 
   const { rows } = await pool.query(
-    `update player_profiles set
-       jet_fuel = jet_fuel - $2,
-       ms_level = $3,
-       ms_current = $4,
-       ms_hit = $5,
-       ms_crit = $6,
-       ms_dodge = $7,
-       energy = $8,
-       updated_at = now()
-     where wallet = $1
-     returning *`,
-    [req.wallet, spend, lvCore, ms_current, lvPct.hit|0, lvPct.crit|0, lvPct.dodge|0, energyCapped]
+    `update player_profiles
+        set jet_fuel = jet_fuel - $2,
+            ms_level = $3,
+            ms_current = $4,
+            ms_hit = $5,
+            ms_crit = $6,
+            ms_dodge = $7,
+            energy = $8,
+            updated_at = now()
+      where wallet = $1
+      returning *`,
+    [req.wallet, spend, lv, ms_current, hit, crit, dodge, energyCapped]
   );
 
-  return reply.send({ ok:true, applied, spent: spend, profile: toClient(rows[0]), scale });
+  return reply.send({ ok:true, applied, spent: spend, profile: toClient(rows[0]), scale: econScale });
 });
 
-// --- Energy endpoints ---
+// battle — minimal authoritative rewards in tens via econScale
 app.post('/battle/start', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
   const p = await applyRegen(req.wallet, p0) || p0;
-  const next = clamp((p.energy|0) - 10, 0, (p.energy_cap|0)||100);
+  const next = clamp((p.energy|0) - 10, 0, Number(p.energy_cap ?? 100));
   const { rows } = await pool.query(
     `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
     [req.wallet, next]
   );
-  return reply.send({ ok:true, energy: rows[0].energy|0 });
+  return reply.send({ ok:true, profile: toClient(rows[0]) });
 });
 
 app.post('/battle/turn', async (req, reply) => {
-  const p0 = await getProfileRaw(req.wallet);
-  if (!p0) return reply.code(404).send({ error: 'not_found' });
-  const p = await applyRegen(req.wallet, p0) || p0;
-  const next = clamp((p.energy|0) - 1, 0, (p.energy_cap|0)||100);
-  const { rows } = await pool.query(
-    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
-    [req.wallet, next]
-  );
-  return reply.send({ ok:true, energy: rows[0].energy|0 });
+  // no-op pass-through for now (server is authoritative if you choose later)
+  return reply.send({ ok:true });
 });
 
-// --- Rewards (scaled to tens) ---
 app.post('/battle/finish', async (req, reply) => {
-  const scale = pickScale(req);
-  const { victory, wave } = req.body || {};
-  const lvl = Math.max(1, parseInt(wave || 1, 10));
-
+  const body = req.body || {};
+  const victory = !!body.victory;
+  const wave = clamp(Number(body.wave || 1), 1, 9999);
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
-  const p = await applyRegen(req.wallet, p0) || p0;
 
-  const baseRaw = (lvl <= 5)
-    ? [0,100,150,200,250,300][lvl]
-    : Math.round(300 * Math.pow(1.01, (lvl - 5)));
-
-  const jfEarned = victory ? scaled(baseRaw, scale) : 0;
-  const energyReward = victory ? (3 + Math.floor(Math.random()*4)) : (1 + Math.floor(Math.random()*2));
-
-  const srvUnlocked = p.unlocked_level | 0;
-  if (lvl > Math.max(1, srvUnlocked + 1)) {
-    return reply.code(400).send({ error: 'wave_not_unlocked' });
-  }
-
-  const nextUnlocked = (victory && lvl >= srvUnlocked) ? (lvl + 1) : srvUnlocked;
-  const cap = (p.energy_cap|0) || 100;
-  const newEnergy = clamp((p.energy|0) + energyReward, 0, cap);
-  const newJF = (p.jet_fuel|0) + jfEarned;
+  // rewards in "tens" scaled by ECON_SCALE. mild growth with wave.
+  const base = 10;
+  const reward = victory ? Math.max(0, Math.round(base * wave * ECON_SCALE)) : 0;
 
   const { rows } = await pool.query(
     `update player_profiles
-       set jet_fuel = $2,
-           energy = $3,
-           unlocked_level = $4,
-           updated_at = now()
-     where wallet = $1
-     returning *`,
-    [req.wallet, newJF, newEnergy, nextUnlocked]
+        set jet_fuel = jet_fuel + $2,
+            updated_at = now()
+      where wallet=$1
+      returning *`,
+    [req.wallet, reward]
   );
-  return reply.send({ ok:true, profile: toClient(rows[0]), scale, jfEarned, energyReward });
+  return reply.send({ ok:true, reward, profile: toClient(rows[0]) });
 });
 
-// --- Claim passthrough ---
+// --- Claim JetFuel (protected) ---
 app.post('/claim/start', async (req, reply) => {
-  const { amount } = req.body || {};
-  const amt = Math.max(1, parseInt(amount||0, 10));
-
-  const p0 = await getProfileRaw(req.wallet);
-  if (!p0) return reply.code(404).send({ error: 'not_found' });
-
-  const last = p0.last_claim_at ? new Date(p0.last_claim_at) : null;
-  if (last && (Date.now() - last.getTime()) < 5*60*1000) {
-    return reply.code(429).send({ error: 'cooldown' });
-  }
-
   try {
-    const txid = await claim.sendIssued(req.wallet, amt);
-    await pool.query(
-      `update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1`,
-      [req.wallet]
+    const wallet = (req.headers['x-wallet'] || '').trim();
+    if (!wallet || !wallet.startsWith('r')) {
+      return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
+    }
+
+    const amount = parseInt(req.body?.amount, 10);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return reply.code(400).send({ error: 'bad_amount' });
+    }
+
+    // Enforce daily and cooldown from profile
+    const now = nowUTC();
+    const { rows } = await pool.query(
+      `select wallet, last_claim_at, claimed_today, last_claim_day
+         from player_profiles where wallet = $1`,
+      [wallet]
     );
-    return reply.send({ ok:true, txid });
+    const p = rows[0];
+    if (!p) return reply.code(404).send({ error: 'not_found' });
+
+    const lastDay = p.last_claim_day ? new Date(p.last_claim_day) : null;
+    const todayStr = now.toISOString().slice(0,10);
+    const lastStr  = lastDay ? lastDay.toISOString().slice(0,10) : null;
+    const claimedToday = (lastStr === todayStr) ? Number(p.claimed_today || 0) : 0;
+
+    if (claimedToday + amount > CLAIM_MAX_PER_24H) {
+      return reply.code(429).send({ error: 'limit_exceeded' });
+    }
+
+    if (p.last_claim_at) {
+      const diff = (now - new Date(p.last_claim_at)) / 1000;
+      if (diff < CLAIM_COOLDOWN_SEC) {
+        return reply.code(429).send({ error: 'cooldown', retry_in: Math.ceil(CLAIM_COOLDOWN_SEC - diff) });
+      }
+    }
+
+    // XRPL send (IOU or XRP) — robust trustline check is inside claim module
+    const out = await claim.sendIssued({ to: wallet, amount });
+
+    let txid = null, txJSON = null;
+    if (typeof out === 'string' && out) txid = out;
+    else if (out && out.txJSON) txJSON = out.txJSON;
+
+    await pool.query(
+      `insert into claim_audit (wallet, amount, ts, txid)
+       values ($1, $2, now(), $3)`,
+      [wallet, amount, txid || null]
+    );
+
+    await pool.query(
+      `update player_profiles
+          set last_claim_at = now(),
+              last_claim_day = current_date,
+              claimed_today = $2
+        where wallet = $1`,
+      [wallet, claimedToday + amount]
+    );
+
+    return reply.send({ ok:true, txid, txJSON });
   } catch (e) {
     req.log.error({ err:e }, 'claim_send_failed');
     return reply.code(502).send({ error: 'send_failed', message: e.message || String(e) });
+  }
+});
+
+// --- Admin debug: inspect trustlines the server sees ---
+app.get('/debug/claim/inspect', async (req, reply) => {
+  if (!ADMIN_KEY) return reply.code(500).send({ error: 'server_misconfig' });
+  if ((req.headers['x-admin-key'] || '') !== ADMIN_KEY) {
+    return reply.code(401).send({ error: 'unauthorized' });
+  }
+  const wallet = (req.query.wallet || '').trim();
+  if (!wallet || !wallet.startsWith('r')) {
+    return reply.code(400).send({ error: 'missing_wallet' });
+  }
+  try {
+    const info = await claim.inspectTrustlines({ account: wallet });
+    return reply.send({ ok:true, info });
+  } catch (e) {
+    return reply.code(500).send({ error: 'inspect_failed', message: e.message || String(e) });
+  }
+});
+
+// --- Admin debug: reset claim cooldown for a wallet ---
+app.post('/debug/claim/reset', async (req, reply) => {
+  if (!ADMIN_KEY) return reply.code(500).send({ error: 'server_misconfig' });
+  if ((req.headers['x-admin-key'] || '') !== ADMIN_KEY) {
+    return reply.code(401).send({ error: 'unauthorized' });
+  }
+  const wallet = (req.headers['x-wallet'] || req.body?.wallet || '').trim();
+  if (!wallet || !wallet.startsWith('r')) {
+    return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
+  }
+  try {
+    await pool.query(
+      `update player_profiles
+          set last_claim_at = null,
+              claimed_today = 0,
+              last_claim_day = current_date - interval '1 day'
+        where wallet = $1`,
+      [wallet]
+    );
+    return reply.send({ ok:true });
+  } catch (e) {
+    return reply.code(500).send({ error: 'db_error' });
   }
 });
 
@@ -346,5 +451,5 @@ app.listen({ port: PORT, host: '0.0.0.0' }, (err, addr) => {
     app.log.error(err);
     process.exit(1);
   }
-  app.log.info(`Server listening at ${addr} (ECON_SCALE=${ECON_SCALE_DEFAULT}, BASE_PER_LEVEL=${BASE_PER_LEVEL})`);
+  app.log.info(`Server listening at ${addr}`);
 });
