@@ -1,20 +1,13 @@
-// server/index.js — XRPixel Jets (2025-10-25f, JWT+diagnostics+costs)
-// - CORS allowlist
-// - Simple rate limit (ip|wallet)
-// - Regen-on-read
-// - /ms/costs + /ms/upgrade authoritative
-// - Claim limits via claim_audit (daily + cooldown)
-// - XRPL payout w/ robust diagnostics
-// - Signed nonce → verify → JWT; /claim/start requires Bearer + X-Wallet
+// server/index.js — XRPixel Jets (2025-10-25g)
+// ESM imports for JWT + ripple-keypairs; nonce via crypto.randomBytes
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import pkg from 'pg';
+import jwt from 'jsonwebtoken';
+import * as rippleKeypairs from 'ripple-keypairs';
+import { randomBytes } from 'crypto';
 import * as claim from './claimJetFuel.js';
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-const jwt = require('jsonwebtoken');
-const rippleKeypairs = require('ripple-keypairs'); // signature verify
 
 const { Pool } = pkg;
 
@@ -62,7 +55,7 @@ const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n|0));
 const nowUTC = () => new Date();
 
 // in-memory nonce store
-const nonces = new Map(); // key=nonce -> { address, scope, ts, exp, used }
+const nonces = new Map(); // nonce -> { address, scope, ts, exp, used }
 
 function recomputeCurrent(base, level) {
   const b = base || { health:20, energyCap:100, regenPerMin:1 };
@@ -122,10 +115,13 @@ async function applyRegen(wallet, row) {
     const cap = Number(row.energy_cap ?? ms_cur.energyCap ?? 100);
     const rpm = Number(ms_cur.regenPerMin ?? 1);
     if (rpm <= 0) return row;
+
     const minutes = Math.floor((nowUTC() - updated) / 60000);
     if (minutes <= 0) return row;
+
     const gain = minutes * rpm;
     const nextEnergy = clamp((row.energy|0) + gain, 0, cap);
+
     if (nextEnergy !== (row.energy|0)) {
       const { rows: r2 } = await pool.query(
         `update player_profiles
@@ -176,8 +172,7 @@ app.post('/session/start', async (req, reply) => {
   }
   await ensureProfile(address);
 
-  const nonce = [...crypto.getRandomValues(new Uint8Array(32))]
-    .map((b)=>b.toString(16).padStart(2,'0')).join('');
+  const nonce = randomBytes(32).toString('hex');
   const scope = 'play,upgrade,claim';
   const ts = Math.floor(Date.now()/1000);
   const payload = `${nonce}||${scope}||${ts}||${address}`;
@@ -190,7 +185,6 @@ app.post('/session/verify', async (req, reply) => {
   if (!address || !signature || !publicKey || !payload) {
     return reply.code(400).send({ error: 'bad_signature' });
   }
-  // payload must be nonce||scope||ts||address
   const [nonce, scope, tsStr, addr] = String(payload).split('||');
   if (!nonces.has(nonce)) return reply.code(400).send({ error: 'expired_nonce' });
   const rec = nonces.get(nonce);
@@ -199,11 +193,10 @@ app.post('/session/verify', async (req, reply) => {
     nonces.delete(nonce);
     return reply.code(400).send({ error: 'expired_nonce' });
   }
-  // Verify with ripple-keypairs
   try {
     const ok = rippleKeypairs.verify(payload, signature, publicKey);
     if (!ok) return reply.code(401).send({ error: 'bad_signature' });
-  } catch (e) {
+  } catch {
     return reply.code(401).send({ error: 'bad_signature' });
   }
   rec.used = true; nonces.set(nonce, rec);
@@ -216,9 +209,9 @@ app.post('/session/verify', async (req, reply) => {
   return reply.send({ ok: true, jwt: token });
 });
 
-// Require JWT on protected routes (at least claim)
+// Require JWT on /claim/start
 app.addHook('preHandler', async (req, reply) => {
-  if (req.routerPath !== '/claim/start') return; // only enforce for claim now
+  if (req.routerPath !== '/claim/start') return;
   const hdr = req.headers['authorization'] || '';
   const m = hdr.match(/^Bearer\s+(.+)$/i);
   if (!m) return reply.code(401).send({ error: 'unauthorized' });
@@ -228,7 +221,7 @@ app.addHook('preHandler', async (req, reply) => {
       return reply.code(401).send({ error: 'unauthorized' });
     }
     req.jwt = decoded;
-  } catch (e) {
+  } catch {
     return reply.code(401).send({ error: 'unauthorized' });
   }
 });
@@ -241,6 +234,7 @@ app.get('/profile', async (req, reply) => {
   return reply.send(toClient(p));
 });
 
+// Costs
 app.get('/ms/costs', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -264,6 +258,7 @@ app.get('/ms/costs', async (req, reply) => {
   return reply.send({ costs, levels: { ...lv, ...pct }, scale });
 });
 
+// Upgrade
 app.post('/ms/upgrade', async (req, reply) => {
   const body = req.body || {};
   const econScale = Math.max(0.01, Number(body.econScale || ECON_SCALE));
@@ -323,7 +318,7 @@ app.post('/ms/upgrade', async (req, reply) => {
   return reply.send({ ok:true, applied, spent: spend, profile: toClient(rows[0]), scale: econScale });
 });
 
-// Minimal battle
+// Battle
 app.post('/battle/start', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -357,7 +352,7 @@ app.post('/battle/finish', async (req, reply) => {
   return reply.send({ ok:true, reward, profile: toClient(rows[0]) });
 });
 
-// ---------- CLAIM (audit-derived daily cap + cooldown) ----------
+// ---------- CLAIM (audit-based caps) ----------
 app.post('/claim/start', async (req, reply) => {
   try {
     const wallet = (req.headers['x-wallet'] || '').trim();
@@ -411,12 +406,10 @@ app.post('/claim/start', async (req, reply) => {
       [wallet, amount, txid || null]
     );
 
-    // best-effort profile stamp if column exists
     try { await pool.query(`update player_profiles set last_claim_at = now() where wallet=$1`, [wallet]); } catch {}
 
     return reply.send({ ok:true, txid, txJSON });
   } catch (e) {
-    // normalize common XRPL preflight errors for clearer client logs
     const m = String(e?.message || e);
     if (m.includes('dest_account_not_found')) {
       return reply.code(502).send({ error:'send_failed', message:'Destination account not found (network mismatch or unfunded address).' });
@@ -429,7 +422,7 @@ app.post('/claim/start', async (req, reply) => {
   }
 });
 
-// ---------- Admin: diagnostics / inspect / reset ----------
+// ---------- Admin: diagnostics ----------
 app.get('/debug/claim/ping', async (req, reply) => {
   if (!ADMIN_KEY || (req.headers['x-admin-key'] || '') !== ADMIN_KEY) {
     return reply.code(401).send({ error: 'unauthorized' });
@@ -442,7 +435,6 @@ app.get('/debug/claim/ping', async (req, reply) => {
     return reply.code(500).send({ error: 'ping_failed', message: e.message || String(e) });
   }
 });
-
 app.get('/debug/claim/inspect', async (req, reply) => {
   if (!ADMIN_KEY || (req.headers['x-admin-key'] || '') !== ADMIN_KEY) {
     return reply.code(401).send({ error: 'unauthorized' });
@@ -450,13 +442,12 @@ app.get('/debug/claim/inspect', async (req, reply) => {
   const wallet = (req.query.wallet || '').trim();
   if (!wallet || !wallet.startsWith('r')) return reply.code(400).send({ error: 'missing_wallet' });
   try {
-    const info = await claim.hasTrustline({ account: wallet });
-    return reply.send({ ok:true, trustline: !!info });
+    const ok = await claim.hasTrustline({ account: wallet });
+    return reply.send({ ok:true, trustline: !!ok });
   } catch (e) {
     return reply.code(500).send({ error: 'inspect_failed', message: e.message || String(e) });
   }
 });
-
 app.post('/debug/claim/reset', async (req, reply) => {
   if (!ADMIN_KEY || (req.headers['x-admin-key'] || '') !== ADMIN_KEY) {
     return reply.code(401).send({ error: 'unauthorized' });
