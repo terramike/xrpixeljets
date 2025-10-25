@@ -1,6 +1,6 @@
-// server/index.js — XRPixel Jets (2025-10-25t)
-// Harden CORS (always add, even on errors), keep env names aligned to Render.
-// IMPORTANT: package.json should have fastify ^4 and @fastify/cors ^8 (you already do).
+// server/index.js — XRPixel Jets (2025-10-25u)
+// Fix: remove duplicate OPTIONS /* route (cors plugin handles preflight).
+// CORS still hardened via onSend. Env names aligned to Render.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -27,7 +27,7 @@ const MAX24 = Number(process.env.CLAIM_MAX_PER_24H || '1000');
 const COOLDOWN_SEC =
   process.env.CLAIM_COOLDOWN_SEC
     ? Number(process.env.CLAIM_COOLDOWN_SEC)
-    : Number(process.env.CLAIM_COOLDOWN_HOURS || 0) * 3600; // ok if you later delete HOURS
+    : Number(process.env.CLAIM_COOLDOWN_HOURS || 0) * 3600; // ok if HOURS still present
 
 const JWT_SECRET = (process.env.JWT_SECRET || 'change-me');
 const CLAIM_ALLOW_DEMO = String(process.env.CLAIM_ALLOW_DEMO || '').trim() === '1';
@@ -67,14 +67,6 @@ app.addHook('onSend', async (req, reply, payload) => {
     }
   } catch {}
   return payload;
-});
-
-// Catch-all OPTIONS (some proxies strip plugin handling on 5xx)
-app.options('/*', async (req, reply) => {
-  reply
-    .header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-    .header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Wallet, X-Admin-Key, X-Requested-With')
-    .code(204).send();
 });
 
 // ---------- Helpers ----------
