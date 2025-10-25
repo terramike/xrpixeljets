@@ -1,7 +1,6 @@
-// server/index.js — XRPixel Jets (2025-10-25s)
-// Aligns env names to: ALLOW_ORIGIN, CORS_ORIGIN, XRPL_WSS, HOT_SEED, ISSUER_ADDR,
-// CURRENCY_CODE/HEX, TOKEN_MODE, ECON_SCALE, BASE_PER_LEVEL, JWT_SECRET, DATABASE_URL,
-// CLAIM_* (…_SEC, _MAX_PER_24H, _FALLBACK_TXJSON). Adds optional CLAIM_ALLOW_DEMO.
+// server/index.js — XRPixel Jets (2025-10-25t)
+// Harden CORS (always add, even on errors), keep env names aligned to Render.
+// IMPORTANT: package.json should have fastify ^4 and @fastify/cors ^8 (you already do).
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -16,7 +15,7 @@ const { Pool } = pkg;
 // ---------- ENV ----------
 const PORT = Number(process.env.PORT || 10000);
 
-// Allowlist: prefer CORS_ORIGIN, fall back to ALLOW_ORIGIN (single origin)
+// Allowlist: prefer CORS_ORIGIN, fallback ALLOW_ORIGIN
 const ORIGIN_RAW = (process.env.CORS_ORIGIN || process.env.ALLOW_ORIGIN || 'https://mykeygo.io,https://www.mykeygo.io,http://localhost:8000');
 const CORS_LIST = ORIGIN_RAW.split(',').map(s => s.trim()).filter(Boolean);
 
@@ -28,11 +27,9 @@ const MAX24 = Number(process.env.CLAIM_MAX_PER_24H || '1000');
 const COOLDOWN_SEC =
   process.env.CLAIM_COOLDOWN_SEC
     ? Number(process.env.CLAIM_COOLDOWN_SEC)
-    : Number(process.env.CLAIM_COOLDOWN_HOURS || 0) * 3600;
+    : Number(process.env.CLAIM_COOLDOWN_HOURS || 0) * 3600; // ok if you later delete HOURS
 
 const JWT_SECRET = (process.env.JWT_SECRET || 'change-me');
-
-// Optional: demo-mode if your hot wallet isn’t funded yet (keeps UX flowing)
 const CLAIM_ALLOW_DEMO = String(process.env.CLAIM_ALLOW_DEMO || '').trim() === '1';
 
 // ---------- DB ----------
@@ -46,7 +43,7 @@ const pool = DATABASE_URL ? new Pool({
 
 const app = Fastify({ logger: true });
 
-// ---------- CORS ----------
+// ---------- CORS (plugin) ----------
 await app.register(cors, {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
@@ -60,15 +57,33 @@ await app.register(cors, {
   maxAge: 86400
 });
 
+// Extra safety: ensure CORS header is present even on errors / unexpected paths
+app.addHook('onSend', async (req, reply, payload) => {
+  try {
+    const origin = req.headers.origin;
+    if (origin && (CORS_LIST.length === 0 || CORS_LIST.includes(origin))) {
+      reply.header('Access-Control-Allow-Origin', origin);
+      reply.header('Vary', 'Origin');
+    }
+  } catch {}
+  return payload;
+});
+
+// Catch-all OPTIONS (some proxies strip plugin handling on 5xx)
+app.options('/*', async (req, reply) => {
+  reply
+    .header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    .header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Wallet, X-Admin-Key, X-Requested-With')
+    .code(204).send();
+});
+
 // ---------- Helpers ----------
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n|0));
 const nowUTC = () => new Date();
 const priceAt = (n, scale) => Math.max(1, Math.round(BASE_PER_LEVEL * (n + 1) * scale));
 
-// Nonce store for login
 const nonces = new Map(); // nonce -> { address, scope, ts, exp, used }
 
-// Derived/current mothership stats
 function recomputeCurrent(base, level) {
   const b = base || { health:20, energyCap:100, regenPerMin:1 };
   const lv = level || { health:0, energyCap:0, regenPerMin:0 };
@@ -95,7 +110,6 @@ function toClient(row) {
     unlockedLevel: Number(row.unlocked_level ?? 1),
   };
 }
-
 async function ensureProfile(wallet) {
   if (!pool) return;
   await pool.query(
@@ -106,7 +120,6 @@ async function ensureProfile(wallet) {
 }
 async function getProfileRaw(wallet){
   if (!pool) {
-    // dev fallback if no DB is present
     return {
       wallet, jet_fuel: 0, energy: 100, energy_cap: 100,
       ms_base: { health:20, energyCap:100, regenPerMin:1 },
@@ -158,7 +171,7 @@ async function applyRegen(wallet, row) {
   return row;
 }
 
-// ---------- Global guard on X-Wallet (except auth & health) ----------
+// ---------- Allow unauthenticated for auth & health ----------
 app.addHook('onRequest', async (req, reply) => {
   if (req.raw.url?.startsWith('/session/start')) return;
   if (req.raw.url?.startsWith('/session/verify')) return;
@@ -171,6 +184,10 @@ app.addHook('onRequest', async (req, reply) => {
   }
   req.wallet = w;
 });
+
+// ---------- Root + health ----------
+app.get('/', async () => ({ ok: true, ts: Date.now() }));
+app.get('/healthz', async () => ({ ok: true, ts: Date.now() }));
 
 // ---------- Auth (signed nonce → JWT) ----------
 app.post('/session/start', async (req, reply) => {
@@ -234,6 +251,8 @@ app.addHook('preHandler', async (req, reply) => {
 });
 
 // ---------- Gameplay ----------
+const price = (lvl, scale) => priceAt(lvl|0, scale);
+
 app.get('/profile', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -253,12 +272,12 @@ app.get('/ms/costs', async (req, reply) => {
     dodge: Number(p0.ms_dodge ?? 0),
   };
   const costs = {
-    health:      priceAt(lv.health|0,      scale),
-    energyCap:   priceAt(lv.energyCap|0,   scale),
-    regenPerMin: priceAt(lv.regenPerMin|0, scale),
-    hit:   priceAt(pct.hit|0,   scale),
-    crit:  priceAt(pct.crit|0,  scale),
-    dodge: priceAt(pct.dodge|0, scale),
+    health:      price(lv.health,      scale),
+    energyCap:   price(lv.energyCap,   scale),
+    regenPerMin: price(lv.regenPerMin, scale),
+    hit:   price(pct.hit,   scale),
+    crit:  price(pct.crit,  scale),
+    dodge: price(pct.dodge, scale),
   };
   return reply.send({ costs, levels: { ...lv, ...pct }, scale });
 });
@@ -328,7 +347,7 @@ app.post('/ms/upgrade', async (req, reply) => {
   return reply.send({ ok:true, applied, spent: spend, profile: toClient(rows[0]), scale: econScale });
 });
 
-// Authoritative energy: -10 at start, -1 per turn
+// Energy authority: -10 on start, -1 per turn
 app.post('/battle/start', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -401,7 +420,6 @@ app.post('/claim/start', async (req, reply) => {
     }
     await ensureProfile(wallet);
 
-    // in-memory per-24h and cooldown (DB audit can be layered later)
     const key = `claim:${wallet}`;
     app.claimMem ||= new Map();
     const rec = app.claimMem.get(key) || { last: 0, sum: 0, window: Date.now() };
@@ -428,7 +446,6 @@ app.post('/claim/start', async (req, reply) => {
         }
         return reply.code(502).send({ error: 'hot_wallet_missing', message: 'Hot wallet account not found on selected XRPL network.' });
       }
-      // XRPL engine codes, trustline, etc.
       return reply.code(502).send({ error: 'send_failed', message: msg });
     }
 
@@ -439,13 +456,11 @@ app.post('/claim/start', async (req, reply) => {
   }
 });
 
-// Public health (no secrets)
+// Claim health (no secrets)
 app.get('/claim/health', async (_req, reply) => {
   const info = await claim.health();
   return reply.send(info);
 });
-
-app.get('/healthz', async () => ({ ok: true, ts: Date.now() }));
 
 app.listen({ port: PORT, host: '0.0.0.0' }, (err, addr) => {
   if (err) { app.log.error(err); process.exit(1); }
