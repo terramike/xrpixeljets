@@ -1,5 +1,5 @@
-// server/index.js — XRPixel Jets (2025-10-25k)
-// CORS, signed-nonce → JWT auth, gameplay routes, claim, per-turn energy.
+// server/index.js — XRPixel Jets (2025-10-25m)
+// CORS, signed-nonce → JWT auth, gameplay routes, claim, per-turn energy, claim health.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -152,6 +152,7 @@ app.addHook('onRequest', async (req, reply) => {
   if (req.raw.url?.startsWith('/session/start')) return;
   if (req.raw.url?.startsWith('/session/verify')) return;
   if (req.raw.url?.startsWith('/healthz')) return;
+  if (req.raw.url?.startsWith('/claim/health')) return;
 
   const w = req.headers['x-wallet'];
   if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
@@ -189,14 +190,12 @@ app.post('/session/verify', async (req, reply) => {
     nonces.delete(nonce);
     return reply.code(400).send({ error: 'expired_nonce' });
   }
-  // Optional strict verification (enable when front-end provides publicKey consistently)
   try {
     if (publicKey) {
       const ok = rippleKeypairs.verify(payload, signature, publicKey);
       if (!ok) return reply.code(401).send({ error: 'bad_signature' });
     }
-  } catch { /* ignore to ease bring-up */ }
-
+  } catch {}
   rec.used = true; nonces.set(nonce, rec);
   const token = jwt.sign(
     { sub: address, scope: 'play,upgrade,claim' },
@@ -391,7 +390,7 @@ app.post('/claim/start', async (req, reply) => {
     }
     await ensureProfile(wallet);
 
-    // very light in-memory limits (DB audit can be added back later)
+    // very light in-memory limits (DB audit can be added later)
     const key = `claim:${wallet}`;
     app.claimMem ||= new Map();
     const rec = app.claimMem.get(key) || { last: 0, sum: 0, window: Date.now() };
@@ -409,8 +408,19 @@ app.post('/claim/start', async (req, reply) => {
 
     return reply.send({ ok:true, ...(typeof out === 'string' ? { txid: out } : out) });
   } catch (e) {
-    return reply.code(502).send({ error: 'send_failed', message: e?.message || String(e) });
+    const msg = String(e?.message || e);
+    // Improve debuggability for hot-wallet issues
+    if (/account not found/i.test(msg)) {
+      return reply.code(502).send({ error: 'hot_wallet_missing', message: 'Hot wallet account not found on selected XRPL network.' });
+    }
+    return reply.code(502).send({ error: 'send_failed', message: msg });
   }
+});
+
+// Quick health for claims (no secrets)
+app.get('/claim/health', async (_req, reply) => {
+  const info = await claim.health();
+  return reply.send(info);
 });
 
 app.get('/healthz', async () => ({ ok: true, ts: Date.now() }));
