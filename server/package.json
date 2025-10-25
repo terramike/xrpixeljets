@@ -1,17 +1,19 @@
 {
-  "name": "xrpixeljets",
-  "version": "1.0.0",
+  "name": "xrpixel-jets-server",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "start": "node server/index.js",
-    "build": "echo \"(client is static on WP)\""
+    "start": "node server/index.js"
   },
   "dependencies": {
-    "@fastify/cors": "^9.0.1",
-    "fastify": "^4.28.1",
-    "pg": "^8.12.0",
-    "xrpl": "^3.0.0"
+    "@fastify/cors": "^10.0.0",
+    "fastify": "^4.26.2",
+    "pg": "^8.11.5",
+    "xrpl": "^3.3.1",
+    "jsonwebtoken": "^9.0.2",
+    "ripple-keypairs": "^1.0.1"
   }
 }
