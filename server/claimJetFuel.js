@@ -1,22 +1,22 @@
-// server/claimJetFuel.js — XRPixel Jets (2025-10-25c)
-// Hot-wallet sender for issued JetFuel (IOU) or native XRP. Adds health() and hot-wallet preflight.
+// server/claimJetFuel.js — XRPixel Jets (2025-10-25e)
+// Uses XRPL_WSS, HOT_SEED, ISSUER_ADDR, CURRENCY_CODE/HEX, TOKEN_MODE, CLAIM_FALLBACK_TXJSON.
 
 import xrpl from "xrpl";
 
-// ----- ENV -----
+// ----- ENV bindings (match your Render env names) -----
 const WSS =
-  process.env.NETWORK ||
   process.env.XRPL_WSS ||
+  process.env.NETWORK ||
   "wss://s1.ripple.com";
 
 const ISSUER =
-  process.env.ISSUER_ADDRESS ||
   process.env.ISSUER_ADDR ||
+  process.env.ISSUER_ADDRESS ||
   "";
 
 const HOT_SEED =
-  process.env.HOT_WALLET_SEED ||
   process.env.HOT_SEED ||
+  process.env.HOT_WALLET_SEED ||
   "";
 
 const CODE_ASCII =
@@ -26,12 +26,12 @@ const CODE_ASCII =
 
 const CODE_HEX = (process.env.CURRENCY_HEX || "").toUpperCase();
 const TOKEN_MODE = (process.env.TOKEN_MODE || "IOU").toUpperCase();
-const FALLBACK_TXJSON = process.env.CLAIM_FALLBACK_TXJSON === "1";
+const FALLBACK_TXJSON = String(process.env.CLAIM_FALLBACK_TXJSON || '') === '1';
 
 // ----- helpers -----
 function assertEnv() {
-  if (!HOT_SEED) throw new Error("HOT_WALLET_SEED (or HOT_SEED) not set");
-  if (TOKEN_MODE === "IOU" && !ISSUER) throw new Error("ISSUER_ADDRESS (or ISSUER_ADDR) not set for IOU");
+  if (!HOT_SEED) throw new Error("HOT_SEED not set");
+  if (TOKEN_MODE === "IOU" && !ISSUER) throw new Error("ISSUER_ADDR not set for IOU");
 }
 function currencyField() {
   if (CODE_HEX && /^[A-F0-9]{40}$/i.test(CODE_HEX)) return CODE_HEX;
@@ -83,12 +83,10 @@ export async function hasTrustline({ account }) {
     });
     const cur = currencyField();
     return (resp.result.lines || []).some((l) => (l.currency || "").toUpperCase() === cur);
-  } finally {
-    try { await client.disconnect(); } catch {}
-  }
+  } finally { try { await client.disconnect(); } catch {} }
 }
 
-// Build unsigned tx (used only if you enable a different flow)
+// Build unsigned tx (if you later want user-sign flow)
 export async function prepareIssued({ to, amount }) {
   assertEnv();
   const client = await newClient();
@@ -104,7 +102,7 @@ export async function prepareIssued({ to, amount }) {
   } finally { try { await client.disconnect(); } catch {} }
 }
 
-// Server-send with preflight (clear error when hot wallet missing)
+// Server-send with preflight; throws 'hot_wallet_missing' clearly if unfunded on WSS
 export async function sendIssued(a, b) {
   const params = typeof a === "object" ? a : { to: a, amount: b };
   const to = params.to || params.destination || params.wallet;
@@ -119,14 +117,14 @@ export async function sendIssued(a, b) {
   try {
     const wallet = xrpl.Wallet.fromSeed(HOT_SEED);
 
-    // Hot wallet must exist (otherwise autofill throws "Account not found")
+    // Ensure the hot wallet exists on the configured network
     try {
       await client.request({ command: 'account_info', account: wallet.address, ledger_index: 'validated' });
     } catch {
       throw new Error('hot_wallet_missing');
     }
 
-    // Trustline guard for IOU
+    // Trustline check in IOU mode
     if (TOKEN_MODE === "IOU") {
       let tlOK = true;
       try {
@@ -137,7 +135,7 @@ export async function sendIssued(a, b) {
         const cur = currencyField();
         tlOK = (resp.result.lines || []).some((l) => (l.currency || "").toUpperCase() === cur);
       } catch {
-        tlOK = false; // account_lines fails for unfunded accounts
+        tlOK = false; // new/unfunded account case
       }
       if (!tlOK) {
         if (FALLBACK_TXJSON) {
@@ -166,7 +164,5 @@ export async function sendIssued(a, b) {
 
     const hash = res.result?.hash || signed.hash;
     return hash ? String(hash) : "";
-  } finally {
-    try { await client.disconnect(); } catch {}
-  }
+  } finally { try { await client.disconnect(); } catch {} }
 }
