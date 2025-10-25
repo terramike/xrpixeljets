@@ -1,7 +1,5 @@
-// server/index.js — XRPixel Jets MKG (2025-10-25 trustline+debug)
-// Fastify + PG, CORS allowlist, rate limiting, regen-on-read, MS costs/upgrades,
-// battle rewards in tens via econScale (server authoritative),
-// XRPL claim (IOU/XRP) with robust trustline check, and admin debug tools.
+// server/index.js — XRPixel Jets MKG (2025-10-25c)
+// Uses claim_audit to enforce daily limit + cooldown (no profile cols needed)
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -10,23 +8,22 @@ import * as claim from './claimJetFuel.js';
 
 const { Pool } = pkg;
 
-// ---- ENV ----
+// ---------- ENV ----------
 const PORT = Number(process.env.PORT || 8080);
 const CORS_ORIGIN = (process.env.CORS_ORIGIN || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 const DATABASE_URL = process.env.DATABASE_URL;
 const ECON_SCALE = Number(process.env.ECON_SCALE || '0.10');
 const BASE_PER_LEVEL = Number(process.env.BASE_PER_LEVEL || '300');
-const CLAIM_MAX_PER_24H = Number(process.env.CLAIM_MAX_PER_24H || '500'); // JFUEL units
-const CLAIM_COOLDOWN_SEC = Number(process.env.CLAIM_COOLDOWN_SEC || '300');
+const CLAIM_MAX_PER_24H = Number(process.env.CLAIM_MAX_PER_24H || '500');
+// accept either seconds or hours (back-compat)
+const CLAIM_COOLDOWN_SEC =
+  process.env.CLAIM_COOLDOWN_SEC
+    ? Number(process.env.CLAIM_COOLDOWN_SEC)
+    : Number(process.env.CLAIM_COOLDOWN_HOURS || 0) * 3600;
 const ADMIN_KEY = (process.env.ADMIN_KEY || '');
 
-if (!DATABASE_URL) {
-  console.error('DATABASE_URL not set');
-  process.exit(1);
-}
+if (!DATABASE_URL) { console.error('DATABASE_URL not set'); process.exit(1); }
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -37,10 +34,9 @@ const pool = new Pool({
 
 const app = Fastify({ logger: true });
 
-// ---- CORS ----
+// ---------- CORS ----------
 await app.register(cors, {
   origin: (origin, cb) => {
-    // allow same-origin / non-browser
     if (!origin) return cb(null, true);
     if (CORS_ORIGIN.length === 0) return cb(null, true);
     if (CORS_ORIGIN.includes(origin)) return cb(null, true);
@@ -48,24 +44,28 @@ await app.register(cors, {
   },
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','X-Wallet','X-Admin-Key'],
-  credentials: false,
 });
 
-// ---- utils ----
+// ---------- helpers ----------
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n|0));
 const nowUTC = () => new Date();
 
+function recomputeCurrent(base, level) {
+  const b = base || { health:20, energyCap:100, regenPerMin:1 };
+  const lv = level || { health:0, energyCap:0, regenPerMin:0 };
+  return {
+    health: (b.health|0) + (lv.health|0),
+    energyCap: (b.energyCap|0) + (lv.energyCap|0),
+    regenPerMin: (b.regenPerMin|0) + (lv.regenPerMin|0),
+  };
+}
+
 function toClient(row) {
-  // Shapes expected by client
   const ms_base = row.ms_base || { health:20, energyCap:100, regenPerMin:1 };
   const ms_level = row.ms_level || { health:0, energyCap:0, regenPerMin:0 };
   const ms_current = row.ms_current || recomputeCurrent(ms_base, ms_level);
   return {
-    ms: {
-      base: ms_base,
-      level: ms_level,
-      current: ms_current
-    },
+    ms: { base: ms_base, level: ms_level, current: ms_current },
     pct: {
       hit: Number(row.ms_hit ?? 0),
       crit: Number(row.ms_crit ?? 10),
@@ -78,26 +78,11 @@ function toClient(row) {
   };
 }
 
-function recomputeCurrent(base, level) {
-  const b = base || { health:20, energyCap:100, regenPerMin:1 };
-  const lv = level || { health:0, energyCap:0, regenPerMin:0 };
-  return {
-    health: (b.health|0) + (lv.health|0),
-    energyCap: (b.energyCap|0) + (lv.energyCap|0),
-    regenPerMin: (b.regenPerMin|0) + (lv.regenPerMin|0),
-  };
-}
-
-// ---- profile helpers ----
 async function ensureProfile(wallet) {
-  const { rows } = await pool.query(
+  await pool.query(
     `insert into player_profiles (wallet)
-       values ($1)
-       on conflict (wallet) do nothing
-     returning wallet`,
-    [wallet]
+     values ($1) on conflict (wallet) do nothing`, [wallet]
   );
-  return rows[0]?.wallet || wallet;
 }
 
 async function getProfileRaw(wallet){
@@ -108,7 +93,7 @@ async function getProfileRaw(wallet){
             coalesce(ms_crit,10)::int as ms_crit,
             coalesce(ms_dodge,0)::int as ms_dodge,
             coalesce(unlocked_level,1)::int as unlocked_level,
-            last_claim_at, updated_at, created_at
+            updated_at, created_at
        from player_profiles where wallet = $1`,
     [wallet]
   );
@@ -123,13 +108,10 @@ async function applyRegen(wallet, row) {
     const cap = Number(row.energy_cap ?? ms_cur.energyCap ?? 100);
     const rpm = Number(ms_cur.regenPerMin ?? 1);
     if (rpm <= 0) return row;
-
     const minutes = Math.floor((nowUTC() - updated) / 60000);
     if (minutes <= 0) return row;
-
     const gain = minutes * rpm;
     const nextEnergy = clamp((row.energy|0) + gain, 0, cap);
-
     if (nextEnergy !== (row.energy|0)) {
       const { rows: r2 } = await pool.query(
         `update player_profiles
@@ -146,20 +128,16 @@ async function applyRegen(wallet, row) {
   return row;
 }
 
-// ---- rate limiter (ip|wallet) ----
+// simple rate limit (ip|wallet)
 const RATE = { windowMs: 10_000, maxPerWindow: 30 };
-const bucket = new Map(); // key = ip|wallet -> {count, ts}
-
+const bucket = new Map();
 app.addHook('onRequest', async (req, reply) => {
-  // open route
   if (req.raw.url === '/session/start') return;
-
   const w = req.headers['x-wallet'];
   if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
     return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
   }
   req.wallet = w;
-
   const key = `${req.ip}|${w}`;
   const now = Date.now();
   const cur = bucket.get(key) || { count: 0, ts: now };
@@ -173,14 +151,14 @@ app.addHook('onRequest', async (req, reply) => {
 
 // ---------- routes ----------
 
-// open: ensure profile exists (today no nonce/JWT)
+// open: ensure profile
 app.post('/session/start', async (req, reply) => {
   const address = (req.body?.address || '').trim();
   if (!address || !address.startsWith('r')) {
     return reply.code(400).send({ error: 'bad_address' });
   }
   await ensureProfile(address);
-  // Optional: seed defaults on first run
+  // seed defaults if nulls
   await pool.query(
     `update player_profiles
         set ms_base = coalesce(ms_base,'{"health":20,"energyCap":100,"regenPerMin":1}'::jsonb),
@@ -205,7 +183,7 @@ app.get('/profile', async (req, reply) => {
   return reply.send(toClient(p));
 });
 
-// costs: BASE_PER_LEVEL * (level+1) * scale, min 1
+// costs
 app.get('/ms/costs', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -213,13 +191,10 @@ app.get('/ms/costs', async (req, reply) => {
   const lv = p0.ms_level || { health:0, energyCap:0, regenPerMin:0 };
   const pct = {
     hit: Number(p0.ms_hit ?? 0),
-    crit: Number(p0.ms_crit ?? 10), // note: 'level' here is absolute points; treat +1 step cost as BASE*(lvl+1)
+    crit: Number(p0.ms_crit ?? 10),
     dodge: Number(p0.ms_dodge ?? 0),
   };
-  function nextCost(n) {
-    const raw = BASE_PER_LEVEL * (n + 1);
-    return Math.max(1, Math.round(raw * scale));
-  }
+  const nextCost = (n) => Math.max(1, Math.round(BASE_PER_LEVEL * (n + 1) * scale));
   const costs = {
     health: nextCost(lv.health|0),
     energyCap: nextCost(lv.energyCap|0),
@@ -231,7 +206,7 @@ app.get('/ms/costs', async (req, reply) => {
   return reply.send({ costs, levels: { ...lv, ...pct }, scale });
 });
 
-// server-authoritative upgrade apply (iterative per level)
+// upgrade
 app.post('/ms/upgrade', async (req, reply) => {
   const body = req.body || {};
   const econScale = Math.max(0.01, Number(body.econScale || ECON_SCALE));
@@ -254,25 +229,21 @@ app.post('/ms/upgrade', async (req, reply) => {
     dodge: Number(p0.ms_dodge ?? 0),
   };
 
-  // Iterative price function
   const priceAt = (n) => Math.max(1, Math.round(BASE_PER_LEVEL * (n + 1) * econScale));
 
   let spend = 0;
   const applied = { health:0, energyCap:0, regenPerMin:0, hit:0, crit:0, dodge:0 };
   const lv = { ...lv0 };
-
-  // apply for core
-  for (let i=0;i<q.health;i++)  { const c=priceAt(lv.health);      if (spend+c > (p0.jet_fuel|0)) break; spend+=c; lv.health++; applied.health++; }
-  for (let i=0;i<q.energyCap;i++){ const c=priceAt(lv.energyCap);   if (spend+c > (p0.jet_fuel|0)) break; spend+=c; lv.energyCap++; applied.energyCap++; }
-  for (let i=0;i<q.regenPerMin;i++){ const c=priceAt(lv.regenPerMin);if (spend+c > (p0.jet_fuel|0)) break; spend+=c; lv.regenPerMin++; applied.regenPerMin++; }
-
-  // pct stats
   let hit = pct0.hit, crit = pct0.crit, dodge = pct0.dodge;
-  for (let i=0;i<q.hit;i++)   { const c=priceAt(hit);   if (spend+c > (p0.jet_fuel|0)) break; spend+=c; hit++;   applied.hit++; }
-  for (let i=0;i<q.crit;i++)  { const c=priceAt(crit);  if (spend+c > (p0.jet_fuel|0)) break; spend+=c; crit++;  applied.crit++; }
-  for (let i=0;i<q.dodge;i++) { const c=priceAt(dodge); if (spend+c > (p0.jet_fuel|0)) break; spend+=c; dodge++; applied.dodge++; }
 
-  // recompute, clamp energy
+  for (let i=0;i<q.health;i++){ const c=priceAt(lv.health);      if (spend+c > (p0.jet_fuel|0)) break; spend+=c; lv.health++; applied.health++; }
+  for (let i=0;i<q.energyCap;i++){ const c=priceAt(lv.energyCap); if (spend+c > (p0.jet_fuel|0)) break; spend+=c; lv.energyCap++; applied.energyCap++; }
+  for (let i=0;i<q.regenPerMin;i++){ const c=priceAt(lv.regenPerMin); if (spend+c > (p0.jet_fuel|0)) break; spend+=c; lv.regenPerMin++; applied.regenPerMin++; }
+
+  for (let i=0;i<q.hit;i++){   const c=priceAt(hit);   if (spend+c > (p0.jet_fuel|0)) break; spend+=c; hit++;   applied.hit++; }
+  for (let i=0;i<q.crit;i++){  const c=priceAt(crit);  if (spend+c > (p0.jet_fuel|0)) break; spend+=c; crit++;  applied.crit++; }
+  for (let i=0;i<q.dodge;i++){ const c=priceAt(dodge); if (spend+c > (p0.jet_fuel|0)) break; spend+=c; dodge++; applied.dodge++; }
+
   const ms_current = recomputeCurrent(p0.ms_base, lv);
   const cap = Number(p0.energy_cap ?? ms_current.energyCap ?? 100);
   const energyCapped = clamp((p0.energy|0), 0, cap);
@@ -295,7 +266,7 @@ app.post('/ms/upgrade', async (req, reply) => {
   return reply.send({ ok:true, applied, spent: spend, profile: toClient(rows[0]), scale: econScale });
 });
 
-// battle — minimal authoritative rewards in tens via econScale
+// battle
 app.post('/battle/start', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
@@ -308,10 +279,7 @@ app.post('/battle/start', async (req, reply) => {
   return reply.send({ ok:true, profile: toClient(rows[0]) });
 });
 
-app.post('/battle/turn', async (req, reply) => {
-  // no-op pass-through for now (server is authoritative if you choose later)
-  return reply.send({ ok:true });
-});
+app.post('/battle/turn', async (_req, reply) => reply.send({ ok:true }));
 
 app.post('/battle/finish', async (req, reply) => {
   const body = req.body || {};
@@ -320,7 +288,6 @@ app.post('/battle/finish', async (req, reply) => {
   const p0 = await getProfileRaw(req.wallet);
   if (!p0) return reply.code(404).send({ error: 'not_found' });
 
-  // rewards in "tens" scaled by ECON_SCALE. mild growth with wave.
   const base = 10;
   const reward = victory ? Math.max(0, Math.round(base * wave * ECON_SCALE)) : 0;
 
@@ -335,66 +302,72 @@ app.post('/battle/finish', async (req, reply) => {
   return reply.send({ ok:true, reward, profile: toClient(rows[0]) });
 });
 
-// --- Claim JetFuel (protected) ---
+// ---------- CLAIM (audit-driven limits) ----------
 app.post('/claim/start', async (req, reply) => {
   try {
     const wallet = (req.headers['x-wallet'] || '').trim();
     if (!wallet || !wallet.startsWith('r')) {
       return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
     }
-
     const amount = parseInt(req.body?.amount, 10);
     if (!Number.isFinite(amount) || amount <= 0) {
       return reply.code(400).send({ error: 'bad_amount' });
     }
 
-    // Enforce daily and cooldown from profile
-    const now = nowUTC();
-    const { rows } = await pool.query(
-      `select wallet, last_claim_at, claimed_today, last_claim_day
-         from player_profiles where wallet = $1`,
+    // ensure profile exists
+    await ensureProfile(wallet);
+
+    // derive claimedToday + lastClaimAt from claim_audit
+    const { rows: agg } = await pool.query(
+      `with today as (
+         select coalesce(sum(amount),0)::int as sum_today
+           from claim_audit
+          where wallet = $1
+            and ts >= date_trunc('day', now())
+            and ts <  date_trunc('day', now()) + interval '1 day'
+       ),
+       last as (
+         select max(ts) as last_ts
+           from claim_audit
+          where wallet = $1
+       )
+       select today.sum_today, last.last_ts
+         from today cross join last`,
       [wallet]
     );
-    const p = rows[0];
-    if (!p) return reply.code(404).send({ error: 'not_found' });
+    const sumToday = Number(agg[0]?.sum_today || 0);
+    const lastTs = agg[0]?.last_ts ? new Date(agg[0].last_ts) : null;
 
-    const lastDay = p.last_claim_day ? new Date(p.last_claim_day) : null;
-    const todayStr = now.toISOString().slice(0,10);
-    const lastStr  = lastDay ? lastDay.toISOString().slice(0,10) : null;
-    const claimedToday = (lastStr === todayStr) ? Number(p.claimed_today || 0) : 0;
-
-    if (claimedToday + amount > CLAIM_MAX_PER_24H) {
+    if (sumToday + amount > CLAIM_MAX_PER_24H) {
       return reply.code(429).send({ error: 'limit_exceeded' });
     }
-
-    if (p.last_claim_at) {
-      const diff = (now - new Date(p.last_claim_at)) / 1000;
+    if (CLAIM_COOLDOWN_SEC > 0 && lastTs) {
+      const diff = (nowUTC() - lastTs) / 1000;
       if (diff < CLAIM_COOLDOWN_SEC) {
         return reply.code(429).send({ error: 'cooldown', retry_in: Math.ceil(CLAIM_COOLDOWN_SEC - diff) });
       }
     }
 
-    // XRPL send (IOU or XRP) — robust trustline check is inside claim module
+    // XRPL send
     const out = await claim.sendIssued({ to: wallet, amount });
-
     let txid = null, txJSON = null;
     if (typeof out === 'string' && out) txid = out;
     else if (out && out.txJSON) txJSON = out.txJSON;
 
+    // audit
     await pool.query(
       `insert into claim_audit (wallet, amount, ts, txid)
        values ($1, $2, now(), $3)`,
       [wallet, amount, txid || null]
     );
 
-    await pool.query(
-      `update player_profiles
-          set last_claim_at = now(),
-              last_claim_day = current_date,
-              claimed_today = $2
-        where wallet = $1`,
-      [wallet, claimedToday + amount]
-    );
+    // best-effort: update last_claim_at if column exists (ignore failures)
+    try {
+      await pool.query(
+        `update player_profiles set last_claim_at = now() where wallet=$1`,
+        [wallet]
+      );
+    } catch {}
 
     return reply.send({ ok:true, txid, txJSON });
   } catch (e) {
@@ -403,7 +376,7 @@ app.post('/claim/start', async (req, reply) => {
   }
 });
 
-// --- Admin debug: inspect trustlines the server sees ---
+// ---------- Admin debug ----------
 app.get('/debug/claim/inspect', async (req, reply) => {
   if (!ADMIN_KEY) return reply.code(500).send({ error: 'server_misconfig' });
   if ((req.headers['x-admin-key'] || '') !== ADMIN_KEY) {
@@ -421,7 +394,6 @@ app.get('/debug/claim/inspect', async (req, reply) => {
   }
 });
 
-// --- Admin debug: reset claim cooldown for a wallet ---
 app.post('/debug/claim/reset', async (req, reply) => {
   if (!ADMIN_KEY) return reply.code(500).send({ error: 'server_misconfig' });
   if ((req.headers['x-admin-key'] || '') !== ADMIN_KEY) {
@@ -432,12 +404,12 @@ app.post('/debug/claim/reset', async (req, reply) => {
     return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
   }
   try {
+    // just delete today's rows to fully clear daily + cooldown
     await pool.query(
-      `update player_profiles
-          set last_claim_at = null,
-              claimed_today = 0,
-              last_claim_day = current_date - interval '1 day'
-        where wallet = $1`,
+      `delete from claim_audit
+        where wallet=$1
+          and ts >= date_trunc('day', now())
+          and ts <  date_trunc('day', now()) + interval '1 day'`,
       [wallet]
     );
     return reply.send({ ok:true });
@@ -447,9 +419,6 @@ app.post('/debug/claim/reset', async (req, reply) => {
 });
 
 app.listen({ port: PORT, host: '0.0.0.0' }, (err, addr) => {
-  if (err) {
-    app.log.error(err);
-    process.exit(1);
-  }
+  if (err) { app.log.error(err); process.exit(1); }
   app.log.info(`Server listening at ${addr}`);
 });
