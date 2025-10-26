@@ -1,17 +1,14 @@
-// claimJetFuel.js — XRPixel Jets (2025-10-26-path-fallback2)
-// Option B (hot wallet holder) + safe fallback to issuer signer on tecPATH_PARTIAL.
-// Sanitizes currency code (strips a leading '$') and prefers CURRENCY_HEX if provided.
-
+// claimJetFuel.js — XRPixel Jets (2025-10-26-path-fallback3)
 export async function sendIssued({ to, amount }) {
   const MODE = (process.env.TOKEN_MODE || 'mock').toLowerCase(); // 'mock' | 'hot' | 'prepare'
   const WSS  = process.env.XRPL_WSS || process.env.NETWORK || 'wss://s.altnet.rippletest.net:51233';
 
-  const RAW_CODE = (process.env.CURRENCY_CODE || process.env.CURRENCY || 'JFUEL');
-  const CODE_ASCII = RAW_CODE.replace(/^\$/, ''); // strip optional '$'
+  const RAW_CODE   = (process.env.CURRENCY_CODE || process.env.CURRENCY || 'JFUEL');
+  const CODE_ASCII = RAW_CODE.replace(/^\$/, ''); // tolerate "$JFUEL"
   const CODE_HEX   = (process.env.CURRENCY_HEX || '').toUpperCase();
   const ISSUER     = process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || '';
   const HOT_SEED   = process.env.HOT_WALLET_SEED || process.env.HOT_SEED || '';
-  const ISSUER_SEED= process.env.ISSUER_SEED || ''; // optional fallback signer
+  const ISSUER_SEED= process.env.ISSUER_SEED || ''; // optional fallback
 
   const isIOU = !!CODE_HEX || (CODE_ASCII && CODE_ASCII.toUpperCase() !== 'XRP');
 
@@ -54,12 +51,12 @@ export async function sendIssued({ to, amount }) {
     if (isIOU) {
       if (!ISSUER) throw new Error('issuer_missing');
 
-      // Dest must trust issuer/token
+      // Destination must trust issuer/token
       const destLines = await client.request({ method:'account_lines', account: to, ledger_index:'validated' });
       const destHasTL = (destLines?.result?.lines || []).some(l => l.account === ISSUER && String(l.currency).toUpperCase() === cur);
       if (!destHasTL) throw Object.assign(new Error('trustline_required'), { code:'trustline_required' });
 
-      // Try hot wallet sender first (Option B)
+      // Try hot wallet first (Option B)
       const hot = xrpl.Wallet.fromSeed(HOT_SEED || ISSUER_SEED, { algorithm:'secp256k1' });
       const signingAsIssuer = (hot.address === ISSUER);
 
@@ -81,7 +78,7 @@ export async function sendIssued({ to, amount }) {
 
       let { eng, hash } = await signSubmitAndCheck(hot, tx);
 
-      // If path liquidity issue, fallback to issuer signer if present
+      // Auto-fallback on path liquidity if issuer seed available
       if (eng === 'tecPATH_PARTIAL' && ISSUER_SEED) {
         const issuerW = xrpl.Wallet.fromSeed(ISSUER_SEED, { algorithm:'secp256k1' });
         const res2 = await signSubmitAndCheck(issuerW, { ...tx, Account: issuerW.address });
