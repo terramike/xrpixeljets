@@ -332,28 +332,37 @@ async function start() {
     return reply.send({ ok:true, reward, victory: !!victory, level: lvl, profile: toClient(rows[0]) });
   });
 
-  // Claim
-  app.post('/claim/start', async (req, reply) => {
-    const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
-    const amount = toInt(req.body?.amount, 0);
-    if (amount <= 0) return reply.code(400).send({ error: 'bad_amount' });
+  // ---------- Claim ----------
+app.post('/claim/start', async (req, reply) => {
+  const jwtClaims = requireJWT(req, reply); if (!jwtClaims) return;
+  const amt = Number(req.body?.amount || 0);
+  if (!Number.isFinite(amt) || amt <= 0) return reply.code(400).send({ error: 'bad_amount' });
 
-    // cooldown/limits
-    const row = await getProfileRaw(req.wallet);
-    const now = new Date();
-    const last = row?.last_claim_at ? new Date(row.last_claim_at) : null;
-    const COOL = Number(process.env.CLAIM_COOLDOWN_SEC || 300);
-    if (last && (now - last) / 1000 < COOL) return reply.code(429).send({ error: 'cooldown' });
+  // cooldown / limits (unchanged)
+  const row = await getProfileRaw(req.wallet);
+  if (!row) return reply.code(404).send({ error: 'not_found' });
+  const lastTs = row.last_claim_at ? Math.floor(new Date(row.last_claim_at).getTime()/1000) : 0;
+  const nowS = nowSec();
+  const COOLD = Number(process.env.CLAIM_COOLDOWN_SEC || 300);
+  if (COOLD > 0 && (nowS - lastTs) < COOLD) return reply.code(429).send({ error:'cooldown' });
 
-    try {
-      const sent = await claim.sendIssued({ to: req.wallet, amount });
-      await pool.query(`update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1`, [req.wallet]);
-      return reply.send({ ok:true, txid: sent.txid || null, txJSON: sent.txJSON || null });
-    } catch (e) {
-      app.log.warn({ err: e }, 'claim_send_failed');
-      return reply.code(500).send({ error:'claim_failed' });
+  try {
+    const dest = req.wallet;
+    const sent = await claim.sendIssued({ to: dest, amount: amt }); // may throw 'trustline_required'
+    await pool.query(`update player_profiles set last_claim_at = now(), updated_at = now() where wallet=$1`, [dest]).catch(()=>{});
+    await pool.query(`insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`, [dest, amt, sent?.txid||null]).catch(()=>{});
+    return reply.send({ ok:true, txid: sent?.txid || null, txJSON: sent?.txJSON || null });
+  } catch (e) {
+    const msg = String(e?.message || e || '');
+    if (msg.includes('trustline_required') || msg.includes('no_trustline')) {
+      return reply.code(400).send({ error: 'trustline_required' });
     }
-  });
+    if (msg.includes('hot_wallet_missing')) return reply.code(500).send({ error: 'server_hot_wallet_missing' });
+    if (msg.includes('issuer_missing'))     return reply.code(500).send({ error: 'server_issuer_missing' });
+    return reply.code(500).send({ error: 'claim_failed' });
+  }
+});
+
 
   // Health
   app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
@@ -372,3 +381,4 @@ start().catch((e) => {
   console.error('[startup_error]', e);
   process.exit(1);
 });
+
