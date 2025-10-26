@@ -1,9 +1,9 @@
-// server/claimJetFuel.js — XRPixel Jets (2025-10-25ac, secp hot-wallet enforced)
+// server/claimJetFuel.js — XRPixel Jets (2025-10-25secp, secp hot-wallet enforced)
 import xrpl from 'xrpl';
 
-const WSS     = process.env.NETWORK || process.env.XRPL_WSS || 'wss://s1.ripple.com';
-const ISSUER  = process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || '';
-const HOT_SEED= process.env.HOT_WALLET_SEED || process.env.HOT_SEED || '';
+const WSS      = process.env.NETWORK || process.env.XRPL_WSS || 'wss://s1.ripple.com';
+const ISSUER   = process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || '';
+const HOT_SEED = process.env.HOT_WALLET_SEED || process.env.HOT_SEED || '';
 const CODE_ASCII = process.env.CURRENCY_CODE || process.env.CURRENCY || 'JFUEL';
 const CODE_HEX   = (process.env.CURRENCY_HEX || '').toUpperCase();
 const TOKEN_MODE = (process.env.TOKEN_MODE || 'IOU').toUpperCase();
