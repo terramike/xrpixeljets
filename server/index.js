@@ -1,4 +1,9 @@
-// index.js — XRPixel Jets API (2025-10-26-cors4)
+// index.js — XRPixel Jets API (2025-10-26-claims4)
+// Changes in this drop:
+// - /claim/start now verifies available jet_fuel, debits atomically,
+//   sends the XRPL payout, and REFUNDS on failure.
+// - Returns updated profile in the claim response: { ok, txid, txJSON, profile }
+
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import pkg from 'pg';
@@ -18,18 +23,18 @@ const ALLOW = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeyg
 const ECON_SCALE_ENV = Number(process.env.ECON_SCALE || 0.10);
 const BASE_PER_LEVEL = Number(process.env.BASE_PER_LEVEL || 300);
 
-// ---- CORS plugin (preflights + allowlist) ----
+// ---- CORS plugin ----
 await app.register(cors, {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);           // same-origin / server-to-server
-    cb(null, ALLOW.includes(origin));             // only explicit allowlist
+    if (!origin) return cb(null, true);
+    cb(null, ALLOW.includes(origin));
   },
   methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Accept','Origin','X-Wallet','Authorization'],
+  allowedHeaders: ['Content-Type','Accept','Origin','X-Wallet','Authorization','X-Idempotency-Key'],
   credentials: false
 });
 
-// Ensure ACAO on every reply (including errors)
+// Always include ACAO (even on errors)
 app.addHook('onSend', async (req, reply, payload) => {
   const origin = req.headers.origin;
   if (origin && ALLOW.includes(origin)) {
@@ -38,8 +43,6 @@ app.addHook('onSend', async (req, reply, payload) => {
   }
   return payload;
 });
-
-// Global error handler — keep CORS headers on errors too
 app.setErrorHandler((err, req, reply) => {
   const origin = req.headers.origin;
   if (origin && ALLOW.includes(origin)) {
@@ -58,7 +61,6 @@ const pool = new Pool({
 });
 
 // ---------- utils ----------
-const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 const toInt = (x, d=0) => { const n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : d; };
 const nowSec = () => Math.floor(Date.now()/1000);
 const asciiToHex = (s) => Buffer.from(String(s),'utf8').toString('hex');
@@ -71,7 +73,7 @@ function takeNonce(address){ const r=NONCES.get(address); if(!r){return {err:'ex
 const isSecpPublicKeyHex = (pk) => typeof pk==='string' && /^(02|03)[0-9A-Fa-f]{64}$/.test(pk);
 const isEd25519PublicKeyHex = (pk) => typeof pk==='string' && /^ED[0-9A-Fa-f]{64}$/.test(pk);
 
-// Rate limit + X-Wallet (skip for /session/start and /config; plugin handles OPTIONS)
+// Rate limit + X-Wallet (skip for /session/start and /config)
 const RATE = { windowMs: 10_000, maxPerWindow: 30 };
 const bucket = new Map();
 app.addHook('onRequest', async (req, reply) => {
@@ -119,24 +121,6 @@ function toClient(row){
            pct:{ hit:row.ms_hit|0, crit:row.ms_crit|0, dodge:row.ms_dodge|0 },
            jetFuel:row.jet_fuel|0, energy:row.energy|0, energyCap:row.energy_cap|0, unlockedLevel:row.unlocked_level|0 };
 }
-async function applyRegen(wallet,row){
-  try {
-    const minutes = Math.max(0, Math.floor((Date.now() - new Date(row.updated_at))/60000));
-    const ms = recomputeCurrent(row.ms_base, row.ms_level);
-    const regen = (ms.regenPerMin|0)||1;
-    if (minutes>0 && regen>0) {
-      const cap = (row.energy_cap|0)||100;
-      const next = Math.max(0, Math.min(cap, (row.energy|0) + minutes*regen));
-      if (next !== (row.energy|0)) {
-        const { rows } = await pool.query(
-`update player_profiles set energy=$2, ms_current=$3, updated_at=now() where wallet=$1 returning *`,
-          [wallet, next, JSON.stringify(ms)]);
-        return rows[0];
-      }
-    }
-  } catch {}
-  return row;
-}
 
 // ---------- jwt ----------
 function signJWT(address, scope='play,upgrade,claim'){ const now=nowSec(); const exp=now+60*60; return jwt.sign({sub:address,scope,iat:now,exp}, JWT_SECRET, {algorithm:'HS256'}); }
@@ -159,7 +143,7 @@ app.get('/config', async (_req, reply) => {
   reply.send({
     tokenMode: (process.env.TOKEN_MODE || 'mock').toLowerCase(),
     network: process.env.XRPL_WSS || process.env.NETWORK || 'wss://s.altnet.rippletest.net:51233',
-    currencyCode: (process.env.CURRENCY_CODE || process.env.CURRENCY || 'JFUEL'),
+    currencyCode: (process.env.CURRENCY_CODE || process.env.CURRENCY || 'JETS'),
     currencyHex: process.env.CURRENCY_HEX || null,
     issuer: process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || null
   });
@@ -194,9 +178,8 @@ app.post('/session/verify', async (req, reply) => {
 // ---------- profile ----------
 app.get('/profile', async (req, reply) => {
   await ensureProfile(req.wallet);
-  let row = await getProfileRaw(req.wallet);
+  const row = await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error:'not_found' });
-  row = await applyRegen(req.wallet, row);
   reply.send(toClient(row));
 });
 
@@ -219,7 +202,8 @@ app.post('/ms/upgrade', async (req, reply) => {
     const want = Math.max(0, toInt(q[key],0));
     for(let i=0;i<want;i++){
       const lvlNow=(key==='health'||key==='energyCap'||key==='regenPerMin')?levels[key]:(key==='hit'?levels.hit:(key==='crit'?levels.crit:levels.dodge));
-      const price=unitCost(lvlNow, scale); if (jf<price) break;
+      const price=Math.max(1, Math.round(BASE_PER_LEVEL*(lvlNow+1)*getEconScaleFrom(scale)));
+      if (jf<price) break;
       jf-=price; spent+=price; applied[key]+=1;
       if (key==='health'||key==='energyCap'||key==='regenPerMin') levels[key]+=1;
       else if (key==='hit') levels.hit+=1; else if (key==='crit') levels.crit+=1; else levels.dodge+=1;
@@ -227,7 +211,6 @@ app.post('/ms/upgrade', async (req, reply) => {
   }
   const newCore={ health:levels.health, energyCap:levels.energyCap, regenPerMin:levels.regenPerMin };
   const ms_current=recomputeCurrent(row.ms_base, newCore);
-
   const { rows } = await pool.query(
 `update player_profiles set jet_fuel=$2, ms_level=$3, ms_current=$4, ms_hit=$5, ms_crit=$6, ms_dodge=$7, updated_at=now()
  where wallet=$1 returning *`,
@@ -238,15 +221,13 @@ app.post('/ms/upgrade', async (req, reply) => {
 // ---------- battle ----------
 app.post('/battle/start', async (req, reply) => {
   const level = toInt((req.body||{}).level, 1);
-  let row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
-  row = await applyRegen(req.wallet, row);
+  const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
   let energy=row.energy|0, spent=0; if (energy>=10){ energy-=10; spent=10; }
   const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [req.wallet, energy]);
   reply.send({ ok:true, level, spent, profile: toClient(rows[0]) });
 });
 app.post('/battle/turn', async (req, reply) => {
-  let row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
-  row = await applyRegen(req.wallet, row);
+  const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
   let energy=row.energy|0, spent=0; if (energy>=1){ energy-=1; spent=1; }
   const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [req.wallet, energy]);
   reply.send({ ok:true, spent, profile: toClient(rows[0]) });
@@ -260,26 +241,55 @@ app.post('/battle/finish', async (req, reply) => {
   reply.send({ ok:true, reward, victory, level:lvl, profile: toClient(rows[0]) });
 });
 
-// ---------- claim ----------
+// ---------- claim (debit → send → refund on failure) ----------
 app.post('/claim/start', async (req, reply) => {
   const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
-  const amt = Number(req.body?.amount || 0);
-  if (!Number.isFinite(amt) || amt<=0) return reply.code(400).send({ error:'bad_amount' });
+
+  const amt = toInt(req.body?.amount, 0);
+  if (!Number.isFinite(amt) || amt <= 0) return reply.code(400).send({ error:'bad_amount' });
 
   const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
+
+  // Cooldown (unchanged)
   const nowS = nowSec(); const lastS = row.last_claim_at ? Math.floor(new Date(row.last_claim_at).getTime()/1000) : 0;
   const COOL = Number(process.env.CLAIM_COOLDOWN_SEC || 300);
   if (COOL>0 && (nowS-lastS)<COOL) return reply.code(429).send({ error:'cooldown' });
 
+  // 1) Atomically debit jet_fuel (only if enough balance)
+  const debit = await pool.query(
+`update player_profiles
+   set jet_fuel = jet_fuel - $2,
+       last_claim_at = now(),
+       updated_at = now()
+ where wallet = $1
+   and jet_fuel >= $2
+ returning *`,
+    [req.wallet, amt]
+  );
+
+  if (debit.rows.length === 0) {
+    return reply.code(400).send({ error:'insufficient_funds' });
+  }
+
+  const debitedProfile = toClient(debit.rows[0]);
+
   try {
-    const sent = await claim.sendIssued({ to:req.wallet, amount: amt }); // may throw trustline/inventory/path errors
-    await pool.query(`update player_profiles set last_claim_at=now(), updated_at=now() where wallet=$1`, [req.wallet]).catch(()=>{});
+    // 2) XRPL payout (server sends or prepares)
+    const sent = await claim.sendIssued({ to:req.wallet, amount: amt });
+
+    // 3) Audit success
     await pool.query(`insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`, [req.wallet, amt, sent?.txid||null]).catch(()=>{});
-    reply.send({ ok:true, txid: sent?.txid || null, txJSON: sent?.txJSON || null });
+
+    // Optional: fetch fresh profile (already debited above)
+    const latest = await getProfileRaw(req.wallet);
+    return reply.send({ ok:true, txid: sent?.txid || null, txJSON: sent?.txJSON || null, profile: toClient(latest || debit.rows[0]) });
   } catch (e) {
+    // 4) Refund on any failure
+    await pool.query(`update player_profiles set jet_fuel = jet_fuel + $2, updated_at=now() where wallet=$1`, [req.wallet, amt]).catch(()=>{});
+
     const msg = String(e?.message||'');
     if (msg.includes('trustline_required'))         return reply.code(400).send({ error:'trustline_required' });
-    if (msg.includes('path_liquidity'))             return reply.code(500).send({ error:'server_path_liquidity' });
+    if (msg.includes('issuer_rippling_disabled'))   return reply.code(500).send({ error:'issuer_rippling_disabled' });
     if (msg.includes('hot_wallet_no_inventory'))    return reply.code(500).send({ error:'server_hot_no_inventory' });
     if (msg.includes('hot_wallet_needs_trustline')) return reply.code(500).send({ error:'server_hot_needs_trustline' });
     if (msg.includes('hot_wallet_missing'))         return reply.code(500).send({ error:'server_hot_wallet_missing' });
