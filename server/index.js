@@ -1,8 +1,4 @@
-// index.js — XRPixel Jets API (2025-10-26-cors3)
-// - Fix: no duplicate OPTIONS route (CORS plugin handles preflights).
-// - Includes /config, auth, profile, ms costs/upgrades, battle, claim.
-// - Server-authoritative economy; JWT auth for claims.
-
+// index.js — XRPixel Jets API (2025-10-26-cors4)
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import pkg from 'pg';
@@ -22,15 +18,37 @@ const ALLOW = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeyg
 const ECON_SCALE_ENV = Number(process.env.ECON_SCALE || 0.10);
 const BASE_PER_LEVEL = Number(process.env.BASE_PER_LEVEL || 300);
 
-// ---- CORS (plugin only; preflights handled here) ----
+// ---- CORS plugin (preflights + allowlist) ----
 await app.register(cors, {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);         // same-origin / server-to-server
-    cb(null, ALLOW.includes(origin));           // allowlisted origins only
+    if (!origin) return cb(null, true);           // same-origin / server-to-server
+    cb(null, ALLOW.includes(origin));             // only explicit allowlist
   },
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Accept','Origin','X-Wallet','Authorization'],
   credentials: false
+});
+
+// Ensure ACAO on every reply (including errors)
+app.addHook('onSend', async (req, reply, payload) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOW.includes(origin)) {
+    reply.header('Access-Control-Allow-Origin', origin);
+    reply.header('Vary', 'Origin');
+  }
+  return payload;
+});
+
+// Global error handler — keep CORS headers on errors too
+app.setErrorHandler((err, req, reply) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOW.includes(origin)) {
+    reply.header('Access-Control-Allow-Origin', origin);
+    reply.header('Vary', 'Origin');
+  }
+  const code = err.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
+  req.log.error({ err }, 'request_error');
+  reply.code(code).send({ error: 'internal_error' });
 });
 
 // ---------- DB ----------
