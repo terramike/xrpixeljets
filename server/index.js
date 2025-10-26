@@ -1,8 +1,6 @@
-// index.js — XRPixel Jets API (2025-10-26-claims4)
-// Changes in this drop:
-// - /claim/start now verifies available jet_fuel, debits atomically,
-//   sends the XRPL payout, and REFUNDS on failure.
-// - Returns updated profile in the claim response: { ok, txid, txJSON, profile }
+// index.js — XRPixel Jets API (2025-10-26-claims5 + server-side ENERGY REGEN)
+// - Adds regenEnergyIfDue() and invokes it on /profile, /battle/start, /battle/turn.
+// - Everything else unchanged from your working loops.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -25,10 +23,7 @@ const BASE_PER_LEVEL = Number(process.env.BASE_PER_LEVEL || 300);
 
 // ---- CORS plugin ----
 await app.register(cors, {
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    cb(null, ALLOW.includes(origin));
-  },
+  origin: (origin, cb) => { if (!origin) return cb(null, true); cb(null, ALLOW.includes(origin)); },
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: ['Content-Type','Accept','Origin','X-Wallet','Authorization','X-Idempotency-Key'],
   credentials: false
@@ -37,28 +32,19 @@ await app.register(cors, {
 // Always include ACAO (even on errors)
 app.addHook('onSend', async (req, reply, payload) => {
   const origin = req.headers.origin;
-  if (origin && ALLOW.includes(origin)) {
-    reply.header('Access-Control-Allow-Origin', origin);
-    reply.header('Vary', 'Origin');
-  }
+  if (origin && ALLOW.includes(origin)) { reply.header('Access-Control-Allow-Origin', origin); reply.header('Vary', 'Origin'); }
   return payload;
 });
 app.setErrorHandler((err, req, reply) => {
   const origin = req.headers.origin;
-  if (origin && ALLOW.includes(origin)) {
-    reply.header('Access-Control-Allow-Origin', origin);
-    reply.header('Vary', 'Origin');
-  }
+  if (origin && ALLOW.includes(origin)) { reply.header('Access-Control-Allow-Origin', origin); reply.header('Vary', 'Origin'); }
   const code = err.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
   req.log.error({ err }, 'request_error');
   reply.code(code).send({ error: 'internal_error' });
 });
 
 // ---------- DB ----------
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 // ---------- utils ----------
 const toInt = (x, d=0) => { const n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : d; };
@@ -122,6 +108,39 @@ function toClient(row){
            jetFuel:row.jet_fuel|0, energy:row.energy|0, energyCap:row.energy_cap|0, unlockedLevel:row.unlocked_level|0 };
 }
 
+// ---------- server-side ENERGY REGEN ----------
+async function regenEnergyIfDue(wallet){
+  let row = await getProfileRaw(wallet);
+  if (!row) return null;
+
+  // compute current stats and regen params
+  const cur = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
+  const cap = toInt(cur.energyCap ?? row.energy_cap ?? 100, 100);
+  const rpm = toInt(cur.regenPerMin, 0);
+
+  if (rpm <= 0) return row;
+
+  const nowS  = nowSec();
+  const lastS = row.updated_at ? Math.floor(new Date(row.updated_at).getTime()/1000) : nowS;
+  const deltaS = Math.max(0, nowS - lastS);
+
+  // how much to add since last update
+  const gain = Math.floor((deltaS * rpm) / 60);
+  if (gain <= 0) return row;
+
+  const before = row.energy|0;
+  if (before >= cap) return row; // already full; leave updated_at so we accumulate from last spend
+
+  const after = Math.min(cap, before + gain);
+  if (after === before) return row;
+
+  const { rows } = await pool.query(
+    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
+    [wallet, after]
+  );
+  return rows[0] || row;
+}
+
 // ---------- jwt ----------
 function signJWT(address, scope='play,upgrade,claim'){ const now=nowSec(); const exp=now+60*60; return jwt.sign({sub:address,scope,iat:now,exp}, JWT_SECRET, {algorithm:'HS256'}); }
 function requireJWT(req, reply){
@@ -178,7 +197,8 @@ app.post('/session/verify', async (req, reply) => {
 // ---------- profile ----------
 app.get('/profile', async (req, reply) => {
   await ensureProfile(req.wallet);
-  const row = await getProfileRaw(req.wallet);
+  const rowR = await regenEnergyIfDue(req.wallet); // <-- regen here
+  const row  = rowR || await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error:'not_found' });
   reply.send(toClient(row));
 });
@@ -221,13 +241,15 @@ app.post('/ms/upgrade', async (req, reply) => {
 // ---------- battle ----------
 app.post('/battle/start', async (req, reply) => {
   const level = toInt((req.body||{}).level, 1);
-  const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
+  let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
+  if (!row) return reply.code(404).send({ error:'not_found' });
   let energy=row.energy|0, spent=0; if (energy>=10){ energy-=10; spent=10; }
   const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [req.wallet, energy]);
   reply.send({ ok:true, level, spent, profile: toClient(rows[0]) });
 });
 app.post('/battle/turn', async (req, reply) => {
-  const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
+  let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
+  if (!row) return reply.code(404).send({ error:'not_found' });
   let energy=row.energy|0, spent=0; if (energy>=1){ energy-=1; spent=1; }
   const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [req.wallet, energy]);
   reply.send({ ok:true, spent, profile: toClient(rows[0]) });
@@ -241,7 +263,7 @@ app.post('/battle/finish', async (req, reply) => {
   reply.send({ ok:true, reward, victory, level:lvl, profile: toClient(rows[0]) });
 });
 
-// ---------- claim (debit → send → refund on failure) ----------
+// ---------- claim ----------
 app.post('/claim/start', async (req, reply) => {
   const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
 
@@ -280,13 +302,11 @@ app.post('/claim/start', async (req, reply) => {
     // 3) Audit success
     await pool.query(`insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`, [req.wallet, amt, sent?.txid||null]).catch(()=>{});
 
-    // Optional: fetch fresh profile (already debited above)
+    // Optional: fetch fresh profile
     const latest = await getProfileRaw(req.wallet);
     return reply.send({ ok:true, txid: sent?.txid || null, txJSON: sent?.txJSON || null, profile: toClient(latest || debit.rows[0]) });
   } catch (e) {
-    // 4) Refund on any failure
     await pool.query(`update player_profiles set jet_fuel = jet_fuel + $2, updated_at=now() where wallet=$1`, [req.wallet, amt]).catch(()=>{});
-
     const msg = String(e?.message||'');
     if (msg.includes('trustline_required'))         return reply.code(400).send({ error:'trustline_required' });
     if (msg.includes('issuer_rippling_disabled'))   return reply.code(500).send({ error:'issuer_rippling_disabled' });
