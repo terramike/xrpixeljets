@@ -227,9 +227,10 @@ function calcCosts(levels,s){
 }
 function missionReward(level){
   const l = Math.max(1, Number(level) || 1);
-  const base = 100; // base reward
-  const inc = Math.round(base * Math.pow(1.01, Math.max(0, l - 1)));
-  return Math.max(1, Math.min(10000, Math.round(inc * REWARD_SCALE)));
+  const base   = Number(process.env.REWARD_BASE   || 100);
+  const growth = Number(process.env.REWARD_GROWTH || 1.03); // 3% per wave
+  const val = base * Math.pow(growth, l - 1) * REWARD_SCALE;
+  return Math.max(1, Math.min(10000, Math.ceil(val))); // ceil to avoid stagnation
 }
 
 // ---------- profiles ----------
@@ -540,4 +541,5 @@ app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`XRPixel Jets API listening on :${PORT}`);
 });
+
 
