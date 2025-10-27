@@ -166,12 +166,7 @@ app.addHook('onRequest', async (req, reply) => {
   if (req.method === 'OPTIONS') return;
 
   // Allow auth bootstrap and public config/health without X-Wallet
-  if (
-    url.startsWith('/session/start') ||
-    url.startsWith('/session/verify') ||   // ← add this exemption
-    url.startsWith('/config') ||
-    url.startsWith('/healthz')
-  ) return;
+  if (url.startsWith('/session/start') || url.startsWith('/session/verify') || url.startsWith('/config') || url.startsWith('/healthz')) return;
 
   const w = req.headers['x-wallet'];
   if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
@@ -242,28 +237,56 @@ app.post('/session/start', async (req, reply) => {
   reply.send({ nonce });
 });
 
+// inside index.js
 app.post('/session/verify', async (req, reply) => {
   const { address, signature, publicKey, ts, scope, payload, payloadHex } = req.body || {};
-  const asciiToHex = (s) => Buffer.from(String(s),'utf8').toString('hex');
-  const normHex = (s) => String(s||'').replace(/^0x/i,'').toLowerCase();
-  const okClassic = /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(String(address||''));
-  const okSecp = /^(02|03)[0-9A-Fa-f]{64}$/.test(String(publicKey||''));
 
+  const asciiToHex = s => Buffer.from(String(s||''), 'utf8').toString('hex');
+  const normHex = s => String(s||'').replace(/^0x/i,'').toLowerCase();
+
+  // basic guards
+  const okClassic = /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(String(address||''));
+  const okSecp    = /^(02|03|04)[0-9A-Fa-f]{66,130}$/.test(String(publicKey||'')); // allow uncompressed 04…, we’ll compress
   if (!okClassic) return reply.code(400).send({ error:'bad_address' });
   if (!okSecp)    return reply.code(400).send({ error:'bad_key_algo' });
   if (!signature) return reply.code(400).send({ error:'bad_signature' });
 
-  const msgHex = normHex(payloadHex || asciiToHex(String(payload||'')));
-  const sigHex = normHex(signature);
+  // compress 04… pubkeys to 02/03… (if needed)
+  function compressPub(pub){
+    const p = normHex(pub);
+    if (!p.startsWith('04')) return pub; // already 02/03
+    const x = p.slice(2, 66);
+    const y = p.slice(66, 130);
+    const yLastByte = parseInt(y.slice(-2), 16);
+    const prefix = (yLastByte % 2) ? '03' : '02';
+    return prefix + x;
+  }
+  const pubC = compressPub(publicKey);
+  if (!/^(02|03)[0-9a-f]{64}$/.test(pubC)) return reply.code(400).send({ error:'bad_key_algo' });
 
-  // Nonce check must match the ASCII payload we asked the wallet to sign
+  // Nonce must match the ASCII payload we instructed to sign
   const nonceAscii = (String(payload||'').split('||')[0] || '').trim();
   if (!takeNonce(address, nonceAscii)) return reply.code(400).send({ error:'bad_nonce' });
 
-  let ok = false;
-  try { ok = keypairs.verifyMessage(msgHex, sigHex, publicKey); }
-  catch(e){ req.log.warn({ e:String(e), msgLen:msgHex.length, sigLen:sigHex.length }, 'verify_throw'); return reply.code(400).send({ error:'bad_signature' }); }
-  if (!ok) return reply.code(400).send({ error:'bad_signature' });
+  const msgAsciiHex = asciiToHex(payload);
+  const msgHexGiven = normHex(payloadHex||'');
+  const sigHex      = normHex(signature);
+
+  // Try both interpretations to accommodate wallet differences:
+  // 1) Verify against provided payloadHex (HEX path)
+  // 2) Verify against asciiToHex(payload) (ASCII path)
+  let ok = false, err1=null, err2=null;
+  try { ok = require('ripple-keypairs').verifyMessage(msgHexGiven || msgAsciiHex, sigHex, pubC); }
+  catch(e){ err1 = String(e); }
+  if (!ok) {
+    try { ok = require('ripple-keypairs').verifyMessage(msgAsciiHex, sigHex, pubC); }
+    catch(e){ err2 = String(e); }
+  }
+
+  if (!ok) {
+    req.log.warn({ err1, err2, msgLen1:(msgHexGiven||'').length, msgLen2:msgAsciiHex.length }, 'verify_failed');
+    return reply.code(400).send({ error:'bad_signature' });
+  }
 
   const token = jwt.sign({ sub:address, scope:String(scope||'play,upgrade,claim') }, JWT_SECRET, { algorithm:'HS256', expiresIn:'60m' });
   reply.send({ ok:true, jwt: token });
@@ -541,5 +564,6 @@ app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`XRPixel Jets API listening on :${PORT}`);
 });
+
 
 
