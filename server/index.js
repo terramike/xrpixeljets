@@ -37,31 +37,22 @@ await app.register(cors, {
   credentials: false
 });
 
-// ---- error handler ----
+// Always include ACAO (even on errors)
+app.addHook('onSend', async (req, reply, payload) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOW.includes(origin)) { reply.header('Access-Control-Allow-Origin', origin); reply.header('Vary', 'Origin'); }
+  return payload;
+});
 app.setErrorHandler((err, req, reply) => {
-  const code = Number(err.statusCode || err.code || 500);
+  const origin = req.headers.origin;
+  if (origin && ALLOW.includes(origin)) { reply.header('Access-Control-Allow-Origin', origin); reply.header('Vary', 'Origin'); }
+  const code = err.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
   req.log.error({ err }, 'request_error');
   reply.code(code).send({ error: 'internal_error' });
 });
 
 // ---------- DB ----------
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-
-// ---------- (optional) shop tables ----------
-async function ensureShopTables(){
-  await pool.query(`
-    create table if not exists shop_orders(
-      id bigserial primary key,
-      wallet text not null,
-      item_id text not null,
-      cost int not null,
-      tx_hash text,
-      redeem_code text,
-      created_at timestamp with time zone default now()
-    );
-  `);
-}
-await ensureShopTables().catch(err => app.log.error({err}, 'ensure_shop_tables_failed'));
 
 // ---------- utils ----------
 const toInt  = (x, d=0) => { const n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : d; };
@@ -70,114 +61,25 @@ const asciiToHex = (s) => Buffer.from(String(s),'utf8').toString('hex');
 
 const NONCES = new Map();
 const newNonce = () => crypto.randomBytes(32).toString('hex');
-function storeNonce(address, nonce){ NONCES.set(address,{nonce,exp:Date.now()+5*60*1000}); }
-function takeNonce(address, nonce){
-  const rec = NONCES.get(address);
-  NONCES.delete(address);
-  if (!rec) return false;
-  if (rec.exp < Date.now()) return false;
-  return rec.nonce === nonce;
-}
+function storeNonce(address, nonce){ NONCES.set(address,{nonce,exp:Date.now()+5*60_000,used:false}); }
+function takeNonce(address){ const r=NONCES.get(address); if(!r){return {err:'expired_nonce'}}; NONCES.delete(address); if(r.used||Date.now()>r.exp){return {err:'expired_nonce'}}; r.used=true; return {ok:true, nonce:r.nonce}; }
 
-function recomputeCurrent(row){
-  const base = row.ms_base || { health:20, energyCap:100, regenPerMin:1.0, hit:0, crit:10, dodge:0 };
-  const lv   = row.ms_level || { health:0, energyCap:0, regenPerMin:0 };
-  const pct  = { hit: toInt(row.ms_hit,0), crit: toInt(row.ms_crit,10), dodge: toInt(row.ms_dodge,0) };
-  const cur = {
-    health: toInt(base.health,20) + toInt(lv.health,0),
-    energyCap: toInt(base.energyCap,100) + toInt(lv.energyCap,0),
-    regenPerMin: Number(base.regenPerMin||1.0) + toInt(lv.regenPerMin,0)*Number(REGEN_STEP||0.1),
-    hit: pct.hit,
-    crit: pct.crit,
-    dodge: pct.dodge
-  };
-  return cur;
-}
+const isSecpPublicKeyHex   = (pk) => typeof pk==='string' && /^(02|03)[0-9A-Fa-f]{64}$/.test(pk);
+const isEd25519PublicKeyHex= (pk) => typeof pk==='string' && /^ED[0-9A-Fa-f]{64}$/.test(pk);
 
-async function regenEnergyIfDue(wallet){
-  // Track last regen timestamp + fractional accumulation per user
-  await pool.query(`
-    create table if not exists energy_clock(
-      wallet text primary key,
-      last_at timestamptz default now(),
-      acc float8 default 0
-    );
-  `);
-  const p = await pool.query(`select jet_fuel, energy, ms_base, ms_level, ms_hit, ms_crit, ms_dodge from player_profiles where wallet=$1`, [wallet]);
-  if (!p.rows.length) return null;
-  const row = p.rows[0];
-  const ms = recomputeCurrent(row);
-
-  const clk = await pool.query(`insert into energy_clock(wallet) values ($1)
-    on conflict(wallet) do update set wallet=excluded.wallet returning *`, [wallet]);
-  const lastAt = new Date(clk.rows[0].last_at || new Date());
-  const acc0   = Number(clk.rows[0].acc || 0);
-
-  const now = new Date();
-  const ds = Math.max(0, Math.floor((now - lastAt)/1000)); // seconds
-  if (ds <= 0) return { energy: toInt(row.energy,0), ms };
-
-  const perSec = Number(ms.regenPerMin || 0) / 60;
-  let acc = acc0 + perSec * ds;
-  let gain = 0;
-  while (acc >= 1) { gain += 1; acc -= 1; }
-  let newEnergy = Math.min(Number(ms.energyCap||100), toInt(row.energy,0) + gain);
-
-  await pool.query(`update energy_clock set last_at=now(), acc=$2 where wallet=$1`, [wallet, acc]);
-  if (newEnergy !== toInt(row.energy,0)) {
-    await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1`, [wallet, newEnergy]);
-  }
-  return { energy: newEnergy, ms };
-}
-
-function toClient(row){
-  const ms = { base: row.ms_base || { health:20, energyCap:100, regenPerMin:1.0, hit:0, crit:10, dodge:0 } };
-  ms.level = row.ms_level || { health:0, energyCap:0, regenPerMin:0 };
-  ms.current = recomputeCurrent(row);
-  const pct = { hit: toInt(row.ms_hit,0), crit: toInt(row.ms_crit,10), dodge: toInt(row.ms_dodge,0) };
-  return {
-    wallet: row.wallet,
-    jetFuel: toInt(row.jet_fuel,0),
-    energy: toInt(row.energy,0),
-    energyCap: ms.current.energyCap,
-    ms,
-    pct,
-    unlockedLevel: toInt(row.unlocked_level, 5)
-  };
-}
-
-// ---------- public config ----------
-app.get('/config', async (_req, reply) => {
-  reply.send({
-    tokenMode: (process.env.TOKEN_MODE || 'mock'),
-    network:   (process.env.XRPL_WSS || 'wss://xrplcluster.com'),
-    currencyCode: (process.env.CURRENCY_CODE || 'JFUEL'),
-    currencyHex:  (process.env.CURRENCY_HEX  || null),
-    issuer:       (process.env.ISSUER_ADDR   || null)
-  });
-});
-
-// ---------- rate limit + X-Wallet & auth helpers ----------
-function verifySecpPub(pub){ return /^(02|03)[0-9A-Fa-f]{64}$/.test(String(pub||'')); }
-function verifyClassic(addr){ return /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(String(addr||'')); }
-
+// Rate limit + X-Wallet (skip for /session/start and /config)
+const RATE = { windowMs: 10_000, maxPerWindow: 30 };
+const bucket = new Map();
 app.addHook('onRequest', async (req, reply) => {
   const url = req.raw.url || '';
   if (req.method === 'OPTIONS') return;
-
-  // Allow auth bootstrap and public config/health without X-Wallet
-  if (url.startsWith('/session/start') || url.startsWith('/session/verify') || url.startsWith('/config') || url.startsWith('/healthz')) return;
+  if (url.startsWith('/session/start') || url.startsWith('/config')) return;
 
   const w = req.headers['x-wallet'];
-  if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
-    return reply.code(400).send({ error:'missing_or_bad_X-Wallet' });
-  }
+  if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) return reply.code(400).send({ error:'missing_or_bad_X-Wallet' });
   req.wallet = w;
 
-  // (rate limit logic unchanged)
   const key = `${req.ip}|${w}`;
-  const RATE = { windowMs: 10_000, maxPerWindow: 30 };
-  const bucket = app._ratebucket || (app._ratebucket = new Map());
   const now = Date.now();
   const cur = bucket.get(key) || { count: 0, ts: now };
   if (now - cur.ts > RATE.windowMs) { cur.count = 0; cur.ts = now; }
@@ -185,6 +87,87 @@ app.addHook('onRequest', async (req, reply) => {
   if (cur.count > RATE.maxPerWindow) return reply.code(429).send({ error:'rate_limited' });
 });
 
+// ---------- profile helpers ----------
+async function ensureProfile(wallet){
+  await pool.query(
+    `insert into player_profiles (wallet) values ($1) on conflict (wallet) do nothing`,
+    [wallet]
+  );
+}
+async function getProfileRaw(wallet){
+  const { rows } = await pool.query(
+`select wallet,
+  coalesce(jet_fuel,0)::int as jet_fuel,
+  coalesce(energy,0)::int as energy,
+  coalesce(energy_cap,100)::int as energy_cap,
+  ms_base, ms_level, ms_current,
+  coalesce(ms_hit,0)::int as ms_hit,
+  coalesce(ms_crit,10)::int as ms_crit,
+  coalesce(ms_dodge,0)::int as ms_dodge,
+  coalesce(unlocked_level,1)::int as unlocked_level,
+  last_claim_at, updated_at, created_at
+ from player_profiles where wallet=$1`,
+    [wallet]
+  );
+  return rows[0] || null;
+}
+
+// NOTE: 'level' here is the *levels purchased*, recomputed into current via REGEN_STEP
+function recomputeCurrent(base, level){
+  const b  = base  || { health:20, energyCap:100, regenPerMin:1 };
+  const lv = level || { health:0,  energyCap:0,   regenPerMin:0 };
+  return {
+    health:     (b.health|0)    + (lv.health|0),
+    energyCap:  (b.energyCap|0) + (lv.energyCap|0),
+    regenPerMin: Number(b.regenPerMin || 0) + Number(lv.regenPerMin || 0) * REGEN_STEP
+  };
+}
+function toClient(row){
+  const ms_current = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
+  return {
+    ms: { base:row.ms_base, level:row.ms_level, current:ms_current },
+    pct:{ hit:row.ms_hit|0, crit:row.ms_crit|0, dodge:row.ms_dodge|0 },
+    jetFuel:row.jet_fuel|0, energy:row.energy|0, energyCap:row.energy_cap|0, unlockedLevel:row.unlocked_level|0
+  };
+}
+
+// ---------- server-side ENERGY REGEN (fractional rpm supported) ----------
+async function regenEnergyIfDue(wallet){
+  let row = await getProfileRaw(wallet);
+  if (!row) return null;
+
+  const cur = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
+  const cap = Number(cur.energyCap ?? row.energy_cap ?? 100) || 100;
+  const rpm = Number(cur.regenPerMin || 0); // may be fractional
+
+  if (rpm <= 0) return row;
+
+  const nowS   = nowSec();
+  const lastS  = row.updated_at ? Math.floor(new Date(row.updated_at).getTime()/1000) : nowS;
+  const deltaS = Math.max(0, nowS - lastS);
+
+  // accrue whole energy points from fractional regen/min
+  const gain = Math.floor((deltaS * rpm) / 60);
+  if (gain <= 0) return row;
+
+  const before = row.energy|0;
+  if (before >= cap) return row;
+
+  const after = Math.min(cap, before + gain);
+  if (after === before) return row;
+
+  const { rows } = await pool.query(
+    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
+    [wallet, after]
+  );
+  return rows[0] || row;
+}
+
+// ---------- jwt ----------
+function signJWT(address, scope='play,upgrade,claim'){
+  const now=nowSec(); const exp=now+60*60;
+  return jwt.sign({sub:address,scope,iat:now,exp}, JWT_SECRET, {algorithm:'HS256'});
+}
 function requireJWT(req, reply){
   const auth = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
@@ -222,147 +205,62 @@ function calcCosts(levels,s){
 }
 function missionReward(level){
   const l = Math.max(1, Number(level) || 1);
-  const base   = Number(process.env.REWARD_BASE   || 100);
-  const growth = Number(process.env.REWARD_GROWTH || 1.03); // 3% per wave
-  const val = base * Math.pow(growth, l - 1) * REWARD_SCALE;
-  return Math.max(1, Math.min(10000, Math.ceil(val))); // ceil to avoid stagnation
+
+  // legacy base rewards (unchanged logic)
+  let base;
+  if (l <= 5) base = [0,100,150,200,250,300][l];
+  else        base = Math.round(300 * Math.pow(1.01, l - 5));
+
+  // scale & clamp; defaults to ECON_SCALE unless REWARD_SCALE set in env
+  const reward = Math.round(base * REWARD_SCALE);
+  const scaledMax = Math.max(1, Math.round(10000 * REWARD_SCALE)); // keep old 10k cap proportional
+  return Math.max(1, Math.min(scaledMax, reward));
 }
 
-// ---------- profiles ----------
+// ---------- public config ----------
+app.get('/config', async (_req, reply) => {
+  reply.send({
+    tokenMode: (process.env.TOKEN_MODE || 'mock').toLowerCase(),
+    network: process.env.XRPL_WSS || process.env.NETWORK || 'wss://s.altnet.rippletest.net:51233',
+    currencyCode: (process.env.CURRENCY_CODE || process.env.CURRENCY || 'JETS'),
+    currencyHex: process.env.CURRENCY_HEX || null,
+    issuer: process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || null
+  });
+});
+
+// ---------- auth ----------
 app.post('/session/start', async (req, reply) => {
-  const address = String(req.body?.address || '');
-  if (!verifyClassic(address)) return reply.code(400).send({ error:'bad_address' });
-  await pool.query(`insert into player_profiles (wallet) values ($1) on conflict (wallet) do nothing`, [address]);
+  const { address } = req.body || {};
+  if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) return reply.code(400).send({ error:'bad_address' });
+  await ensureProfile(address);
   const nonce = newNonce(); storeNonce(address, nonce);
   reply.send({ nonce });
 });
-
-// inside index.js
 app.post('/session/verify', async (req, reply) => {
-  const { address, signature, publicKey, ts, scope, payload, payloadHex } = req.body || {};
-
-  const asciiToHex = s => Buffer.from(String(s||''), 'utf8').toString('hex');
-  const normHex = s => String(s||'').replace(/^0x/i,'').toLowerCase();
-
-  // basic guards
-  const okClassic = /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(String(address||''));
-  const okSecp    = /^(02|03|04)[0-9A-Fa-f]{66,130}$/.test(String(publicKey||'')); // allow uncompressed 04…, we’ll compress
-  if (!okClassic) return reply.code(400).send({ error:'bad_address' });
-  if (!okSecp)    return reply.code(400).send({ error:'bad_key_algo' });
+  const { address, signature, publicKey, payloadHex, scope='play,upgrade,claim', ts } = req.body || {};
+  if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) return reply.code(400).send({ error:'bad_address' });
   if (!signature) return reply.code(400).send({ error:'bad_signature' });
-
-  // compress 04… pubkeys to 02/03… (if needed)
-  function compressPub(pub){
-    const p = normHex(pub);
-    if (!p.startsWith('04')) return pub; // already 02/03
-    const x = p.slice(2, 66);
-    const y = p.slice(66, 130);
-    const yLastByte = parseInt(y.slice(-2), 16);
-    const prefix = (yLastByte % 2) ? '03' : '02';
-    return prefix + x;
-  }
-  const pubC = compressPub(publicKey);
-  if (!/^(02|03)[0-9a-f]{64}$/.test(pubC)) return reply.code(400).send({ error:'bad_key_algo' });
-
-  // Nonce must match the ASCII payload we instructed to sign
-  const nonceAscii = (String(payload||'').split('||')[0] || '').trim();
-  if (!takeNonce(address, nonceAscii)) return reply.code(400).send({ error:'bad_nonce' });
-
-  const msgAsciiHex = asciiToHex(payload);
-  const msgHexGiven = normHex(payloadHex||'');
-  const sigHex      = normHex(signature);
-
-  // Try both interpretations to accommodate wallet differences:
-  // 1) Verify against provided payloadHex (HEX path)
-  // 2) Verify against asciiToHex(payload) (ASCII path)
-  let ok = false, err1=null, err2=null;
-  try { ok = require('ripple-keypairs').verifyMessage(msgHexGiven || msgAsciiHex, sigHex, pubC); }
-  catch(e){ err1 = String(e); }
-  if (!ok) {
-    try { ok = require('ripple-keypairs').verifyMessage(msgAsciiHex, sigHex, pubC); }
-    catch(e){ err2 = String(e); }
-  }
-
-  if (!ok) {
-    req.log.warn({ err1, err2, msgLen1:(msgHexGiven||'').length, msgLen2:msgAsciiHex.length }, 'verify_failed');
-    return reply.code(400).send({ error:'bad_signature' });
-  }
-
-  const token = jwt.sign({ sub:address, scope:String(scope||'play,upgrade,claim') }, JWT_SECRET, { algorithm:'HS256', expiresIn:'60m' });
-  reply.send({ ok:true, jwt: token });
+  if (!publicKey) return reply.code(400).send({ error:'bad_key' });
+  if (isEd25519PublicKeyHex(publicKey)) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
+  if (!isSecpPublicKeyHex(publicKey)) return reply.code(400).send({ error:'bad_key' });
+  const taken = takeNonce(address); if (!taken.ok) return reply.code(400).send({ error:taken.err });
+  const now = nowSec(); const tsNum = Number(ts || now);
+  if (!Number.isFinite(tsNum) || Math.abs(now-tsNum)>300) return reply.code(400).send({ error:'expired_nonce' });
+  const expectedHex = payloadHex && payloadHex.length>=8 ? payloadHex : asciiToHex(`${taken.nonce}||${scope}||${tsNum}||${address}`);
+  let okSig=false, derived='';
+  try { okSig = keypairs.verify(expectedHex, signature, publicKey)===true; derived = keypairs.deriveAddress(publicKey); } catch {}
+  if (!okSig) return reply.code(401).send({ error:'bad_signature' });
+  if (derived !== address) return reply.code(401).send({ error:'unauthorized' });
+  reply.send({ ok:true, jwt: signJWT(address, scope) });
 });
 
-async function ensureProfile(wallet){
-  await pool.query(
-    `insert into player_profiles (wallet) values ($1) on conflict (wallet) do nothing`,
-    [wallet]
-  );
-}
-async function getProfileRaw(wallet){
-  const { rows } = await pool.query(
-`select wallet, coalesce(jet_fuel,0) as jet_fuel, coalesce(energy,0) as energy,
-        coalesce(ms_base,'{"health":20,"energyCap":100,"regenPerMin":1.0,"hit":0,"crit":10,"dodge":0}') as ms_base,
-        coalesce(ms_level,'{"health":0,"energyCap":0,"regenPerMin":0}') as ms_level,
-        coalesce(ms_hit,0)   as ms_hit,
-        coalesce(ms_crit,10) as ms_crit,
-        coalesce(ms_dodge,0) as ms_dodge,
-        coalesce(unlocked_level,5) as unlocked_level,
-        last_claim_at, updated_at
-   from player_profiles where wallet=$1`,
-    [wallet]
-  );
-  return rows[0] || null;
-}
-
+// ---------- profile ----------
 app.get('/profile', async (req, reply) => {
   await ensureProfile(req.wallet);
-  const res = await regenEnergyIfDue(req.wallet);
-  const row = await getProfileRaw(req.wallet);
+  const rowR = await regenEnergyIfDue(req.wallet); // fractional regen here
+  const row  = rowR || await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error:'not_found' });
-  const cur = res?.ms ? res : { energy: toInt(row.energy,0), ms: recomputeCurrent(row) };
-  const payload = toClient({ ...row, ...{ energy: cur.energy } });
-  payload.ms.current = cur.ms;
-  reply.send(payload);
-});
-
-// ---------- battle ----------
-app.post('/battle/start', async (req, reply) => {
-  const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
-  const cur = recomputeCurrent(row);
-  const energy = toInt(row.energy,0);
-  const cost = 10;
-  if (energy < cost) return reply.code(400).send({ error:'insufficient_energy' });
-  await pool.query(`update player_profiles set energy = $2, updated_at=now() where wallet=$1`, [req.wallet, energy - cost]);
-  reply.send({ ok:true, energy: energy - cost, profile: toClient({ ...row, energy: energy - cost }) });
-});
-
-app.post('/battle/turn', async (req, reply) => {
-  const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
-  const cur = recomputeCurrent(row);
-  const energy = toInt(row.energy,0);
-  const cost = 1;
-  if (energy < cost) return reply.code(400).send({ error:'insufficient_energy' });
-  await pool.query(`update player_profiles set energy = $2, updated_at=now() where wallet=$1`, [req.wallet, energy - cost]);
-  reply.send({ ok:true, energy: energy - cost, profile: toClient({ ...row, energy: energy - cost }) });
-});
-
-app.post('/battle/finish', async (req, reply) => {
-  const lvl = toInt(req.body?.level, 1);
-  const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
-
-  const reward = missionReward(lvl);
-  const unlocked = Math.max(toInt(row.unlocked_level,5), lvl+1);
-  const upd = await pool.query(
-    `update player_profiles
-        set jet_fuel = coalesce(jet_fuel,0) + $2,
-            unlocked_level = $3,
-            updated_at = now()
-      where wallet = $1
-   returning *`,
-    [req.wallet, reward, unlocked]
-  );
-  const r1 = upd.rows[0];
-  reply.send({ ok:true, reward, unlockedLevel: unlocked, profile: toClient(r1) });
+  reply.send(toClient(row));
 });
 
 // ---------- costs & upgrade ----------
@@ -391,22 +289,48 @@ app.post('/ms/upgrade', async (req, reply) => {
       else if (key==='hit') levels.hit+=1; else if (key==='crit') levels.crit+=1; else levels.dodge+=1;
     }
   }
-  // write back levels + debit
-  await pool.query(
-`update player_profiles
-    set jet_fuel = $2,
-        ms_level = jsonb_build_object(
-          'health',$3,'energyCap',$4,'regenPerMin',$5
-        ),
-        ms_hit   = $6,
-        ms_crit  = $7,
-        ms_dodge = $8,
-        updated_at = now()
-  where wallet = $1`,
-    [req.wallet, jf, levels.health|0, levels.energyCap|0, levels.regenPerMin|0, levels.hit|0, levels.crit|0, levels.dodge|0]
+  const newCore={ health:levels.health, energyCap:levels.energyCap, regenPerMin:levels.regenPerMin }; // regen "levels"
+  const ms_current=recomputeCurrent(row.ms_base, newCore); // -> applies REGEN_STEP
+  const { rows } = await pool.query(
+`update player_profiles set jet_fuel=$2, ms_level=$3, ms_current=$4, ms_hit=$5, ms_crit=$6, ms_dodge=$7, updated_at=now()
+ where wallet=$1 returning *`,
+    [req.wallet, jf, JSON.stringify(newCore), JSON.stringify(ms_current), levels.hit, levels.crit, levels.dodge]
   );
-  row = await getProfileRaw(req.wallet);
-  reply.send({ ok:true, applied, spent, profile: toClient(row), scale: getEconScaleFrom(scale) });
+  reply.send({ ok:true, applied, spent, profile: toClient(rows[0]), scale });
+});
+
+// ---------- battle ----------
+app.post('/battle/start', async (req, reply) => {
+  const level = toInt((req.body||{}).level, 1);
+  let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
+  if (!row) return reply.code(404).send({ error:'not_found' });
+  let energy=row.energy|0, spent=0; if (energy>=10){ energy-=10; spent=10; }
+  const { rows } = await pool.query(
+    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
+    [req.wallet, energy]
+  );
+  reply.send({ ok:true, level, spent, profile: toClient(rows[0]) });
+});
+app.post('/battle/turn', async (req, reply) => {
+  let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
+  if (!row) return reply.code(404).send({ error:'not_found' });
+  let energy=row.energy|0, spent=0; if (energy>=1){ energy-=1; spent=1; }
+  const { rows } = await pool.query(
+    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
+    [req.wallet, energy]
+  );
+  reply.send({ ok:true, spent, profile: toClient(rows[0]) });
+});
+app.post('/battle/finish', async (req, reply) => {
+  const lvl=Math.max(1, toInt((req.body||{}).level,1)); const victory=!!(req.body||{}).victory;
+  let row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
+  let jf=row.jet_fuel|0, unlocked=row.unlocked_level|0, reward=0;
+  if (victory){ reward=missionReward(lvl); jf+=reward; if (lvl>=unlocked) unlocked=lvl+1; }
+  const { rows } = await pool.query(
+    `update player_profiles set jet_fuel=$2, unlocked_level=$3, updated_at=now() where wallet=$1 returning *`,
+    [req.wallet, jf, unlocked]
+  );
+  reply.send({ ok:true, reward, victory, level:lvl, profile: toClient(rows[0]) });
 });
 
 // ---------- claim ----------
@@ -437,37 +361,22 @@ app.post('/claim/start', async (req, reply) => {
   if (debit.rows.length === 0) {
     return reply.code(400).send({ error:'insufficient_funds' });
   }
+  const debitedProfile = toClient(debit.rows[0]);
 
-  // 2) Attempt XRPL payout (TOKEN_MODE=hot) via claim module
   try {
-    const dest = req.wallet;
-    const res = await claim.payout({
-      amount: amt,
-      destination: dest,
-      currencyHex: process.env.CURRENCY_HEX,
-      issuer: process.env.ISSUER_ADDR,
-      xrplWss: process.env.XRPL_WSS || 'wss://xrplcluster.com',
-      mode: String(process.env.TOKEN_MODE||'mock').toLowerCase()
-    });
+    // 2) XRPL payout
+    const sent = await claim.sendIssued({ to:req.wallet, amount: amt });
 
-    // 3) If failed, refund debit
-    if (!res?.ok) {
-      await pool.query(
-        `update player_profiles set jet_fuel = jet_fuel + $2, updated_at = now() where wallet=$1`,
-        [req.wallet, amt]
-      );
-      return reply.code(500).send({ error:'claim_failed' });
-    }
-
-    // 4) Return txid/txJSON + profile
-    const profile = toClient((await getProfileRaw(req.wallet)));
-    reply.send({ ok:true, txid: res.txid||null, txJSON: res.txJSON||null, profile });
-  } catch (e) {
-    // Refund on any throw
+    // 3) Audit success
     await pool.query(
-      `update player_profiles set jet_fuel = jet_fuel + $2, updated_at = now() where wallet=$1`,
-      [req.wallet, amt]
-    );
+      `insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`,
+      [req.wallet, amt, sent?.txid||null]
+    ).catch(()=>{});
+
+    const latest = await getProfileRaw(req.wallet);
+    return reply.send({ ok:true, txid: sent?.txid || null, txJSON: sent?.txJSON || null, profile: toClient(latest || debit.rows[0]) });
+  } catch (e) {
+    await pool.query(`update player_profiles set jet_fuel = jet_fuel + $2, updated_at=now() where wallet=$1`, [req.wallet, amt]).catch(()=>{});
     const msg = String(e?.message||'');
     if (msg.includes('trustline_required'))         return reply.code(400).send({ error:'trustline_required' });
     if (msg.includes('issuer_rippling_disabled'))   return reply.code(500).send({ error:'issuer_rippling_disabled' });
@@ -479,91 +388,9 @@ app.post('/claim/start', async (req, reply) => {
   }
 });
 
-// ---------- shop catalog ----------
-const SHOP_ITEMS = [
-  {
-    id: 'skin_neon_blue',
-    name: 'Neon Blue Jet Skin (NFT)',
-    desc: 'Cosmetic livery for your XRPixel Jet. Limited.',
-    cost: 500,
-    type: 'nft',
-    image: 'https://mykeygo.io/jets/assets/shop/skin_neon_blue.png'
-  },
-  {
-    id: 'badge_ace',
-    name: 'ACE Pilot Badge (Code)',
-    desc: 'Profile badge + Discord flair (redeem code).',
-    cost: 150,
-    type: 'code',
-    image: 'https://mykeygo.io/jets/assets/shop/badge_ace.png'
-  },
-  {
-    id: 'theme_chiptune_1',
-    name: 'Chiptune Theme Pack',
-    desc: 'OST pack unlock (account-bound).',
-    cost: 200,
-    type: 'upgrade',
-    image: 'https://mykeygo.io/jets/assets/shop/theme_chiptune_1.png'
-  }
-];
-function getItemById(id){ return SHOP_ITEMS.find(x => x.id === String(id)); }
-
-// ---------- shop endpoints ----------
-app.get('/shop/items', async (req, reply) => {
-  reply.send({ items: SHOP_ITEMS });
-});
-
-app.post('/shop/redeem', async (req, reply) => {
-  const jwtPayload = requireJWT(req, reply); if (!jwtPayload) return;
-  const wallet = req.wallet;
-  if (!wallet || jwtPayload.sub !== wallet) return reply.code(401).send({ error:'unauthorized' });
-
-  const itemId = String(req.body?.itemId || '');
-  const item = getItemById(itemId);
-  if (!item) return reply.code(400).send({ error:'bad_item' });
-
-  const cost = Number(item.cost || 0);
-  if (!Number.isFinite(cost) || cost <= 0) return reply.code(400).send({ error:'bad_cost' });
-
-  // Atomic debit
-  const debit = await pool.query(
-    `update player_profiles
-       set jet_fuel = jet_fuel - $2,
-           updated_at = now()
-     where wallet = $1
-       and coalesce(jet_fuel,0) >= $2
-     returning coalesce(jet_fuel,0)::int as jet_fuel`,
-    [wallet, cost]
-  );
-  if (!debit.rows.length) return reply.code(400).send({ error:'insufficient_funds' });
-  const newBalance = debit.rows[0].jet_fuel|0;
-
-  let txid = null, redeemCode = null, message = 'purchase_ok';
-
-  if (item.type === 'nft') {
-    message = 'NFT queued for mint.';
-  } else if (item.type === 'code') {
-    redeemCode = crypto.randomBytes(6).toString('hex').toUpperCase();
-    message = 'Redeem code issued.';
-  } else if (item.type === 'upgrade') {
-    message = 'Theme pack unlocked.';
-  }
-
-  await pool.query(
-    `insert into shop_orders(wallet,item_id,cost,tx_hash,redeem_code)
-      values ($1,$2,$3,$4,$5)`,
-    [wallet, item.id, cost, txid, redeemCode]
-  );
-
-  reply.send({ ok:true, item: { id:item.id, name:item.name, type:item.type, cost:item.cost }, newBalance, message, txid, redeemCode });
-});
-
 // ---------- health ----------
 app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
 
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`XRPixel Jets API listening on :${PORT}`);
 });
-
-
-
