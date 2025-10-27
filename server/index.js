@@ -3,7 +3,7 @@
 // - recomputeCurrent(): regenPerMin = base + level*REGEN_STEP
 // - regenEnergyIfDue(): respects fractional rpm (adds whole energy over elapsed time)
 // - Hooks for regen remain on /profile, /battle/start, /battle/turn
-// - Everything else preserved
+// - Rewards scale defaults to ECON_SCALE (override via REWARD_SCALE if set)
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -24,6 +24,10 @@ const ALLOW = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeyg
 const ECON_SCALE_ENV = Number(process.env.ECON_SCALE || 0.10);
 const BASE_PER_LEVEL  = Number(process.env.BASE_PER_LEVEL || 300);
 const REGEN_STEP      = Number(process.env.REGEN_STEP || 0.1); // +0.1 energy/min per regen level
+// ⬇️ REWARD_SCALE defaults to ECON_SCALE unless explicitly set
+const REWARD_SCALE    = Number.isFinite(Number(process.env.REWARD_SCALE))
+  ? Number(process.env.REWARD_SCALE)
+  : ECON_SCALE_ENV;
 
 // ---- CORS plugin ----
 await app.register(cors, {
@@ -200,9 +204,17 @@ function calcCosts(levels,s){
   };
 }
 function missionReward(level){
-  const l=Math.max(1,Number(level)||1);
-  if(l<=5) return [0,100,150,200,250,300][l];
-  return Math.max(1, Math.min(10000, Math.round(300*Math.pow(1.01,l-5))));
+  const l = Math.max(1, Number(level) || 1);
+
+  // legacy base rewards (unchanged logic)
+  let base;
+  if (l <= 5) base = [0,100,150,200,250,300][l];
+  else        base = Math.round(300 * Math.pow(1.01, l - 5));
+
+  // scale & clamp; defaults to ECON_SCALE unless REWARD_SCALE set in env
+  const reward = Math.round(base * REWARD_SCALE);
+  const scaledMax = Math.max(1, Math.round(10000 * REWARD_SCALE)); // keep old 10k cap proportional
+  return Math.max(1, Math.min(scaledMax, reward));
 }
 
 // ---------- public config ----------
