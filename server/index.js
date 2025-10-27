@@ -164,12 +164,22 @@ function verifyClassic(addr){ return /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(Strin
 app.addHook('onRequest', async (req, reply) => {
   const url = req.raw.url || '';
   if (req.method === 'OPTIONS') return;
-  if (url.startsWith('/session/start') || url.startsWith('/config')) return;
+
+  // Allow auth bootstrap and public config/health without X-Wallet
+  if (
+    url.startsWith('/session/start') ||
+    url.startsWith('/session/verify') ||   // ← add this exemption
+    url.startsWith('/config') ||
+    url.startsWith('/healthz')
+  ) return;
 
   const w = req.headers['x-wallet'];
-  if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) return reply.code(400).send({ error:'missing_or_bad_X-Wallet' });
+  if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
+    return reply.code(400).send({ error:'missing_or_bad_X-Wallet' });
+  }
   req.wallet = w;
 
+  // (rate limit logic unchanged)
   const key = `${req.ip}|${w}`;
   const RATE = { windowMs: 10_000, maxPerWindow: 30 };
   const bucket = app._ratebucket || (app._ratebucket = new Map());
@@ -233,16 +243,26 @@ app.post('/session/start', async (req, reply) => {
 
 app.post('/session/verify', async (req, reply) => {
   const { address, signature, publicKey, ts, scope, payload, payloadHex } = req.body || {};
-  if (!verifyClassic(address)) return reply.code(400).send({ error:'bad_address' });
-  if (!verifySecpPub(publicKey)) return reply.code(400).send({ error:'bad_key_algo' });
+  const asciiToHex = (s) => Buffer.from(String(s),'utf8').toString('hex');
+  const normHex = (s) => String(s||'').replace(/^0x/i,'').toLowerCase();
+  const okClassic = /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(String(address||''));
+  const okSecp = /^(02|03)[0-9A-Fa-f]{64}$/.test(String(publicKey||''));
+
+  if (!okClassic) return reply.code(400).send({ error:'bad_address' });
+  if (!okSecp)    return reply.code(400).send({ error:'bad_key_algo' });
   if (!signature) return reply.code(400).send({ error:'bad_signature' });
 
-  const msg = payloadHex || asciiToHex(String(payload || ''));
-  const ok = keypairs.verifyMessage(msg, signature, publicKey);
-  if (!ok) return reply.code(400).send({ error:'bad_signature' });
+  const msgHex = normHex(payloadHex || asciiToHex(String(payload||'')));
+  const sigHex = normHex(signature);
 
-  const n = (String(payload||'').split('||')[0] || '').trim();
-  if (!takeNonce(address, n)) return reply.code(400).send({ error:'bad_nonce' });
+  // Nonce check must match the ASCII payload we asked the wallet to sign
+  const nonceAscii = (String(payload||'').split('||')[0] || '').trim();
+  if (!takeNonce(address, nonceAscii)) return reply.code(400).send({ error:'bad_nonce' });
+
+  let ok = false;
+  try { ok = keypairs.verifyMessage(msgHex, sigHex, publicKey); }
+  catch(e){ req.log.warn({ e:String(e), msgLen:msgHex.length, sigLen:sigHex.length }, 'verify_throw'); return reply.code(400).send({ error:'bad_signature' }); }
+  if (!ok) return reply.code(400).send({ error:'bad_signature' });
 
   const token = jwt.sign({ sub:address, scope:String(scope||'play,upgrade,claim') }, JWT_SECRET, { algorithm:'HS256', expiresIn:'60m' });
   reply.send({ ok:true, jwt: token });
@@ -520,3 +540,4 @@ app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`XRPixel Jets API listening on :${PORT}`);
 });
+
