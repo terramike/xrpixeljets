@@ -1,71 +1,80 @@
+// jets/js/missions.js — XRPixel Jets MKG (2025-10-26-polish1)
 import { GameState } from './state.js';
 import { LS } from './constants.js';
 
-// Base 5 fixed missions; waves auto-extend past 5 (+1% reward each level)
+const KEY_LAST = 'JETS_LAST_MISSION';
+
+// Base 5 fixed missions; waves auto-extend past 5
 const BASE_MISSIONS = [
   { id: 1, name: 'Skirmish Intro',  enemyHP: 20, enemyAtk: 5, enemyDef: 3, enemySpd: 4, rewardFuel: 100 },
   { id: 2, name: 'Raider Patrol',   enemyHP: 22, enemyAtk: 6, enemyDef: 4, enemySpd: 5, rewardFuel: 150 },
   { id: 3, name: 'Blockade Line',   enemyHP: 24, enemyAtk: 7, enemyDef: 5, enemySpd: 6, rewardFuel: 200 },
   { id: 4, name: 'Carrier Escort',  enemyHP: 26, enemyAtk: 8, enemyDef: 6, enemySpd: 7, rewardFuel: 250 },
-  { id: 5, name: 'Dread Gate',      enemyHP: 28, enemyAtk: 9, enemyDef: 7, enemySpd: 8, rewardFuel: 300 }
+  { id: 5, name: 'Siege Breaker',   enemyHP: 30, enemyAtk: 9, enemyDef: 7, enemySpd: 8, rewardFuel: 300 },
 ];
 
-function waveFor(level){
-  // scale +1% per wave past 5
-  const k = Math.max(0, level - 5);
-  const last = BASE_MISSIONS[4];
-  const hp   = Math.round(last.enemyHP * Math.pow(1.03, k)); // a bit spicier HP growth
-  const atk  = Math.round(last.enemyAtk * Math.pow(1.02, k));
-  const def  = Math.round(last.enemyDef * Math.pow(1.02, k));
-  const spd  = Math.round(last.enemySpd * Math.pow(1.01, k));
-  const fuel = Math.round(last.rewardFuel * Math.pow(1.01, k));
-  return { id: level, name:`Wave ${level}`, enemyHP: hp, enemyAtk: atk, enemyDef: def, enemySpd: spd, rewardFuel: fuel };
+function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
+
+/** Server is authoritative for rewards/unlocks. This helper only updates local UI. */
+export function unlockNextIfNeeded(currentWave, victory, unlockedFromServer){
+  const lvl = Math.max(1, Number(currentWave) || 1);
+  const srv = Math.max(1, Number(unlockedFromServer) || 1);
+  const next = (victory && lvl >= srv) ? (lvl + 1) : srv;
+
+  try {
+    const lsPrev = parseInt(localStorage.getItem(LS.UNLOCK) || '1', 10) || 1;
+    const uiMax = Math.max(lsPrev, next);
+    localStorage.setItem(LS.UNLOCK, String(uiMax));
+  } catch {}
+
+  if (GameState) GameState.unlockedLevel = next;
+  return next;
 }
 
 export function getMission(level){
-  if (level <= 5) return BASE_MISSIONS[level-1];
-  return waveFor(level);
+  const lvl = Math.max(1, Number(level) || 1);
+  if (lvl <= 5) return BASE_MISSIONS[lvl - 1];
+
+  const k = Math.max(0, (lvl|0) - 5);
+  const last = BASE_MISSIONS[4];
+
+  let hp   = Math.round(last.enemyHP * Math.pow(1.03, k));
+  let atk  = Math.round(last.enemyAtk * Math.pow(1.02, k));
+  let def  = Math.round(last.enemyDef * Math.pow(1.02, k));
+  let spd  = Math.round(last.enemySpd * Math.pow(1.01, k));
+  let fuel = Math.round(last.rewardFuel * Math.pow(1.01, k));
+
+  hp   = clamp(hp,   1,  9999);
+  atk  = clamp(atk,  1,   999);
+  def  = clamp(def,  0,   999);
+  spd  = clamp(spd,  1,   200);
+  fuel = clamp(fuel, 1, 10000);
+
+  return { id: lvl, name:`Wave ${lvl}`, enemyHP: hp, enemyAtk: atk, enemyDef: def, enemySpd: spd, rewardFuel: fuel };
 }
 
-export function unlockNextIfNeeded(level){
-  const unlocked = parseInt(localStorage.getItem(LS.UNLOCK)||'5',10);
-  if (level >= unlocked){
-    localStorage.setItem(LS.UNLOCK, String(level+1));
-    return true;
-  }
-  return false;
-}
+export function buildMissionOptions(unlocked){
+  const sel = document.getElementById('sel-mission') || document.getElementById('mission');
+  if (!sel || typeof sel.appendChild !== 'function') return;
 
-/**
- * Build mission <select> options WITHOUT changing the user's current selection.
- * @param {HTMLSelectElement} sel
- * @param {number=} keepLevel - level to keep selected (defaults to GameState.battle.missionLevel or 1)
- */
-export function buildMissionOptions(sel, keepLevel){
-  if (!sel) return;
-  const current = (typeof keepLevel === 'number' && keepLevel>0)
-    ? keepLevel
-    : (GameState.battle.missionLevel || 1);
-
-  const unlocked = parseInt(localStorage.getItem(LS.UNLOCK)||'5',10);
-  const maxLevel = Math.max(unlocked, current);
-
-  // capture current value to restore after rebuild
-  const restoreVal = String(current);
-
-  // rebuild
+  const max = Math.max(1, Number(unlocked) || 1);
   sel.innerHTML = '';
-  for (let lvl = 1; lvl <= maxLevel; lvl++){
-    const m = getMission(lvl);
+
+  for (let i = 1; i <= max; i++){
     const opt = document.createElement('option');
-    opt.value = String(lvl);
-    opt.textContent = (lvl<=5) ? `Mission ${lvl}: ${m.name}` : `Wave ${lvl}`;
+    const m = getMission(i);
+    opt.value = String(i);
+    opt.textContent = `${m.name}`;
     sel.appendChild(opt);
   }
 
-  // restore selection
-  sel.value = restoreVal;
+  // Restore the player's last selection (clamped to unlocked)
+  let last = 1;
+  try {
+    last = parseInt(localStorage.getItem(KEY_LAST) || '1', 10) || 1;
+  } catch {}
+  if (isNaN(last) || last < 1) last = 1;
+  if (last > max) last = max;
 
-  // keep state in sync
-  GameState.battle.missionLevel = parseInt(sel.value,10);
+  sel.value = String(last);
 }

@@ -1,124 +1,135 @@
+// jets/js/ui.js — XRPixel Jets MKG (2025-10-24 bars-solid)
+// Fixes: selects bar fills by class per your current index.html.
+// Energy:  #hud-top .energyfill
+// Player:  #hud-top .playerfill
+// Enemy:   #hud-top .enemyfill
+
 import { GameState } from './state.js';
-import { getE, getFuel } from './utils.js';
 
-// Try several likely containers to place the cards into; fall back to #ui-root or body.
-const CARD_PARENT_CANDIDATES = [
-  'squad-cards','squad-panel','cards-row','pick-row','controls-left','controls','ui-left','ui-root'
-];
+// -------- small DOM helpers --------
+const $ = (s) => document.querySelector(s);
+function setText(el, val) { if (el) el.textContent = (val ?? '—'); }
+function byIds(ids) { for (const id of ids) { const el = document.getElementById(id); if (el) return el; } return null; }
+function setBarFill(el, value, max) {
+  if (!el) return;
+  const pct = (!max || max <= 0) ? 0 : Math.max(0, Math.min(100, Math.round((value / max) * 100)));
+  el.style.width = pct + '%';
+  el.setAttribute?.('data-pct', String(pct));
+}
 
-function firstExistingId(ids){
-  for (const id of ids){
-    const el = document.getElementById(id);
-    if (el) return id;
+// -------- Squad Stats --------
+export function renderSquadStats() {
+  const s = GameState?.squad || { attack: 0, speed: 0, defense: 0, synergy: 1, synergyText: '—' };
+
+  const atkEl = byIds(['s-atk', 'squad-atk', 'squad_attack', 'squadAtk']);
+  const spdEl = byIds(['s-spd', 'squad-spd', 'squad_speed', 'squadSpd']);
+  const defEl = byIds(['s-def', 'squad-def', 'squad_defense', 'squadDef']);
+  const synEl = byIds(['s-syn', 'squad-syn', 'squad_synergy', 'squadSyn']);
+
+  setText(atkEl, s.attack|0);
+  setText(spdEl, s.speed|0);
+  setText(defEl, s.defense|0);
+  setText(synEl, s.synergyText || `${(s.synergy||1).toFixed(1)}×`);
+}
+
+// -------- Main/Wing cards --------
+export function setMainCard(jetOrNull) {
+  const nameEl = byIds(['main-name','main_name','mainName']);
+  const gunsEl = byIds(['main-guns','main_guns','mainGuns']);
+  const imgEl  = byIds(['main-img','main_img','mainImg']);
+
+  if (!jetOrNull) {
+    setText(nameEl, '—');
+    setText(gunsEl, '— | —');
+    if (imgEl) imgEl.src = '/jets/assets/placeholder.png';
+    return;
   }
-  return null;
+  const j = jetOrNull;
+  setText(nameEl, j.name || 'XRPixel Jet');
+  setText(gunsEl, `${j.top_gun || '—'} | ${j.bottom_gun || '—'}`);
+  if (imgEl && j.image) imgEl.src = j.image;
 }
 
-function ensureEl(id, tag, parentId, attrs={}){
-  let el = document.getElementById(id);
-  if (!el){
-    let parent = null;
-    if (parentId) parent = document.getElementById(parentId);
-    if (!parent){
-      const chosen = firstExistingId(CARD_PARENT_CANDIDATES);
-      parent = chosen ? document.getElementById(chosen) : null;
-    }
-    el = document.createElement(tag);
-    el.id = id;
-    Object.entries(attrs).forEach(([k,v])=> el.setAttribute(k, v));
-    (parent || document.body).appendChild(el);
+export function setWingCard(jetOrNull) {
+  const nameEl = byIds(['wing-name','wing_name','wingName']);
+  const gunsEl = byIds(['wing-guns','wing_guns','wingGuns']);
+  const imgEl  = byIds(['wing-img','wing_img','wingImg']);
+
+  if (!jetOrNull) {
+    setText(nameEl, '—');
+    setText(gunsEl, '— | —');
+    if (imgEl) imgEl.src = '/jets/assets/placeholder.png';
+    return;
   }
-  return el;
+  const j = jetOrNull;
+  setText(nameEl, j.name || 'XRPixel Jet');
+  setText(gunsEl, `${j.top_gun || '—'} | ${j.bottom_gun || '—'}`);
+  if (imgEl && j.image) imgEl.src = j.image;
 }
 
-export const ui = {
-  energyFill: document.querySelector('.energyfill'),
-  energyText: document.getElementById('energy-text'),
-  youFill:    document.querySelector('.youfill'),
-  enemyFill:  document.querySelector('.enemyfill'),
+// -------- Energy / JF / HP --------
+export function updateEnergyUI() {
+  const cap = Number(GameState?.ms?.current?.energyCap ?? GameState?.ms?.base?.energyCap ?? 100);
+  const val = Number(GameState?.energy ?? 0);
 
-  msHit:   document.getElementById('ms-hit'),
-  msCrit:  document.getElementById('ms-crit'),
-  msDodge: document.getElementById('ms-dodge'),
+  // text
+  const textEl = byIds(['energy-text','energyText','energy_value']);
+  setText(textEl, `${val}/${cap}`);
 
-  squadAtk: document.getElementById('sq-atk'),
-  squadSpd: document.getElementById('sq-spd'),
-  squadDef: document.getElementById('sq-def'),
-  squadSyn: document.getElementById('sq-syn'),
-
-  youHPLabel:   document.getElementById('you-hp-text'),
-  enemyHPLabel: document.getElementById('enemy-hp-text'),
-
-  jetFuelText: document.getElementById('jetfuel'),
-};
-
-// Safe setters for squad cards (will mount into a proper UI container)
-export function setMainCard(name, image){
-  const parentId = firstExistingId(CARD_PARENT_CANDIDATES);
-  const cardId = 'main-card';
-  ensureEl(cardId, 'div', parentId, { class: 'card tiny' });
-
-  const img = ensureEl('main-img', 'img', cardId, { style: 'width:72px;height:72px;object-fit:contain;image-rendering:pixelated;' });
-  const label = ensureEl('main-name', 'div', cardId, { class: 'tiny' });
-
-  img.src = image || '';
-  img.alt = name || 'Main Jet';
-  label.textContent = name || '—';
+  // fill (match your current HTML structure)
+  const fillEl = $('#hud-top .energyfill');
+  setBarFill(fillEl, val, cap);
 }
 
-export function setWingCard(name, image){
-  const parentId = firstExistingId(CARD_PARENT_CANDIDATES);
-  const cardId = 'wing-card';
-  ensureEl(cardId, 'div', parentId, { class: 'card tiny' });
-
-  const img = ensureEl('wing-img', 'img', cardId, { style: 'width:72px;height:72px;object-fit:contain;image-rendering:pixelated;' });
-  const label = ensureEl('wing-name', 'div', cardId, { class: 'tiny' });
-
-  img.src = image || '';
-  img.alt = name || 'Wingman';
-  label.textContent = name || 'None';
+export function updateJetFuelUI() {
+  const jfEl = byIds(['jetfuel','jet_fuel','jf-value','jfValue','jetfuel-ms']);
+  setText(jfEl, GameState?.jetFuel ?? 0);
 }
 
-export function updateEnergyUI(){
-  const cap = GameState.ms.current.energyCap;
-  const e = Math.min(parseInt(localStorage.getItem('energy')||'0',10), cap);
-  if (ui.energyFill) ui.energyFill.style.width = `${Math.floor(100*e/cap)}%`;
-  if (ui.energyText) ui.energyText.textContent = `Energy: ${e}/${cap}`;
+export function updateHPBars() {
+  // Text IDs in your HTML:
+  const pNowText = byIds(['player-hp-text','hp-player','hp_player','hpPlayer']);
+  const eNowText = byIds(['enemy-hp-text','hp-enemy','hp_enemy','hpEnemy']);
+
+  // Prefer live SCENE values, fallback to GameState.scene if present.
+  const pNow = Number(window?.SCENE?.playerHP ?? GameState?.scene?.playerHP ?? 0);
+  const pMax = Number(window?.SCENE?.playerMaxHP ?? GameState?.scene?.playerMaxHP ?? 0);
+  const eNow = Number(window?.SCENE?.enemyHP  ?? GameState?.scene?.enemyHP  ?? 0);
+  const eMax = Number(window?.SCENE?.enemyMaxHP ?? GameState?.scene?.enemyMaxHP ?? 0);
+
+  setText(pNowText, `${pNow}/${pMax || 0}`);
+  setText(eNowText, `${eNow}/${eMax || 0}`);
+
+  // fills by class (per your index.html)
+  const pFill = $('#hud-top .playerfill');
+  const eFill = $('#hud-top .enemyfill');
+  setBarFill(pFill, pNow, pMax);
+  setBarFill(eFill, eNow, eMax);
 }
 
-export function updateMSUI(){
-  const ms = GameState.ms.current;
-  const jf = getFuel();
-  const hEl=document.getElementById('ms-health');
-  const cEl=document.getElementById('ms-cap');
-  const rEl=document.getElementById('ms-regen');
-  if(hEl) hEl.textContent = String(ms.health);
-  if(cEl) cEl.textContent = String(ms.energyCap);
-  if(rEl) rEl.textContent = `${ms.regenPerMin.toFixed(1)}/min`;
+// Paint mothership basics and percent pills
+export function paintMSBasics() {
+  const hp = Number(GameState?.ms?.current?.health ?? GameState?.ms?.base?.health ?? 20);
+  const cap = Number(GameState?.ms?.current?.energyCap ?? GameState?.ms?.base?.energyCap ?? 100);
+  const reg = Number(GameState?.ms?.current?.regenPerMin ?? GameState?.ms?.base?.regenPerMin ?? 1);
 
-  if (ui.msHit)   ui.msHit.textContent   = `${ms.hit??0}%`;
-  if (ui.msCrit)  ui.msCrit.textContent  = `${ms.crit??10}%`;
-  if (ui.msDodge) ui.msDodge.textContent = `${ms.dodge??0}%`;
-
-  if (ui.jetFuelText) ui.jetFuelText.textContent = `${jf}`;
+  setText(byIds(['ms-hp','ms_hp','msHp','ms-health']), hp);
+  setText(byIds(['ms-cap','ms_cap','msCap']), cap);
+  setText(byIds(['ms-reg','ms_reg','msReg','ms-regen']), reg);
 }
 
-export function updateHPBars(){
-  const you = Math.max(0, GameState.battle.playerHP);
-  const en  = Math.max(0, GameState.battle.enemyHP);
-  const youMax = GameState.ms.current.health;
-  const enMax  = GameState.battle.enemyMaxHP || Math.max(en, 1); // lock from scene.resetBattle()
-
-  if (ui.youFill)   ui.youFill.style.width   = `${Math.floor(100*you/youMax)}%`;
-  if (ui.enemyFill) ui.enemyFill.style.width = `${Math.floor(100*en/enMax)}%`;
-
-  if (ui.youHPLabel)   ui.youHPLabel.textContent   = `${you}/${youMax}`;
-  if (ui.enemyHPLabel) ui.enemyHPLabel.textContent = `${en}/${enMax}`;
+export function paintMSPct() {
+  const pct = GameState?.pct || { hit:0, crit:0, dodge:0 };
+  setText(byIds(['ms-hit','ms_hit','msHit']),  pct.hit|0);
+  setText(byIds(['ms-crit','ms_crit','msCrit']), pct.crit|0);
+  setText(byIds(['ms-dodge','ms_dodge','msDodge']), pct.dodge|0);
 }
 
-export function renderSquadStats(){
-  if (ui.squadAtk)  ui.squadAtk.textContent = String(GameState.squad.attack);
-  if (ui.squadSpd)  ui.squadSpd.textContent = String(GameState.squad.speed);
-  if (ui.squadDef)  ui.squadDef.textContent = String(GameState.squad.defense);
-  if (ui.squadSyn)  ui.squadSyn.textContent = GameState.squad.solo ? 'Solo +50% ATK / +20% SPD' : (GameState.squad.synergy>1 ? '+10% ATK (synergy)' : '—');
+// Bulk repaint
+export function syncHUDAll() {
+  paintMSBasics();
+  paintMSPct();
+  updateEnergyUI();
+  renderSquadStats();
+  updateHPBars();
 }

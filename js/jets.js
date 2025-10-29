@@ -1,127 +1,134 @@
+// jets/js/jets.js — XRPixel Jets MKG (2025-10-24 squad-fix)
+// - Mirror Main -> Wing when Wing empty (immediate, not just at Start)
+// - Recompute + repaint squad pills on every selection/unselection
+// - Button badges reflect current role(s)
+// - Allows same jet to be both Main and Wing; clicking again unselects.
+
 import { GameState } from './state.js';
-import { seededStats, parseAttr, numCode, log } from './utils.js';
+import { renderSquadStats, setMainCard, setWingCard } from './ui.js';
 
-// Try to load metadata.json (if present); otherwise, build from /assets/
-async function loadFromMetadata(limit){
-  try{
-    const r=await fetch('metadata.json',{cache:'no-store'}); if(!r.ok) return null;
-    const tx=await r.text(); if(tx.trim().startsWith('<')) return null;
-    const data=JSON.parse(tx); const col=Array.isArray(data.collection)?data.collection:[];
-    let mapped=col.map((j,i)=>({
-      id: j.name || ('jet_'+i),
-      name: j.name || ('XRPixel Jet #'+(i+1)),
-      image: (j.image && !j.image.startsWith('http'))
-              ? ('assets/'+j.image.replace(/^assets\//,''))
-              : (j.image || 'assets/XRPjets.png'),
-      attributes: (Array.isArray(j.attributes) && j.attributes.length) ? j.attributes : seededStats(i+1)
-    }));
-    if(mapped.length<limit){ mapped = mapped.concat(assetJets(limit - mapped.length)); }
-    return mapped.slice(0,limit);
-  }catch{ return null; }
+function gridEl() {
+  return document.getElementById('jet-grid')
+      || document.getElementById('jets')
+      || document.getElementById('jets-grid'); // legacy fallbacks
 }
 
-function assetJets(limit){
-  const TOTAL=111;
-  const idxs=Array.from({length:TOTAL},(_,i)=>i+1).sort(()=>Math.random()-0.5).slice(0,limit);
-  return idxs.map(n=>({
-    id:'jet_'+n, name:'XRPixel Jet #'+n, image:`assets/xrpixeljet_${n}.png`, attributes: seededStats(n)
-  }));
-}
+export function recalcSquad() {
+  const m = GameState.mainJet || null;
+  const w = GameState.wingJet || null;
 
-export async function loadMockJets(limit=10){
-  const md=await loadFromMetadata(limit);
-  GameState.jets = md || assetJets(limit);
-}
+  if (!m && !w) {
+    GameState.squad = { attack: 0, speed: 0, defense: 0, synergy: 1, synergyText: '—' };
+    return GameState.squad;
+  }
 
-function statTriple(attrs){
-  const A=parseAttr(attrs,'Attack')||'a3';
-  const S=parseAttr(attrs,'Speed') ||'s3';
-  const D=parseAttr(attrs,'Defense')||'d3';
-  return {
-    a:numCode(A,'a'),
-    s:numCode(S,'s'),
-    d:numCode(D,'d')
+  const atk = (m?.attack || 0) + (w?.attack || 0);
+  const spd = (m?.speed  || 0) + (w?.speed  || 0);
+  const def = (m?.defense|| 0) + (w?.defense|| 0);
+
+  let syn = 1.0, synText = '1×';
+  if (m && w) {
+    const top  = String(m.top_gun ?? '').toLowerCase();
+    const bot  = String(w.bottom_gun ?? '').toLowerCase();
+    if (top && bot) {
+      syn = (top !== bot) ? 1.2 : 1.1;
+      synText = (top !== bot) ? '1.2×' : '1.1×';
+    }
+  }
+
+  GameState.squad = {
+    attack: Math.round(atk),
+    speed:  Math.round(spd),
+    defense:Math.round(def),
+    synergy: syn,
+    synergyText: synText
   };
+  return GameState.squad;
 }
 
-function gunPair(attrs){
-  const top = parseAttr(attrs,'Top Gun')    || '—';
-  const bot = parseAttr(attrs,'Bottom Gun') || '—';
-  return { top, bottom: bot };
-}
-
-export function recalcSquad(){
-  const j=GameState.mainJet, w=GameState.wingJet;
-  if(!j){ GameState.squad={attack:5,speed:5,defense:5,solo:true,synergy:1}; return; }
-  const js=statTriple(j.attributes);
-  let atk=js.a, spd=js.s, def=js.d;
-  let solo=!w; let syn=1;
-  if(w){
-    const ws=statTriple(w.attributes);
-    atk+=ws.a; spd+=ws.s;
-    const top=parseAttr(j.attributes,'Top Gun'); const bot=parseAttr(w.attributes,'Bottom Gun');
-    if(top && bot && top.toLowerCase()===bot.toLowerCase()) syn=1.1;
-  }else{
-    atk=Math.round(atk*1.5); spd=Math.round(spd*1.2);
+function ensureTwoRolesAfterSelect() {
+  // If only one role is set, mirror it into the other so squad stats are never zero
+  if (GameState.mainJet && !GameState.wingJet) {
+    GameState.wingJet = GameState.mainJet;
+    setWingCard(GameState.wingJet);
+  } else if (!GameState.mainJet && GameState.wingJet) {
+    GameState.mainJet = GameState.wingJet;
+    setMainCard(GameState.mainJet);
   }
-  GameState.squad={attack:atk,speed:spd,defense:def,solo,synergy:syn};
 }
 
-export function renderJets(onMain,onWing){
-  const grid=document.getElementById('jet-grid');
-  grid.innerHTML='';
+export function renderJets(onSetMain, onSetWing, jets) {
+  const grid = gridEl();
+  if (!grid) return;
 
-  // Synergy explainer (once)
-  const helpId='synergy-help';
-  let help=document.getElementById(helpId);
-  if(!help){
-    help=document.createElement('div');
-    help.id=helpId;
-    help.className='tiny';
-    help.style.cssText='margin:6px 0 8px;color:#aad7ff;line-height:1.4;';
-    help.innerHTML = 'Synergy: <b>Solo</b> gives +50% ATK & +20% SPD. <b>Duo</b> gives +10% ATK if <u>Main Top Gun</u> matches <u>Wing Bottom Gun</u>.';
-    const panel=document.querySelector('.panel.selector');
-    if(panel){ panel.insertBefore(help, panel.querySelector('.jet-grid')); }
-  }
+  const mainId = GameState.mainJet?.id ?? null;
+  const wingId = GameState.wingJet?.id ?? null;
 
-  GameState.jets.forEach(j=>{
-    const card=document.createElement('div'); card.className='jet-card';
+  const html = (jets || []).map(j => {
+    const isMain = (j.id === mainId);
+    const isWing = (j.id === wingId);
+    return `
+      <div class="jet-card" data-id="${j.id}">
+        <img src="${j.image}" alt="${j.name || 'Jet'}" />
+        <div class="nm tiny">${j.name || 'XRPixel Jet'}</div>
+        <div class="stats tiny">ATK ${j.attack ?? '—'} • SPD ${j.speed ?? '—'} • DEF ${j.defense ?? '—'}</div>
+        <div class="guns tiny">${j.top_gun || '—'} | ${j.bottom_gun || '—'}</div>
+        <div class="row tight">
+          <button class="btn-main">${isMain ? 'Main ✓' : 'Set Main'}</button>
+          <button class="btn-wing">${isWing ? 'Wing ✓' : 'Set Wing'}</button>
+        </div>
+      </div>
+    `;
+  }).join('');
 
-    // Image
-    const img=document.createElement('img'); img.src=j.image; img.alt=j.name;
+  grid.innerHTML = html || '<div class="tiny">No Jets found.</div>';
 
-    // Name
-    const name=document.createElement('div'); name.className='jet-name'; name.textContent=j.name;
+  // Wire click handlers
+  grid.querySelectorAll('.jet-card').forEach(card => {
+    const id = card.getAttribute('data-id');
+    const btnMain = card.querySelector('.btn-main');
+    const btnWing = card.querySelector('.btn-wing');
 
-    // Stats (A/S/D)
-    const st=statTriple(j.attributes);
-    const stats=document.createElement('div'); stats.className='jet-stats';
-    stats.textContent=`A${st.a}  S${st.s}  D${st.d}`;
+    const findJet = () => (jets || []).find(j => String(j.id) === String(id));
 
-    // Guns
-    const gp=gunPair(j.attributes);
-    const guns=document.createElement('div'); guns.className='guns';
-    guns.textContent=`Top: ${gp.top}  /  Bottom: ${gp.bottom}`;
+    if (btnMain) btnMain.onclick = () => {
+      const jet = findJet(); if (!jet) return;
 
-    // Buttons
-    const actions=document.createElement('div'); actions.className='jet-actions';
-    const mainBtn=document.createElement('button'); mainBtn.textContent='Main'; mainBtn.className='tiny';
-    const wingBtn=document.createElement('button'); wingBtn.textContent='Wing'; wingBtn.className='tiny';
+      // Toggle main selection
+      if (GameState.mainJet && GameState.mainJet.id === jet.id) {
+        GameState.mainJet = null;
+        setMainCard(null);
+      } else {
+        GameState.mainJet = jet;
+        setMainCard(jet);
+      }
 
-    mainBtn.onclick=()=>{
-      onMain(j);
-      log(`Main set: ${j.name}`);
-    };
-    wingBtn.onclick=()=>{
-      onWing(j);
-      log(`Wingman set: ${j.name}`);
+      ensureTwoRolesAfterSelect();
+      recalcSquad(); renderSquadStats();
+      renderJets(onSetMain, onSetWing, jets);
+      onSetMain && onSetMain(GameState.mainJet || null);
     };
 
-    actions.appendChild(mainBtn);
-    actions.appendChild(wingBtn);
+    if (btnWing) btnWing.onclick = () => {
+      const jet = findJet(); if (!jet) return;
 
-    // Assemble
-    [img,name,stats,guns,actions].forEach(n=>card.appendChild(n));
-    grid.appendChild(card);
+      // Toggle wing selection
+      if (GameState.wingJet && GameState.wingJet.id === jet.id) {
+        GameState.wingJet = null;
+        setWingCard(null);
+      } else {
+        GameState.wingJet = jet;
+        setWingCard(jet);
+      }
+
+      ensureTwoRolesAfterSelect();
+      recalcSquad(); renderSquadStats();
+      renderJets(onSetMain, onSetWing, jets);
+      onSetWing && onSetWing(GameState.wingJet || null);
+    };
   });
+
+  // If we loaded fresh and only one role is set, mirror now (e.g., single NFT case)
+  ensureTwoRolesAfterSelect();
+  recalcSquad(); renderSquadStats();
 }
