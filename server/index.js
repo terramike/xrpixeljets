@@ -1,9 +1,6 @@
-// index.js — XRPixel Jets API (2025-10-26-claims5 + fractional ENERGY REGEN)
-// - Regen upgrades: +0.1 per level (REGEN_STEP, env-overridable)
-// - recomputeCurrent(): regenPerMin = base + level*REGEN_STEP
-// - regenEnergyIfDue(): respects fractional rpm (adds whole energy over elapsed time)
-// - Hooks for regen remain on /profile, /battle/start, /battle/turn
-// - Rewards scale defaults to ECON_SCALE (override via REWARD_SCALE if set)
+// index.js — XRPixel Jets API (2025-10-26-claims5 + fractional ENERGY REGEN + 2025-10-30 wc-txproof)
+// - Adds WalletConnect tx-proof login to /session/verify (non-submitted AccountSet with memo)
+// - Keeps existing Crossmark/Gem message-sign path intact
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -12,6 +9,7 @@ import jwt from 'jsonwebtoken';
 import * as keypairs from 'ripple-keypairs';
 import crypto from 'crypto';
 import * as claim from './claimJetFuel.js';
+import { decode, encodeForSigning } from 'ripple-binary-codec'; // ⬅️ NEW
 
 const { Pool } = pkg;
 const app = Fastify({ logger: true });
@@ -57,7 +55,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejec
 // ---------- utils ----------
 const toInt  = (x, d=0) => { const n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : d; };
 const nowSec = () => Math.floor(Date.now()/1000);
-const asciiToHex = (s) => Buffer.from(String(s),'utf8').toString('hex');
+const asciiToHex = (s) => Buffer.from(String(s),'utf8').toString('hex').toUpperCase();
 
 const NONCES = new Map();
 const newNonce = () => crypto.randomBytes(32).toString('hex');
@@ -236,21 +234,60 @@ app.post('/session/start', async (req, reply) => {
   const nonce = newNonce(); storeNonce(address, nonce);
   reply.send({ nonce });
 });
+
+// ⬇️ UPDATED: supports either message-sign (Crossmark/Gem) OR WalletConnect tx-proof
 app.post('/session/verify', async (req, reply) => {
-  const { address, signature, publicKey, payloadHex, scope='play,upgrade,claim', ts } = req.body || {};
+  const { address, signature, publicKey, payloadHex, scope='play,upgrade,claim', ts, txProof } = req.body || {};
   if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) return reply.code(400).send({ error:'bad_address' });
+
+  const taken = takeNonce(address); if (!taken.ok) return reply.code(400).send({ error:taken.err });
+  const now = nowSec(); const tsNum = Number(ts || now);
+  if (!Number.isFinite(tsNum) || Math.abs(now-tsNum)>300) return reply.code(400).send({ error:'expired_nonce' });
+
+  // NEW: WC tx-proof branch
+  if (txProof && txProof.tx_blob) {
+    try {
+      const tx = decode(txProof.tx_blob);
+
+      if (tx.TransactionType !== 'AccountSet') return reply.code(400).send({ error:'bad_tx_type' });
+      if (tx.Account !== address) return reply.code(401).send({ error:'unauthorized' });
+
+      const pub = String(tx.SigningPubKey || '').toUpperCase();
+      if (!(pub.startsWith('02') || pub.startsWith('03'))) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
+
+      const wantMemo = asciiToHex(`XRPixelJets|${taken.nonce}|${scope}|${tsNum}`);
+      const memos = (tx.Memos || []).map(m => (m?.Memo?.MemoData || '').toUpperCase());
+      if (!memos.includes(wantMemo)) return reply.code(400).send({ error:'memo_missing' });
+
+      const preimageHex = encodeForSigning(tx).toUpperCase();     // canonical preimage
+      const sigHex = String(tx.TxnSignature || '').toUpperCase(); // signature from wallet
+      const ok = keypairs.verify(preimageHex, sigHex, pub) === true;
+      if (!ok) return reply.code(401).send({ error:'bad_signature' });
+
+      const derived = keypairs.deriveAddress(pub);
+      if (derived !== address) return reply.code(401).send({ error:'unauthorized' });
+
+      return reply.send({ ok:true, jwt: signJWT(address, scope) });
+    } catch (e) {
+      req.log.error({ err:e }, 'wc_txproof_verify_failed');
+      return reply.code(400).send({ error:'bad_tx_proof' });
+    }
+  }
+
+  // EXISTING: message-sign path
   if (!signature) return reply.code(400).send({ error:'bad_signature' });
   if (!publicKey) return reply.code(400).send({ error:'bad_key' });
   if (isEd25519PublicKeyHex(publicKey)) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
   if (!isSecpPublicKeyHex(publicKey)) return reply.code(400).send({ error:'bad_key' });
-  const taken = takeNonce(address); if (!taken.ok) return reply.code(400).send({ error:taken.err });
-  const now = nowSec(); const tsNum = Number(ts || now);
-  if (!Number.isFinite(tsNum) || Math.abs(now-tsNum)>300) return reply.code(400).send({ error:'expired_nonce' });
-  const expectedHex = payloadHex && payloadHex.length>=8 ? payloadHex : asciiToHex(`${taken.nonce}||${scope}||${tsNum}||${address}`);
+
+  const expectedHex = payloadHex && payloadHex.length>=8 ? String(payloadHex).toUpperCase()
+    : asciiToHex(`${taken.nonce}||${scope}||${tsNum}||${address}`); // already uppercased
+
   let okSig=false, derived='';
-  try { okSig = keypairs.verify(expectedHex, signature, publicKey)===true; derived = keypairs.deriveAddress(publicKey); } catch {}
+  try { okSig = keypairs.verify(expectedHex, String(signature).toUpperCase(), String(publicKey).toUpperCase())===true; derived = keypairs.deriveAddress(publicKey); } catch {}
   if (!okSig) return reply.code(401).send({ error:'bad_signature' });
   if (derived !== address) return reply.code(401).send({ error:'unauthorized' });
+
   reply.send({ ok:true, jwt: signJWT(address, scope) });
 });
 
