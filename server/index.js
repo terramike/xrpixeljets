@@ -1,5 +1,5 @@
-// index.js — XRPixel Jets API (2025-10-31 claims6: cooldown-on-success-only + existing wc-txproof, regen, costs)
-
+// index.js — XRPixel Jets API (2025-10-31rel2-claim-cooldown-fix)
+// Base: 2025-10-26-claims5 + fractional ENERGY REGEN + 2025-10-30 wc-txproof
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import pkg from 'pg';
@@ -30,7 +30,6 @@ await app.register(cors, {
   allowedHeaders: ['Content-Type','Accept','Origin','X-Wallet','Authorization','X-Idempotency-Key'],
   credentials: false
 });
-
 app.addHook('onSend', async (req, reply, payload) => {
   const origin = req.headers.origin;
   if (origin && ALLOW.includes(origin)) { reply.header('Access-Control-Allow-Origin', origin); reply.header('Vary', 'Origin'); }
@@ -78,10 +77,7 @@ app.addHook('onRequest', async (req, reply) => {
 });
 
 async function ensureProfile(wallet){
-  await pool.query(
-    `insert into player_profiles (wallet) values ($1) on conflict (wallet) do nothing`,
-    [wallet]
-  );
+  await pool.query(`insert into player_profiles (wallet) values ($1) on conflict (wallet) do nothing`, [wallet]);
 }
 async function getProfileRaw(wallet){
   const { rows } = await pool.query(
@@ -95,57 +91,32 @@ async function getProfileRaw(wallet){
   coalesce(ms_dodge,0)::int as ms_dodge,
   coalesce(unlocked_level,1)::int as unlocked_level,
   last_claim_at, updated_at, created_at
- from player_profiles where wallet=$1`,
-    [wallet]
-  );
+ from player_profiles where wallet=$1`, [wallet]);
   return rows[0] || null;
 }
-
-function recomputeCurrent(base, level){
-  const b  = base  || { health:20, energyCap:100, regenPerMin:1 };
-  const lv = level || { health:0,  energyCap:0,   regenPerMin:0 };
-  return {
-    health:     (b.health|0)    + (lv.health|0),
-    energyCap:  (b.energyCap|0) + (lv.energyCap|0),
-    regenPerMin: Number(b.regenPerMin || 0) + Number(lv.regenPerMin || 0) * REGEN_STEP
-  };
+function recomputeCurrent(b, lv){
+  const base = b || { health:20, energyCap:100, regenPerMin:1 };
+  const L    = lv|| { health:0,  energyCap:0,   regenPerMin:0 };
+  return { health:(base.health|0)+(L.health|0), energyCap:(base.energyCap|0)+(L.energyCap|0), regenPerMin:Number(base.regenPerMin||0)+Number(L.regenPerMin||0)*REGEN_STEP };
 }
 function toClient(row){
-  const ms_current = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
-  return {
-    ms: { base:row.ms_base, level:row.ms_level, current:ms_current },
-    pct:{ hit:row.ms_hit|0, crit:row.ms_crit|0, dodge:row.ms_dodge|0 },
-    jetFuel:row.jet_fuel|0, energy:row.energy|0, energyCap:row.energy_cap|0, unlockedLevel:row.unlocked_level|0
-  };
+  const cur=row.ms_current || recomputeCurrent(row.ms_base,row.ms_level);
+  return { ms:{ base:row.ms_base, level:row.ms_level, current:cur }, pct:{ hit:row.ms_hit|0, crit:row.ms_crit|0, dodge:row.ms_dodge|0 }, jetFuel:row.jet_fuel|0, energy:row.energy|0, energyCap:row.energy_cap|0, unlockedLevel:row.unlocked_level|0 };
 }
-
 async function regenEnergyIfDue(wallet){
-  let row = await getProfileRaw(wallet);
-  if (!row) return null;
-
+  let row = await getProfileRaw(wallet); if (!row) return null;
   const cur = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
   const cap = Number(cur.energyCap ?? row.energy_cap ?? 100) || 100;
   const rpm = Number(cur.regenPerMin || 0);
-
   if (rpm <= 0) return row;
-
-  const nowS   = nowSec();
-  const lastS  = row.updated_at ? Math.floor(new Date(row.updated_at).getTime()/1000) : nowS;
+  const nowS = nowSec();
+  const lastS = row.updated_at ? Math.floor(new Date(row.updated_at).getTime()/1000) : nowS;
   const deltaS = Math.max(0, nowS - lastS);
-
   const gain = Math.floor((deltaS * rpm) / 60);
   if (gain <= 0) return row;
-
-  const before = row.energy|0;
-  if (before >= cap) return row;
-
-  const after = Math.min(cap, before + gain);
-  if (after === before) return row;
-
-  const { rows } = await pool.query(
-    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
-    [wallet, after]
-  );
+  const before = row.energy|0; if (before >= cap) return row;
+  const after = Math.min(cap, before + gain); if (after === before) return row;
+  const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [wallet, after]);
   return rows[0] || row;
 }
 
@@ -161,46 +132,19 @@ function requireJWT(req, reply){
   catch { reply.code(401).send({ error:'unauthorized' }); return null; }
 }
 
-function getEconScaleFrom(arg){
-  const n=Number(arg);
-  return (Number.isFinite(n)&&n>=0) ? n : ECON_SCALE_ENV;
-}
+function getEconScaleFrom(arg){ const n=Number(arg); return (Number.isFinite(n)&&n>=0) ? n : ECON_SCALE_ENV; }
 function levelsFromRow(row){
   const lv=row?.ms_level||{};
-  return {
-    health:(lv.health|0),
-    energyCap:(lv.energyCap|0),
-    regenPerMin:(lv.regenPerMin|0),
-    hit:(row?.ms_hit|0),
-    crit:(row?.ms_crit|0),
-    dodge:(row?.ms_dodge|0)
-  };
+  return { health:toInt(lv.health,0), energyCap:toInt(lv.energyCap,0), regenPerMin:toInt(lv.regenPerMin,0), hit:toInt(row?.ms_hit,0), crit:toInt(row?.ms_crit,10), dodge:toInt(row?.ms_dodge,0) };
 }
-function unitCost(level,s){ const raw=BASE_PER_LEVEL*((level|0)+1); return Math.max(1, Math.round(raw*s)); }
-function calcCosts(levels,s){
-  return {
-    health:unitCost(levels.health,s),
-    energyCap:unitCost(levels.energyCap,s),
-    regenPerMin:unitCost(levels.regenPerMin,s),
-    hit:unitCost(levels.hit,s),
-    crit:unitCost(levels.crit,s),
-    dodge:unitCost(levels.dodge,s)
-  };
-}
-function missionReward(level){
-  const l = Math.max(1, Number(level) || 1);
-  let base;
-  if (l <= 5) base = [0,100,150,200,250,300][l];
-  else        base = Math.round(300 * Math.pow(1.01, l - 5));
-  const reward = Math.round(base * REWARD_SCALE);
-  const scaledMax = Math.max(1, Math.round(10000 * REWARD_SCALE));
-  return Math.max(1, Math.min(scaledMax, reward));
-}
+function unitCost(level,s){ const raw=BASE_PER_LEVEL*(toInt(level,0)+1); return Math.max(1, Math.round(raw*s)); }
+function calcCosts(levels,s){ return { health:unitCost(levels.health,s), energyCap:unitCost(levels.energyCap,s), regenPerMin:unitCost(levels.regenPerMin,s), hit:unitCost(levels.hit,s), crit:unitCost(levels.crit,s), dodge:unitCost(levels.dodge,s) }; }
+function missionReward(l){ const level = Math.max(1, Number(l) || 1); const base = level<=5 ? [0,100,150,200,250,300][level] : Math.round(300*Math.pow(1.01, level-5)); const reward=Math.round(base*REWARD_SCALE); const cap=Math.max(1,Math.round(10000*REWARD_SCALE)); return Math.max(1,Math.min(cap,reward)); }
 
 app.get('/config', async (_req, reply) => {
   reply.send({
     tokenMode: (process.env.TOKEN_MODE || 'mock').toLowerCase(),
-    network: process.env.XRPL_WSS || process.env.NETWORK || 'wss://s.altnet.rippletest.net:51233',
+    network: process.env.XRPL_WSS || process.env.NETWORK || 'wss://xrplcluster.com',
     currencyCode: (process.env.CURRENCY_CODE || process.env.CURRENCY || 'JETS'),
     currencyHex: process.env.CURRENCY_HEX || null,
     issuer: process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || null
@@ -228,22 +172,17 @@ app.post('/session/verify', async (req, reply) => {
       const tx = decode(txProof.tx_blob);
       if (tx.TransactionType !== 'AccountSet') return reply.code(400).send({ error:'bad_tx_type' });
       if (tx.Account !== address) return reply.code(401).send({ error:'unauthorized' });
-
       const pub = String(tx.SigningPubKey || '').toUpperCase();
       if (!(pub.startsWith('02') || pub.startsWith('03'))) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
-
       const wantMemo = asciiToHex(`XRPixelJets|${taken.nonce}|${scope}|${tsNum}`);
       const memos = (tx.Memos || []).map(m => (m?.Memo?.MemoData || '').toUpperCase());
       if (!memos.includes(wantMemo)) return reply.code(400).send({ error:'memo_missing' });
-
       const preimageHex = encodeForSigning(tx).toUpperCase();
       const sigHex = String(tx.TxnSignature || '').toUpperCase();
       const ok = keypairs.verify(preimageHex, sigHex, pub) === true;
       if (!ok) return reply.code(401).send({ error:'bad_signature' });
-
       const derived = keypairs.deriveAddress(pub);
       if (derived !== address) return reply.code(401).send({ error:'unauthorized' });
-
       return reply.send({ ok:true, jwt: signJWT(address, scope) });
     } catch (e) {
       req.log.error({ err:e }, 'wc_txproof_verify_failed');
@@ -258,7 +197,6 @@ app.post('/session/verify', async (req, reply) => {
 
   const expectedHex = payloadHex && payloadHex.length>=8 ? String(payloadHex).toUpperCase()
     : asciiToHex(`${taken.nonce}||${scope}||${tsNum}||${address}`);
-
   let okSig=false, derived='';
   try { okSig = keypairs.verify(expectedHex, String(signature).toUpperCase(), String(publicKey).toUpperCase())===true; derived = keypairs.deriveAddress(publicKey); } catch {}
   if (!okSig) return reply.code(401).send({ error:'bad_signature' });
@@ -315,35 +253,27 @@ app.post('/battle/start', async (req, reply) => {
   let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error:'not_found' });
   let energy=row.energy|0, spent=0; if (energy>=10){ energy-=10; spent=10; }
-  const { rows } = await pool.query(
-    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
-    [req.wallet, energy]
-  );
+  const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [req.wallet, energy]);
   reply.send({ ok:true, level, spent, profile: toClient(rows[0]) });
 });
 app.post('/battle/turn', async (req, reply) => {
   let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error:'not_found' });
   let energy=row.energy|0, spent=0; if (energy>=1){ energy-=1; spent=1; }
-  const { rows } = await pool.query(
-    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
-    [req.wallet, energy]
-  );
+  const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [req.wallet, energy]);
   reply.send({ ok:true, spent, profile: toClient(rows[0]) });
 });
+
 app.post('/battle/finish', async (req, reply) => {
   const lvl=Math.max(1, toInt((req.body||{}).level,1)); const victory=!!(req.body||{}).victory;
   let row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
   let jf=row.jet_fuel|0, unlocked=row.unlocked_level|0, reward=0;
   if (victory){ reward=missionReward(lvl); jf+=reward; if (lvl>=unlocked) unlocked=lvl+1; }
-  const { rows } = await pool.query(
-    `update player_profiles set jet_fuel=$2, unlocked_level=$3, updated_at=now() where wallet=$1 returning *`,
-    [req.wallet, jf, unlocked]
-  );
+  const { rows } = await pool.query(`update player_profiles set jet_fuel=$2, unlocked_level=$3, updated_at=now() where wallet=$1 returning *`, [req.wallet, jf, unlocked]);
   reply.send({ ok:true, reward, victory, level:lvl, profile: toClient(rows[0]) });
 });
 
-// ---------- claim (COOLDOWN ONLY AFTER SUCCESS) ----------
+// ---------- claim (cooldown moved to AFTER successful payout) ----------
 app.post('/claim/start', async (req, reply) => {
   const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
 
@@ -352,12 +282,12 @@ app.post('/claim/start', async (req, reply) => {
 
   const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
 
-  // Check cooldown based on last successful claim
-  const nowS = nowSec(); const lastS = row.last_claim_at ? Math.floor(new Date(row.last_claim_at).getTime()/1000) : 0;
+  const nowS = nowSec();
+  const lastS = row.last_claim_at ? Math.floor(new Date(row.last_claim_at).getTime()/1000) : 0;
   const COOL = Number(process.env.CLAIM_COOLDOWN_SEC || 300);
   if (COOL>0 && (nowS-lastS)<COOL) return reply.code(429).send({ error:'cooldown' });
 
-  // 1) Atomic debit (no last_claim_at here)
+  // 1) Atomic debit — do NOT touch last_claim_at here
   const debit = await pool.query(
 `update player_profiles
    set jet_fuel = jet_fuel - $2,
@@ -367,30 +297,22 @@ app.post('/claim/start', async (req, reply) => {
  returning *`,
     [req.wallet, amt]
   );
-  if (debit.rows.length === 0) {
-    return reply.code(400).send({ error:'insufficient_funds' });
-  }
+  if (debit.rows.length === 0) return reply.code(400).send({ error:'insufficient_funds' });
 
   try {
     // 2) XRPL payout
     const sent = await claim.sendIssued({ to:req.wallet, amount: amt });
 
-    // 3) Mark cooldown only on success
-    await pool.query(
-      `update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1`,
-      [req.wallet]
-    );
+    // 3) Cooldown only after success
+    await pool.query(`update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1`, [req.wallet]);
 
-    // 4) Audit success
-    await pool.query(
-      `insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`,
-      [req.wallet, amt, sent?.txid||null]
-    ).catch(()=>{});
+    // 4) Audit
+    await pool.query(`insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`, [req.wallet, amt, sent?.txid||null]).catch(()=>{});
 
     const latest = await getProfileRaw(req.wallet);
     return reply.send({ ok:true, txid: sent?.txid || null, txJSON: sent?.txJSON || null, profile: toClient(latest || debit.rows[0]) });
   } catch (e) {
-    // Refund debit; no cooldown applied
+    // Refund; no cooldown
     await pool.query(`update player_profiles set jet_fuel = jet_fuel + $2, updated_at=now() where wallet=$1`, [req.wallet, amt]).catch(()=>{});
     const msg = String(e?.message||'');
     if (msg.includes('trustline_required'))         return reply.code(400).send({ error:'trustline_required' });
@@ -399,13 +321,9 @@ app.post('/claim/start', async (req, reply) => {
     if (msg.includes('hot_wallet_needs_trustline')) return reply.code(500).send({ error:'server_hot_needs_trustline' });
     if (msg.includes('hot_wallet_missing'))         return reply.code(500).send({ error:'server_hot_wallet_missing' });
     if (msg.includes('issuer_missing'))             return reply.code(500).send({ error:'server_issuer_missing' });
-    if (msg.includes('HOT_SEED_must_be_secp256k1')) return reply.code(500).send({ error:'server_hot_seed_algo' });
     return reply.code(500).send({ error:'claim_failed' });
   }
 });
 
 app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
-
-app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
-  app.log.info(`XRPixel Jets API listening on :${PORT}`);
-});
+app.listen({ port: PORT, host: '0.0.0.0' }).then(() => { app.log.info(`XRPixel Jets API listening on :${PORT}`); });
