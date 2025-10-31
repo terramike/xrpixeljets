@@ -1,4 +1,5 @@
-// claimJetFuel.js — XRPixel Jets (2025-10-26-path-fallback3)
+// claimJetFuel.js — XRPixel Jets (2025-10-31 secp-assert + existing hot/prepare/mock modes)
+
 export async function sendIssued({ to, amount }) {
   const MODE = (process.env.TOKEN_MODE || 'mock').toLowerCase(); // 'mock' | 'hot' | 'prepare'
   const WSS  = process.env.XRPL_WSS || process.env.NETWORK || 'wss://s.altnet.rippletest.net:51233';
@@ -31,8 +32,23 @@ export async function sendIssued({ to, amount }) {
   if (MODE !== 'hot')     return SHAPE(null, null);
   if (!HOT_SEED && !ISSUER_SEED) throw new Error('hot_wallet_missing');
 
+  // Load xrpl only when needed
   const xrpl = await import('xrpl').catch(() => null);
   if (!xrpl) throw new Error('xrpl_not_installed');
+
+  // === NEW: enforce secp256k1 for HOT_SEED at runtime (fail fast if ED) ===
+  try {
+    if (HOT_SEED) {
+      const probe = xrpl.Wallet.fromSeed(HOT_SEED); // no algorithm override => detect actual type
+      const pub = String(probe.publicKey || '').toUpperCase();
+      if (pub.startsWith('ED')) throw new Error('HOT_WALLET_SEED must be secp256k1 (Ed25519 is not supported)');
+    }
+  } catch (e) {
+    // Surface a consistent server-side error
+    if (String(e?.message||'').includes('Ed25519')) throw new Error('HOT_SEED_must_be_secp256k1');
+    throw e;
+  }
+  // =======================================================================
 
   const client = new xrpl.Client(WSS);
   await client.connect();
