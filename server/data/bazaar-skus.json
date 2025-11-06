@@ -1,0 +1,28 @@
+{
+  "skus": [
+    {
+      "sku": "ms-hull-001",
+      "name": "Hull Plate +20 HP",
+      "image": "https://mykeygo.io/jets/img/hull-plate-001.png",
+      "meta_uri": "ipfs://bafy.../hull-plate-001.json",
+      "priceJetFuel": 12000,
+      "priceXrpDrops": 250000,
+      "stackRule": "stack-all",
+      "active": true,
+      "supply": 100,
+      "previewBonuses": ["HP +20", "Stack: stack-all"]
+    },
+    {
+      "sku": "ms-armor-003",
+      "name": "Reactive Armor +30 DEF",
+      "image": "https://mykeygo.io/jets/img/reactive-armor-003.png",
+      "meta_uri": "ipfs://bafy.../reactive-armor-003.json",
+      "priceJetFuel": 18000,
+      "priceXrpDrops": 300000,
+      "stackRule": "best-of-per-stat",
+      "active": false,
+      "supply": 0,
+      "previewBonuses": ["DEF +30", "Stack: best-of-per-stat"]
+    }
+  ]
+}
