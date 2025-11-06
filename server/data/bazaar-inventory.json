@@ -1,0 +1,6 @@
+{
+  "inventory": [
+    { "id": 1, "sku": "ms-hull-001", "nftoken_id": "REPLACE_WITH_REAL_NFTOKENID_1", "status": "minted_stock" },
+    { "id": 2, "sku": "ms-hull-001", "nftoken_id": "REPLACE_WITH_REAL_NFTOKENID_2", "status": "minted_stock" }
+  ]
+}
