@@ -1,5 +1,6 @@
-// index.js — XRPixel Jets API (2025-10-31rel2-claim-cooldown-fix)
-// Base: 2025-10-26-claims5 + fractional ENERGY REGEN + 2025-10-30 wc-txproof
+// index.js — XRPixel Jets API (2025-11-06-bazaar-step1)
+// Base: 2025-10-31rel2-claim-cooldown-fix + Bazaar (hybrid XRP+JETS), directed SellOffer flow
+
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import pkg from 'pg';
@@ -8,6 +9,9 @@ import * as keypairs from 'ripple-keypairs';
 import crypto from 'crypto';
 import * as claim from './claimJetFuel.js';
 import { decode, encodeForSigning } from 'ripple-binary-codec';
+
+// XRPL (for Bazaar offers)
+import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
 
 const { Pool } = pkg;
 const app = Fastify({ logger: true });
@@ -23,6 +27,14 @@ const REGEN_STEP      = Number(process.env.REGEN_STEP || 0.1);
 const REWARD_SCALE    = Number.isFinite(Number(process.env.REWARD_SCALE))
   ? Number(process.env.REWARD_SCALE)
   : ECON_SCALE_ENV;
+
+// XRPL config for Bazaar
+const XRPL_WSS = process.env.XRPL_WSS || process.env.NETWORK || 'wss://xrplcluster.com';
+const HOT_WALLET_SEED = process.env.HOT_WALLET_SEED || process.env.HOT_SEED || ''; // secp seed for rJz…
+const xrpl = {
+  client: new XRPLClient(XRPL_WSS),
+  wallet: HOT_WALLET_SEED ? XRPLWallet.fromSeed(HOT_WALLET_SEED) : null
+};
 
 await app.register(cors, {
   origin: (origin, cb) => { if (!origin) return cb(null, true); cb(null, ALLOW.includes(origin)); },
@@ -120,7 +132,7 @@ async function regenEnergyIfDue(wallet){
   return rows[0] || row;
 }
 
-function signJWT(address, scope='play,upgrade,claim'){
+function signJWT(address, scope='play,upgrade,claim,bazaar'){
   const now=nowSec(); const exp=now+60*60;
   return jwt.sign({sub:address,scope,iat:now,exp}, JWT_SECRET, {algorithm:'HS256'});
 }
@@ -141,6 +153,7 @@ function unitCost(level,s){ const raw=BASE_PER_LEVEL*(toInt(level,0)+1); return 
 function calcCosts(levels,s){ return { health:unitCost(levels.health,s), energyCap:unitCost(levels.energyCap,s), regenPerMin:unitCost(levels.regenPerMin,s), hit:unitCost(levels.hit,s), crit:unitCost(levels.crit,s), dodge:unitCost(levels.dodge,s) }; }
 function missionReward(l){ const level = Math.max(1, Number(l) || 1); const base = level<=5 ? [0,100,150,200,250,300][level] : Math.round(300*Math.pow(1.01, level-5)); const reward=Math.round(base*REWARD_SCALE); const cap=Math.max(1,Math.round(10000*REWARD_SCALE)); return Math.max(1,Math.min(cap,reward)); }
 
+// ---------------- core endpoints (unchanged) ----------------
 app.get('/config', async (_req, reply) => {
   reply.send({
     tokenMode: (process.env.TOKEN_MODE || 'mock').toLowerCase(),
@@ -160,7 +173,7 @@ app.post('/session/start', async (req, reply) => {
 });
 
 app.post('/session/verify', async (req, reply) => {
-  const { address, signature, publicKey, payloadHex, scope='play,upgrade,claim', ts, txProof } = req.body || {};
+  const { address, signature, publicKey, payloadHex, scope='play,upgrade,claim,bazaar', ts, txProof } = req.body || {};
   if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) return reply.code(400).send({ error:'bad_address' });
 
   const taken = takeNonce(address); if (!taken.ok) return reply.code(400).send({ error:taken.err });
@@ -325,5 +338,173 @@ app.post('/claim/start', async (req, reply) => {
   }
 });
 
+// ---------------- Bazaar (additive) ----------------
+
+// Step-1: In-memory SKUs + inventory (migrate to DB later)
+const BAZAAR_ENABLED = (process.env.BAZAAR_ENABLED || 'true').toLowerCase() !== 'false';
+
+// sku: priceJetFuel (server debit), priceXrpDrops (sell offer amount in drops), stackRule
+const bazaarSKUs = new Map([
+  ['ms-hull-001', {
+    sku: 'ms-hull-001',
+    name: 'Hull Plate +20 HP',
+    image: 'https://mykeygo.io/jets/img/hull-plate-001.png',
+    meta_uri: 'ipfs://Qm...hullplate001.json',
+    priceJetFuel: 120,
+    priceXrpDrops: 250000,   // 0.25 XRP = mint amortization + tiny "install" fee
+    stackRule: 'stack-all',
+    supply: 100,
+    active: true
+  }]
+]);
+
+// Minimal demo inventory (pretend pre-minted)
+const bazaarInventory = [
+  { id: 1, sku: 'ms-hull-001', nftoken_id: '0008F7...ABCD', status: 'minted_stock' },
+  { id: 2, sku: 'ms-hull-001', nftoken_id: '0008F7...BCDE', status: 'minted_stock' }
+]; // status ∈ minted_stock | offered_to_wallet | sold
+
+const bazaarOrders = new Map(); // orderId -> { wallet, sku, inventory_id, offer_id, status, created_at }
+
+// helper: ensure XRPL client connected
+async function ensureXRPL() {
+  if (!xrpl.wallet) throw new Error('hot_wallet_missing');
+  if (!xrpl.client.isConnected()) await xrpl.client.connect();
+}
+
+// helper: create directed SellOffer
+async function createDirectedSellOffer({ nftoken_id, buyer, amountDrops }) {
+  await ensureXRPL();
+  const tx = {
+    TransactionType: 'NFTokenCreateOffer',
+    Account: xrpl.wallet.address,
+    NFTokenID: nftoken_id,
+    Amount: String(amountDrops ?? 0),
+    Destination: buyer
+  };
+  const prepared = await xrpl.client.autofill(tx);
+  const signed = xrpl.wallet.sign(prepared);
+  const sub = await xrpl.client.submitAndWait(signed.tx_blob);
+  const result = sub?.result;
+  if (result?.engine_result !== 'tesSUCCESS') {
+    const detail = result?.engine_result || 'unknown';
+    throw new Error(`xrpl_offer_failed:${detail}`);
+  }
+  const nodes = result.meta?.AffectedNodes || [];
+  let offerId = null;
+  for (const n of nodes) {
+    const cn = n.CreatedNode;
+    if (cn && cn.LedgerEntryType === 'NFTokenOffer') {
+      offerId = cn.LedgerIndex || cn.NewFields?.OfferID || cn.LedgerIndexHex || null;
+      if (offerId) break;
+    }
+  }
+  if (!offerId) throw new Error('offer_id_parse_failed');
+  return offerId;
+}
+
+// GET /bazaar/skus — public browse (auth optional)
+app.get('/bazaar/skus', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.send({ skus: [] });
+  const live = [];
+  for (const s of bazaarSKUs.values()) {
+    if (!s.active) continue;
+    const available = bazaarInventory.filter(x => x.sku === s.sku && x.status === 'minted_stock').length;
+    live.push({
+      sku: s.sku, name: s.name, image: s.image,
+      priceJetFuel: s.priceJetFuel, priceXrpDrops: s.priceXrpDrops,
+      available,
+      previewBonuses: ['HP +20', 'Stack: ' + (s.stackRule || 'best-of-per-stat')]
+    });
+  }
+  reply.send({ skus: live });
+});
+
+// GET /bazaar/sku/:id — details
+app.get('/bazaar/sku/:id', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
+  const s = bazaarSKUs.get(req.params.id);
+  if (!s || !s.active) return reply.code(404).send({ error:'not_found' });
+  const available = bazaarInventory.filter(x => x.sku === s.sku && x.status === 'minted_stock').length;
+  reply.send({ sku: { ...s, available } });
+});
+
+// POST /bazaar/purchase { sku } — JetFuel debit + create directed SellOffer (user pays accept fee + tiny XRP)
+app.post('/bazaar/purchase', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
+  const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
+
+  try {
+    const buyer = req.wallet;
+    const { sku } = req.body || {};
+    const s = bazaarSKUs.get(sku);
+    if (!s || !s.active) return reply.code(400).send({ error:'invalid_sku' });
+
+    const stock = bazaarInventory.find(x => x.sku === sku && x.status === 'minted_stock');
+    if (!stock) return reply.code(409).send({ error:'sold_out' });
+
+    // 1) Atomic JetFuel debit
+    if (s.priceJetFuel > 0) {
+      const debit = await pool.query(
+        `update player_profiles
+            set jet_fuel = jet_fuel - $2,
+                updated_at = now()
+          where wallet = $1
+            and jet_fuel >= $2
+        returning *`,
+        [buyer, s.priceJetFuel]
+      );
+      if (debit.rows.length === 0) return reply.code(402).send({ error:'insufficient_funds' });
+    }
+
+    // 2) Create directed SellOffer from hot wallet to buyer
+    const sellOfferId = await createDirectedSellOffer({
+      nftoken_id: stock.nftoken_id,
+      buyer,
+      amountDrops: s.priceXrpDrops || 0
+    });
+
+    // 3) Reserve the item & create order (in-memory)
+    stock.status = 'offered_to_wallet';
+    const orderId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    bazaarOrders.set(orderId, {
+      wallet: buyer, sku, inventory_id: stock.id,
+      offer_id: sellOfferId, status: 'offer_created',
+      created_at: new Date().toISOString()
+    });
+
+    reply.send({ ok:true, orderId, sellOfferId, nftokenId: stock.nftoken_id });
+  } catch (e) {
+    const msg = String(e?.message || '');
+    if (msg.startsWith('xrpl_offer_failed')) return reply.code(500).send({ error:'xrpl_offer_failed', detail: msg.split(':')[1]||'unknown' });
+    if (msg.includes('hot_wallet_missing')) return reply.code(500).send({ error:'server_hot_wallet_missing' });
+    return reply.code(500).send({ error:'server_error' });
+  }
+});
+
+// POST /bazaar/settle { offerId } — idempotent mark-sold (best-effort; prod should verify on-ledger)
+app.post('/bazaar/settle', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
+  const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
+
+  const { offerId } = req.body || {};
+  if (!offerId) return reply.code(400).send({ error:'bad_request' });
+
+  const order = [...bazaarOrders.values()].find(o => o.offer_id === offerId && o.wallet === req.wallet);
+  if (order) {
+    order.status = 'settled';
+    const item = bazaarInventory.find(x => x.id === order.inventory_id);
+    if (item) item.status = 'sold';
+  }
+  reply.send({ ok:true });
+});
+
+// ---------------- /healthz ----------------
 app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
-app.listen({ port: PORT, host: '0.0.0.0' }).then(() => { app.log.info(`XRPixel Jets API listening on :${PORT}`); });
+
+// Startup
+app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
+  app.log.info(`XRPixel Jets API listening on :${PORT}`);
+  if (xrpl.wallet) app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address}`);
+  else app.log.warn('[XRPL] HOT_WALLET_SEED missing — Bazaar offer creation will fail.');
+});
