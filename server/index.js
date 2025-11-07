@@ -1,5 +1,5 @@
-// index.js — XRPixel Jets API (2025-11-06-bazaar-json2)
-// Base: 2025-10-31rel2-claim-cooldown-fix + Bazaar (JSON-backed, hybrid XRP+JETS)
+// index.js — XRPixel Jets API (2025-11-06-bazaar-json3-auto)
+// Base: 2025-11-06-bazaar-json2 + auto reload + janitor + admin append/scan
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -13,14 +13,18 @@ import { decode, encodeForSigning } from 'ripple-binary-codec';
 // XRPL (for Bazaar offers)
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
 
-// Bazaar JSON store
+// Bazaar JSON store (now with automation helpers)
 import {
   loadBazaarFromFiles,
   getLiveSkus,
   getSku,
   reserveOneFromInventory,
   markSold,
-  getLoadedInfo
+  getLoadedInfo,
+  startFileWatchers,
+  appendInventory,
+  reclaimExpiredOffers,
+  scanHotWalletAndCollect
 } from './bazaar-store.js';
 
 const { Pool } = pkg;
@@ -200,7 +204,7 @@ async function createDirectedSellOffer({ nftoken_id, buyer, amountDrops }) {
   throw new Error('offer_id_parse_failed');
 }
 
-// ---------- initial Bazaar JSON load ----------
+// ---------- initial Bazaar JSON load + automation ----------
 if (BAZAAR_ENABLED) {
   try {
     const info = await loadBazaarFromFiles();
@@ -208,6 +212,16 @@ if (BAZAAR_ENABLED) {
   } catch (e) {
     app.log.error(e, '[Bazaar] Failed to load JSON');
   }
+  // auto-reload when JSON files change
+  startFileWatchers((msg)=>app.log.info(msg));
+
+  // simple janitor: reclaim stale offers every 5 minutes (older than 15m)
+  setInterval(() => {
+    try {
+      const n = reclaimExpiredOffers(15*60*1000);
+      if (n>0) app.log.info(`[Bazaar] Reclaimed ${n} stale offers`);
+    } catch {}
+  }, 5*60*1000);
 }
 
 // ---------------- core endpoints (unchanged) ----------------
@@ -466,7 +480,6 @@ app.post('/bazaar/settle', async (req, reply) => {
   const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
 
   const { offerId, inventoryId } = req.body || {};
-  // Prefer deterministic mark by inventoryId (client sends it from purchase response)
   if (inventoryId != null) markSold(inventoryId);
   reply.send({ ok:true });
 });
@@ -486,6 +499,43 @@ app.post('/admin/bazaar/reload', async (req, reply) => {
 app.get('/admin/bazaar/status', async (_req, reply) => {
   const info = getLoadedInfo();
   reply.send({ ok:true, info });
+});
+
+// --- Admin: append inventory (paste NFTokenIDs) ---
+app.post('/admin/bazaar/inventory/append', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
+  const key = req.headers['x-admin-key'] || '';
+  if (!ADMIN_KEY || key !== ADMIN_KEY) return reply.code(401).send({ error:'unauthorized' });
+
+  const { items } = req.body || {};
+  if (!Array.isArray(items) || !items.length) return reply.code(400).send({ error:'bad_request' });
+
+  try{
+    const res = await appendInventory(items); // items: [{ sku, nftoken_id, status? }]
+    reply.send({ ok:true, ...res });
+  }catch(e){
+    reply.code(400).send({ error:'append_failed', detail:String(e.message||e) });
+  }
+});
+
+// --- Admin: scan hot wallet & auto-ingest by SKU ---
+app.post('/admin/bazaar/scan-hotwallet', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
+  const key = req.headers['x-admin-key'] || '';
+  if (!ADMIN_KEY || key !== ADMIN_KEY) return reply.code(401).send({ error:'unauthorized' });
+
+  const { sku, uriPrefix } = req.body || {};
+  if (!sku) return reply.code(400).send({ error:'bad_request' });
+
+  try{
+    const owner = xrpl.wallet?.address;
+    if (!owner) return reply.code(500).send({ error:'server_hot_wallet_missing' });
+
+    const res = await scanHotWalletAndCollect({ xrplClient: xrpl.client, owner, sku, uriPrefix });
+    reply.send({ ok:true, ...res });
+  }catch(e){
+    reply.code(400).send({ error:'scan_failed', detail:String(e.message||e) });
+  }
 });
 
 // ---------------- /healthz ----------------
