@@ -1,6 +1,6 @@
-// bazaar-routes.js  v2025-11-08-chain-scan
-// Adds chain-scan purchase flow alongside existing /bazaar/purchase (file-inventory) route.
-// Endpoints:
+// server/bazaar-routes.js  v2025-11-08-chain-scan-fix
+// Chain-scan purchase flow that reads inventory directly from the hot wallet.
+// Endpoints (with server prefix '/bazaar'):
 //   GET  /bazaar/chain/available?sku=BAZ-DEFENSE-V1
 //   POST /bazaar/chain/purchase      (Authorization: Bearer <jwt>, X-Wallet: r...)
 //   POST /bazaar/chain/settle        (Authorization: Bearer <jwt>, X-Wallet: r...)
@@ -11,7 +11,7 @@ import * as xrpl from "xrpl";
 
 // ---- Config ----
 const XRPL_WSS   = process.env.XRPL_WSS || "wss://xrplcluster.com";
-const ISSUER     = process.env.ISSUER_ADDR;                    // rfYZ…
+const ISSUER     = process.env.ISSUER_ADDR;                         // rfYZ…
 const TAXON      = Number(process.env.BAZAAR_TAXON ?? 201);
 const HOT_SEED   = process.env.HOT_SEED || process.env.HOT_WALLET_SEED; // 's...' secp256k1
 const JWT_SECRET = process.env.JWT_SECRET || "dev";
@@ -29,8 +29,7 @@ async function ensureClient() {
   }
   if (!hotWallet) {
     if (!HOT_SEED) throw new Error("hot_seed_missing");
-    // HOT_SEED is secp256k1; Wallet.fromSeed will auto-detect algo.
-    hotWallet = xrpl.Wallet.fromSeed(HOT_SEED);
+    hotWallet = xrpl.Wallet.fromSeed(HOT_SEED); // secp256k1 seed => secp wallet
     hotAddress = hotWallet.classicAddress;
     if (!hotAddress) throw new Error("hot_address_derive_failed");
   }
@@ -48,7 +47,7 @@ function requireAuth(req) {
 
 // ---- Utils ----
 function rippleExpiryIn(sec) {
-  const unix = Math.floor(Date.now()/1000);
+  const unix = Math.floor(Date.now() / 1000);
   return unix - 946684800 + sec; // XRPL epoch offset
 }
 function hexToUtf8(hex) {
@@ -109,7 +108,6 @@ async function findOneNftForSku(sku) {
       const meta = await fetchJsonFromIpfsUri(uri);
       if (!meta) continue;
 
-      // Normalize server SKU the same way client/metadata does
       const sb   = deriveStatBonus(meta);
       const kind = (sb?.stat || "attack").toUpperCase();
       const serverSku = String(
@@ -129,7 +127,7 @@ async function findOneNftForSku(sku) {
   return null;
 }
 
-// Optional: enumerate availability (count)
+// Enumerate availability (count + preview)
 async function listAvailableForSku(sku) {
   const c = await ensureClient();
   const out = [];
@@ -161,7 +159,7 @@ async function listAvailableForSku(sku) {
   return out;
 }
 
-// Lightweight account existence check
+// Light account check
 async function accountExists(addr) {
   const c = await ensureClient();
   try { await c.request({ command:"account_info", account: addr, ledger_index:"current" }); return true; }
@@ -187,22 +185,23 @@ async function releaseJetFuel(/*buyer, jf, holdKey*/) { return { ok:true }; }
 
 // ---- Plugin ----
 export default fastifyPlugin(async function bazaarRoutes(app){
+  app.log.info("[Bazaar] chain-scan routes mounted (hot-wallet inventory)");
 
-  // Live availability (from hot wallet)
-  app.get("/bazaar/chain/available", async (req, reply) => {
+  // NOTE: no '/bazaar' here — index.js prefixes with '/bazaar'
+  app.get("/chain/available", async (req, reply) => {
     const sku = String(req.query?.sku || "").toUpperCase().trim();
     if (!sku) return reply.code(400).send({ error:"bad_sku" });
     try {
       const items = await listAvailableForSku(sku);
       return reply.send({ sku, available: items.length, items });
     } catch (e) {
-      app.log.error(e, "[/bazaar/chain/available]");
+      app.log.error(e, "[GET /chain/available]");
       return reply.code(500).send({ error:"server_error" });
     }
   });
 
-  // Create a directed sell-offer to the buyer
-  app.post("/bazaar/chain/purchase", async (req, reply) => {
+  // Create directed sell-offer to buyer
+  app.post("/chain/purchase", async (req, reply) => {
     try {
       requireAuth(req);
       const buyer = (req.headers["x-wallet"]||"").toString().trim();
@@ -214,7 +213,6 @@ export default fastifyPlugin(async function bazaarRoutes(app){
       const item = await findOneNftForSku(sku);
       if (!item) return reply.code(404).send({ error:"no_inventory" });
 
-      // Hold JFUEL first (server-side). Wire to DB later.
       const holdKey = `bazaar:${buyer}:${item.nft.NFTokenID}`;
       const hold = await holdJetFuel(buyer, item.priceJFUEL, holdKey);
       if (!hold?.ok) return reply.code(402).send({ error:"insufficient_jetfuel" });
@@ -224,8 +222,8 @@ export default fastifyPlugin(async function bazaarRoutes(app){
         TransactionType: "NFTokenCreateOffer",
         Account: hotAddress,
         NFTokenID: item.nft.NFTokenID,
-        Amount: String(item.priceXRPDrops || 0),           // player pays 0–dust XRP on accept
-        Flags: xrpl.NFTokenCreateOfferFlags.tfSellNFToken, // sell offer
+        Amount: String(item.priceXRPDrops || 0),
+        Flags: xrpl.NFTokenCreateOfferFlags.tfSellNFToken,
         Destination: buyer,
         Expiration: rippleExpiryIn(OFFER_TTL),
       };
@@ -238,14 +236,11 @@ export default fastifyPlugin(async function bazaarRoutes(app){
         await releaseJetFuel(buyer, item.priceJFUEL, holdKey);
         return reply.code(500).send({ error:"offer_failed", meta: sub.result?.meta });
       }
-
       const offerId = offerIdFromMeta(sub.result?.meta);
       if (!offerId) {
         await releaseJetFuel(buyer, item.priceJFUEL, holdKey);
         return reply.code(500).send({ error:"no_offer_id" });
       }
-
-      // Optionally: store pending {offerId,buyer,jf,holdKey,sku} for janitor/reclaim.
       return reply.send({
         ok: true,
         sellOfferId: offerId,
@@ -257,13 +252,13 @@ export default fastifyPlugin(async function bazaarRoutes(app){
       });
     } catch (e) {
       if (String(e.message).toLowerCase().includes("unauthorized")) return reply.code(401).send({ error:"unauthorized" });
-      app.log.error(e, "[/bazaar/chain/purchase]");
+      app.log.error(e, "[POST /chain/purchase]");
       return reply.code(500).send({ error:"server_error" });
     }
   });
 
-  // Check whether the offer was consumed; if yes, finalize the JFUEL hold.
-  app.post("/bazaar/chain/settle", async (req, reply) => {
+  // Finalize JFUEL hold once user accepts the offer in their wallet
+  app.post("/chain/settle", async (req, reply) => {
     try {
       requireAuth(req);
       const buyer = (req.headers["x-wallet"]||"").toString().trim();
@@ -271,7 +266,7 @@ export default fastifyPlugin(async function bazaarRoutes(app){
       if (!offerId) return reply.code(400).send({ error:"bad_offer" });
 
       const c = await ensureClient();
-      let accepted = false;
+      let accepted;
       try {
         await c.request({ command:"ledger_entry", index: offerId });
         accepted = false; // still exists
