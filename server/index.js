@@ -1,6 +1,6 @@
-// index.js — XRPixel Jets API (2025-11-08-bazaarfix3a)
-// Base: your 2025-11-06 build + JWT auth + battles + claim
-// Change: remove legacy JSON/chain Bazaar; add hot-wallet Bazaar plugin only
+// server/index.js — XRPixel Jets API (2025-11-08-bazaarfix5)
+// Simplified Bazaar: keep JSON-store + directed SellOffer purchase.
+// Removes old chain-scan wiring. Mounts a tiny hot-bazaar plugin (no node-fetch).
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -9,10 +9,21 @@ import jwt from 'jsonwebtoken';
 import * as keypairs from 'ripple-keypairs';
 import crypto from 'crypto';
 import { decode, encodeForSigning } from 'ripple-binary-codec';
-
-// XRPL (for hot-wallet offers)
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
-// NEW: hot bazaar plugin (must exist in repo)
+
+import {
+  loadBazaarFromFiles,
+  getLiveSkus,
+  getSku,
+  reserveOneFromInventory,
+  markSold,
+  getLoadedInfo,
+  startFileWatchers,
+  appendInventory,
+  reclaimExpiredOffers,
+  scanHotWalletAndCollect
+} from './bazaar-store.js';
+
 import { registerBazaarHotRoutes } from './bazaar-hot.js';
 
 const { Pool } = pkg;
@@ -31,10 +42,10 @@ const REWARD_SCALE    = Number.isFinite(Number(process.env.REWARD_SCALE))
   ? Number(process.env.REWARD_SCALE)
   : ECON_SCALE_ENV;
 
-// XRPL config (hot-bazaar)
+// XRPL config (Bazaar)
 const XRPL_WSS = process.env.XRPL_WSS || process.env.NETWORK || 'wss://xrplcluster.com';
-const HOT_WALLET_SEED = process.env.HOT_WALLET_SEED || process.env.HOT_SEED || ''; // secp256k1 seed for rJz…
-const OFFER_TTL_SEC = Number(process.env.BAZAAR_OFFER_TTL_SEC || 900); // 15m
+const HOT_WALLET_SEED = process.env.HOT_WALLET_SEED || process.env.HOT_SEED || ''; // secp seed for rJz…
+const OFFER_TTL_SEC = Number(process.env.BAZAAR_OFFER_TTL_SEC || 900); // 15 min
 const ISSUER_ADDR = process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || null;
 
 const xrpl = {
@@ -42,7 +53,9 @@ const xrpl = {
   wallet: HOT_WALLET_SEED ? XRPLWallet.fromSeed(HOT_WALLET_SEED) : null
 };
 
+// Bazaar feature/env
 const BAZAAR_ENABLED = (process.env.BAZAAR_ENABLED || 'true').toLowerCase() !== 'false';
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 await app.register(cors, {
   origin: (origin, cb) => { if (!origin) return cb(null, true); cb(null, ALLOW.includes(origin)); },
@@ -84,9 +97,9 @@ const OPEN_ROUTES = [
   '/session/verify',
   '/config',
   '/healthz',
-  // NEW: hot-bazaar public reads
-  '/bazaar/hot/list',
-  '/bazaar/hot/ping'
+  '/bazaar/skus',
+  '/bazaar/hot/ping',
+  '/bazaar/hot/status'
 ];
 
 app.addHook('onRequest', async (req, reply) => {
@@ -174,6 +187,51 @@ async function ensureXRPL() {
   if (!xrpl.wallet) throw new Error('hot_wallet_missing');
   if (!xrpl.client.isConnected()) await xrpl.client.connect();
 }
+async function createDirectedSellOffer({ nftoken_id, buyer, amountDrops }) {
+  await ensureXRPL();
+  const tx = {
+    TransactionType: 'NFTokenCreateOffer',
+    Account: xrpl.wallet.address,
+    NFTokenID: nftoken_id,
+    Amount: String(amountDrops ?? 0),
+    Flags: 1, // tfSellNFToken
+    Destination: buyer,
+    Expiration: rippleEpoch(Math.floor(Date.now()/1000) + OFFER_TTL_SEC)
+  };
+  const prepared = await xrpl.client.autofill(tx);
+  const signed = xrpl.wallet.sign(prepared);
+  const sub = await xrpl.client.submitAndWait(signed.tx_blob, { failHard:false });
+  const r = sub?.result;
+  if ((r?.engine_result || r?.meta?.TransactionResult) !== 'tesSUCCESS') {
+    const detail = r?.engine_result || r?.meta?.TransactionResult || 'unknown';
+    throw new Error(`xrpl_offer_failed:${detail}`);
+  }
+  const nodes = r?.meta?.AffectedNodes || [];
+  for (const n of nodes) {
+    const cn = n.CreatedNode;
+    if (cn && cn.LedgerEntryType === 'NFTokenOffer') {
+      return cn.LedgerIndex || cn.NewFields?.OfferID || cn.LedgerIndexHex || null;
+    }
+  }
+  throw new Error('offer_id_parse_failed');
+}
+
+// ---------- Bazaar JSON load + automation ----------
+if (BAZAAR_ENABLED) {
+  try {
+    const info = await loadBazaarFromFiles();
+    app.log.info({ info }, '[Bazaar] JSON loaded');
+  } catch (e) {
+    app.log.error(e, '[Bazaar] Failed to load JSON');
+  }
+  startFileWatchers((msg)=>app.log.info(msg));
+  setInterval(() => {
+    try {
+      const n = reclaimExpiredOffers(15*60*1000);
+      if (n>0) app.log.info(`[Bazaar] Reclaimed ${n} stale offers`);
+    } catch {}
+  }, 5*60*1000);
+}
 
 // ---------------- config ----------------
 app.get('/config', async (_req, reply) => {
@@ -203,7 +261,6 @@ async function verifyOrFinish(req, reply) {
   const now = nowSec(); const tsNum = Number(ts || now);
   if (!Number.isFinite(tsNum) || Math.abs(now-tsNum)>300) return reply.code(400).send({ error:'expired_nonce' });
 
-  // WalletConnect tx-proof path
   if (txProof && txProof.tx_blob) {
     try {
       const tx = decode(txProof.tx_blob);
@@ -231,7 +288,6 @@ async function verifyOrFinish(req, reply) {
     }
   }
 
-  // Simple signMessage path (secp only)
   if (!signature) return reply.code(400).send({ error:'bad_signature' });
   if (!publicKey) return reply.code(400).send({ error:'bad_key' });
   if (isEd25519PublicKeyHex(publicKey)) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
@@ -248,7 +304,7 @@ async function verifyOrFinish(req, reply) {
 }
 
 app.post('/session/verify', verifyOrFinish);
-app.post('/session/finish', verifyOrFinish); // alias for client helper
+app.post('/session/finish', verifyOrFinish);
 
 // ---------------- profile + battles ----------------
 app.get('/profile', async (req, reply) => {
@@ -344,7 +400,6 @@ app.post('/claim/start', async (req, reply) => {
   const COOL = Number(process.env.CLAIM_COOLDOWN_SEC || 300);
   if (COOL>0 && (nowS-lastS)<COOL) return reply.code(429).send({ error:'cooldown' });
 
-  // Atomic debit
   const debit = await pool.query(
 `update player_profiles
    set jet_fuel = jet_fuel - $2,
@@ -357,7 +412,7 @@ app.post('/claim/start', async (req, reply) => {
   if (debit.rows.length === 0) return reply.code(400).send({ error:'insufficient_funds' });
 
   try {
-    // Plug your real issuer send here:
+    // TODO: sendIssued real call (kept as placeholder in this snippet)
     const sent = { txid: null, txJSON: null };
 
     await pool.query(`update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1`, [req.wallet]);
@@ -378,39 +433,157 @@ app.post('/claim/start', async (req, reply) => {
   }
 });
 
-// ---------- Hot-wallet Bazaar (ONLY) ----------
-if (BAZAAR_ENABLED) {
-  await registerBazaarHotRoutes(app, {
-    prefix: '/bazaar/hot',
-    xrplClient: xrpl.client,
-    xrplWallet: xrpl.wallet,
-    issuer: ISSUER_ADDR,
-    offerTtlSec: OFFER_TTL_SEC,
-    // optional hints for defaults in plugin
-    upgradeTaxon: Number(process.env.UPGRADE_TAXON || 201),
-    defaultPrices: {
-      jf: Number(process.env.PRICE_DEFAULT_JFUEL || 0),
-      xrpDrops: Number(process.env.PRICE_DEFAULT_XRP_DROPS || 0)
+// ---------- Bazaar (public read, server-purchased) ----------
+app.get('/bazaar/skus', async (_req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.send({ skus: [] });
+  try {
+    const list = getLiveSkus();
+    reply.send({ skus: list });
+  } catch {
+    reply.send({ skus: [] });
+  }
+});
+
+app.get('/bazaar/sku/:id', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
+  const s = getSku(req.params.id);
+  if (!s || !s.active) return reply.code(404).send({ error:'not_found' });
+  const live = getLiveSkus().find(x => x.sku === s.sku);
+  reply.send({ sku: { ...s, available: live?.available ?? 0 } });
+});
+
+// Purchase = JWT + JFUEL hold + directed sell offer
+app.post('/bazaar/purchase', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
+  const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
+
+  try {
+    const buyer = req.wallet;
+    const { sku } = req.body || {};
+    const s = getSku(sku);
+    if (!s || !s.active) return reply.code(400).send({ error:'invalid_sku' });
+
+    const stock = reserveOneFromInventory(sku);
+    if (!stock) return reply.code(409).send({ error:'sold_out' });
+
+    if ((s.priceJetFuel|0) > 0) {
+      const debit = await pool.query(
+        `update player_profiles
+            set jet_fuel = jet_fuel - $2,
+                updated_at = now()
+          where wallet = $1
+            and jet_fuel >= $2
+        returning *`,
+        [buyer, s.priceJetFuel|0]
+      );
+      if (debit.rows.length === 0) {
+        stock.status = 'minted_stock';
+        return reply.code(402).send({ error:'insufficient_funds' });
+      }
     }
-  });
+
+    const sellOfferId = await createDirectedSellOffer({
+      nftoken_id: stock.nftoken_id,
+      buyer,
+      amountDrops: s.priceXrpDrops|0
+    });
+
+    const orderId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    reply.send({ ok:true, orderId, sellOfferId, nftokenId: stock.nftoken_id, inventoryId: stock.id });
+  } catch (e) {
+    const msg = String(e?.message || '');
+    if (msg.startsWith('xrpl_offer_failed')) return reply.code(500).send({ error:'xrpl_offer_failed', detail: msg.split(':')[1]||'unknown' });
+    if (msg.includes('hot_wallet_missing')) return reply.code(500).send({ error:'server_hot_wallet_missing' });
+    return reply.code(500).send({ error:'server_error' });
+  }
+});
+
+app.post('/bazaar/settle', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
+  const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
+
+  const { offerId, inventoryId } = req.body || {};
+  if (inventoryId != null) markSold(inventoryId);
+  reply.send({ ok:true });
+});
+
+// --- Admin: hot-reload bazaar JSON (requires ADMIN_KEY) ---
+app.post('/admin/bazaar/reload', async (req, reply) => {
+  const key = req.headers['x-admin-key'] || '';
+  if (!ADMIN_KEY || key !== ADMIN_KEY) return reply.code(401).send({ error:'unauthorized' });
+  try{
+    const info = await loadBazaarFromFiles();
+    reply.send({ ok:true, info });
+  }catch(e){
+    reply.code(500).send({ error:'reload_failed', detail:String(e.message||e) });
+  }
+});
+app.get('/admin/bazaar/status', async (_req, reply) => {
+  const info = getLoadedInfo();
+  reply.send({ ok:true, info });
+});
+
+// --- Admin: append inventory (paste NFTokenIDs) ---
+app.post('/admin/bazaar/inventory/append', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
+  const key = req.headers['x-admin-key'] || '';
+  if (!ADMIN_KEY || key !== ADMIN_KEY) return reply.code(401).send({ error:'unauthorized' });
+
+  const { items } = req.body || {};
+  if (!Array.isArray(items) || !items.length) return reply.code(400).send({ error:'bad_request' });
+
+  try{
+    const res = await appendInventory(items); // items: [{ sku, nftoken_id, status? }]
+    reply.send({ ok:true, ...res });
+  }catch(e){
+    reply.code(400).send({ error:'append_failed', detail:String(e.message||e) });
+  }
+});
+
+// --- Admin: scan hot wallet & auto-ingest by SKU ---
+app.post('/admin/bazaar/scan-hotwallet', async (req, reply) => {
+  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
+  const key = req.headers['x-admin-key'] || '';
+  if (!ADMIN_KEY || key !== ADMIN_KEY) return reply.code(401).send({ error:'unauthorized' });
+
+  const { sku, uriPrefix } = req.body || {};
+  if (!sku) return reply.code(400).send({ error:'bad_request' });
+
+  try{
+    const owner = xrpl.wallet?.address;
+    if (!owner) return reply.code(500).send({ error:'server_hot_wallet_missing' });
+
+    const res = await scanHotWalletAndCollect({ xrplClient: xrpl.client, owner, sku, uriPrefix });
+    reply.send({ ok:true, ...res });
+  }catch(e){
+    reply.code(400).send({ error:'scan_failed', detail:String(e.message||e) });
+  }
+});
+
+// Mount minimal hot-bazaar plugin (no node-fetch)
+if (BAZAAR_ENABLED) {
+  registerBazaarHotRoutes(app);
+  app.log.info('[Bazaar] hot mode routes mounted at /bazaar/hot/*');
 }
 
 // ---------------- /healthz ----------------
 app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
 
-// Ensure XRPL is connected at boot so first offer creation is fast
+// Ensure XRPL ready before serve
 app.addHook('onReady', async () => {
   try {
-    if (BAZAAR_ENABLED && xrpl.wallet && !xrpl.client.isConnected()) {
-      await xrpl.client.connect();
+    if (BAZAAR_ENABLED) {
+      if (xrpl.wallet && !xrpl.client.isConnected()) {
+        await xrpl.client.connect();
+      }
+      app.log.info({
+        wss: XRPL_WSS,
+        issuer: ISSUER_ADDR,
+        hot: xrpl.wallet?.address || '(none)'
+      }, '[Bazaar] Ready');
     }
-    app.log.info({
-      wss: XRPL_WSS,
-      issuer: ISSUER_ADDR,
-      hot: xrpl.wallet?.address || '(none)'
-    }, '[Boot] Ready');
   } catch (e) {
-    app.log.error(e, '[Boot] XRPL init failed');
+    app.log.error(e, '[Bazaar] onReady init failed');
   }
 });
 
