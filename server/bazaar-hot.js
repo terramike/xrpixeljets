@@ -8,6 +8,7 @@
 
 import { Client as XRPLClient, Wallet as XRPLWallet } from "xrpl";
 
+// --- Env + helpers ---
 const XRPL_WSS  = process.env.XRPL_WSS || "wss://xrplcluster.com";
 const HOT_SEED  = process.env.HOT_SEED || process.env.HOT_WALLET_SEED || "";
 const ISSUER    = process.env.ISSUER_ADDR || process.env.ISSUER_ADDRESS || "";
@@ -20,23 +21,38 @@ const ipfsHTTP = (uri) => !uri ? null : uri.startsWith("ipfs://")
   ? "https://cloudflare-ipfs.com/ipfs/" + uri.slice(7)
   : uri;
 
-function priceFromMeta(meta){
-  // attribute keys are matched case-insensitively
+// Small fetch with timeout (Node has global fetch; add AbortController timeout)
+async function fetchJSON(url, { timeoutMs = 8000 } = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Pull price fields from NFT metadata
+function priceFromMeta(meta) {
   const pick = (name) => {
     const A = meta?.attributes;
     if (!Array.isArray(A)) return null;
-    const f = A.find(t => (t?.trait_type||"").toLowerCase() === name.toLowerCase());
+    const f = A.find(t => (t?.trait_type || "").toLowerCase() === name.toLowerCase());
     return f?.value ?? null;
   };
-  const jf   = Number(pick("Price (JFUEL)"));
-  const xrp  = Number(pick("Price (XRP)"));
+  const jf  = Number(pick("Price (JFUEL)"));
+  const xrp = Number(pick("Price (XRP)"));
   return {
     jf: Number.isFinite(jf) ? jf : DEF_JFUEL,
     xrpDrops: Number.isFinite(xrp) ? Math.round(xrp * 1_000_000) : DEF_DROPS
   };
 }
 
-export async function registerBazaarHotRoutes(app){
+export async function registerBazaarHotRoutes(app) {
   if (!HOT_SEED)  app.log.warn("[BazaarHot] HOT_SEED missing");
   if (!isR(ISSUER)) app.log.warn("[BazaarHot] ISSUER_ADDR missing/invalid");
 
@@ -44,18 +60,18 @@ export async function registerBazaarHotRoutes(app){
   const hot    = XRPLWallet.fromSeed(HOT_SEED);
   const HOT    = hot.classicAddress;
 
-  async function ensureConnected(){
+  async function ensureConnected() {
     if (!client.isConnected()) await client.connect();
   }
 
-  async function listHot(){
+  async function listHot() {
     await ensureConnected();
     const out = [];
     let marker = null;
     do {
-      const r = await client.request({ command:"account_nfts", account: HOT, limit: 400, marker });
+      const r = await client.request({ command: "account_nfts", account: HOT, limit: 400, marker });
       marker = r.result.marker;
-      for (const n of (r.result.account_nfts||[])) {
+      for (const n of (r.result.account_nfts || [])) {
         const issuer = n.Issuer || n.issuer;
         const taxon  = n.NFTokenTaxon ?? n.nft_taxon ?? n.TokenTaxon;
         if (issuer === ISSUER && Number(taxon) === TAXON) {
@@ -69,21 +85,17 @@ export async function registerBazaarHotRoutes(app){
     return out;
   }
 
-  async function fetchMeta(uri){
-    try {
-      const url = ipfsHTTP(uri);
-      if (!url) return null;
-      const res = await fetch(url, { timeout: 8000 });
-      if (!res.ok) return null;
-      return await res.json();
-    } catch { return null; }
+  async function fetchMeta(uri) {
+    const url = ipfsHTTP(uri);
+    if (!url) return null;
+    return await fetchJSON(url, { timeoutMs: 8000 });
   }
 
   // GET: list items currently in the hot wallet (issuer/taxon filtered)
+  // -> { items: [{ nftoken_id, uri, name, kind, priceJetFuel, priceXrpDrops }] }
   app.get("/bazaar/hot/list", async (req, reply) => {
     try {
       if (!isR(ISSUER)) return reply.code(503).send({ error: "config_bad_issuer" });
-      await ensureConnected();
       const raw = await listHot();
 
       // attach name/kind/prices from metadata
@@ -94,8 +106,8 @@ export async function registerBazaarHotRoutes(app){
         const kind = (() => {
           const A = meta?.attributes;
           if (!Array.isArray(A)) return "";
-          const f = A.find(a => (a?.trait_type||"").toLowerCase()==="kind");
-          return (f?.value||"").toString();
+          const f = A.find(a => (a?.trait_type || "").toLowerCase() === "kind");
+          return (f?.value || "").toString();
         })();
         return { ...it, name, kind, priceJetFuel: jf, priceXrpDrops: xrpDrops };
       }));
@@ -103,13 +115,14 @@ export async function registerBazaarHotRoutes(app){
       return reply.send({ items });
     } catch (e) {
       req.log.error(e, "[BazaarHot] list error");
-      return reply.code(500).send({ error:"list_failed" });
+      return reply.code(500).send({ error: "list_failed" });
     }
   });
 
   // POST: create directed SellOffer (hot -> buyer) at metadata price (XRP part)
-  // Headers: X-Wallet: r...,  Authorization: Bearer <JWT> (optional for your JFUEL gate)
+  // Headers: X-Wallet: r...,  Authorization: Bearer <JWT> (optional if you later enforce JFUEL here)
   // Body: { nftoken_id }
+  // -> { ok, nftoken_id, uri, price:{ jf, xrpDrops }, offerId, acceptTx }
   app.post("/bazaar/hot/buy", async (req, reply) => {
     try {
       const buyer = req.headers["x-wallet"];
@@ -122,13 +135,14 @@ export async function registerBazaarHotRoutes(app){
       await ensureConnected();
 
       // verify NFT belongs to HOT and matches issuer/taxon
-      const info = await client.request({ command:"nft_info", nft_id: nftoken_id }).catch(()=>null);
+      const info = await client.request({ command: "nft_info", nft_id: nftoken_id }).catch(() => null);
       if (!info?.result) return reply.code(404).send({ error: "nft_not_found" });
+
       const owner = info.result.owner;
       const issuer= info.result.issuer;
       const taxon = info.result.nft_taxon ?? info.result.NFTokenTaxon;
       if (owner !== HOT) return reply.code(409).send({ error: "not_in_hot_wallet" });
-      if (issuer !== ISSUER || Number(taxon)!==TAXON) return reply.code(409).send({ error: "not_official_upgrade" });
+      if (issuer !== ISSUER || Number(taxon) !== TAXON) return reply.code(409).send({ error: "not_official_upgrade" });
 
       // price from meta (fallback to defaults)
       const uriHex = info.result.nft_uri;
@@ -136,10 +150,10 @@ export async function registerBazaarHotRoutes(app){
       const meta   = uri ? await fetchMeta(uri) : null;
       const { jf, xrpDrops } = priceFromMeta(meta || {});
 
-      // TODO (optional): enforce JFUEL debit server-side with your existing game store.
-      // If you have a function debitJetFuel(buyer, jf), call it here and 402 on failure.
+      // Optional: enforce JFUEL debit on server here (call your existing debit function)
+      // If debit fails, return reply.code(402).send({ error:"insufficient_funds" });
 
-      // create directed SellOffer
+      // create directed SellOffer (buyer accepts on client)
       const tx = {
         TransactionType: "NFTokenCreateOffer",
         Account: HOT,
@@ -153,18 +167,18 @@ export async function registerBazaarHotRoutes(app){
       const subm     = await client.submitAndWait(signed.tx_blob);
 
       let offerId = null;
-      for (const n of (subm?.result?.meta?.AffectedNodes||[])) {
+      for (const n of (subm?.result?.meta?.AffectedNodes || [])) {
         const c = n.CreatedNode;
         if (c?.LedgerEntryType === "NFTokenOffer") { offerId = c.LedgerIndex; break; }
       }
-      if (!offerId) return reply.code(500).send({ error:"offer_create_unknown" });
+      if (!offerId) return reply.code(500).send({ error: "offer_create_unknown" });
 
       const acceptTx = { TransactionType: "NFTokenAcceptOffer", Account: buyer, NFTokenSellOffer: offerId };
 
-      return reply.send({ ok:true, nftoken_id, uri: uri || null, price:{ jf, xrpDrops }, offerId, acceptTx });
+      return reply.send({ ok: true, nftoken_id, uri: uri || null, price: { jf, xrpDrops }, offerId, acceptTx });
     } catch (e) {
       req.log.error(e, "[BazaarHot] buy error");
-      return reply.code(500).send({ error:"buy_failed" });
+      return reply.code(500).send({ error: "buy_failed" });
     }
   });
 }
