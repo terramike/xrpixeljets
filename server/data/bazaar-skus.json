@@ -1,11 +1,33 @@
 {
   "skus": [
     {
+      "sku": "BAZ-ATTACK-V1",
+      "name": "XRPixel Bazaar ATTACK +1",
+      "description": "Bazaar Upgrade NFT (attack) usable in XRPixel Jets.",
+      "kind": "attack",
+      "imageCid": "", 
+      "priceJetFuel": 15000,
+      "priceXrpDrops": 250000,
+      "issuer": "rfYZ17wwhA4Be23fw8zthVmQQnrcdDRi52",
+      "taxon": 201
+    },
+    {
+      "sku": "BAZ-SPEED-V1",
+      "name": "XRPixel Bazaar SPEED +1",
+      "description": "Bazaar Upgrade NFT (speed) usable in XRPixel Jets.",
+      "kind": "speed",
+      "imageCid": "",
+      "priceJetFuel": 15000,
+      "priceXrpDrops": 250000,
+      "issuer": "rfYZ17wwhA4Be23fw8zthVmQQnrcdDRi52",
+      "taxon": 201
+    },
+    {
       "sku": "BAZ-DEFENSE-V1",
       "name": "XRPixel Bazaar DEFENSE +1",
       "description": "Bazaar Upgrade NFT (defense) usable in XRPixel Jets.",
       "kind": "defense",
-      "imageCid": "bafy...image_cid...",
+      "imageCid": "bafybeih4ciqlwh2mt64eql7q2dfwb3iwxbmshe6lzubnhxrhfz2iljy2pu",
       "priceJetFuel": 15000,
       "priceXrpDrops": 250000,
       "issuer": "rfYZ17wwhA4Be23fw8zthVmQQnrcdDRi52",
