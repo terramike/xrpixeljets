@@ -1,4 +1,4 @@
-// index.js — XRPixel Jets API (2025-11-07-bazaar-purchase-wired)
+// index.js — XRPixel Jets API (2025-11-08-bazaarfix2)
 // Base: your 2025-11-06 build + JWT auth + directed SellOffer purchase + hot-wallet scan/ingest
 
 import Fastify from 'fastify';
@@ -457,7 +457,8 @@ app.get('/bazaar/sku/:id', async (req, reply) => {
   reply.send({ sku: { ...s, available: live?.available ?? 0 } });
 });
 
-// Purchase = JWT + JFUEL hold + directed sell offer
+// Purchase = JWT + JFUEL hold + directed sell offer (uses inventory reservation)
+// (We'll wire chain-scan route next without breaking this path.)
 app.post('/bazaar/purchase', async (req, reply) => {
   if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
   const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
