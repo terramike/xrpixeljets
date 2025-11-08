@@ -1,6 +1,6 @@
-// index.js — XRPixel Jets API (2025-11-08-bazaarfix3)
-// Base: your 2025-11-06 build + JWT auth + directed SellOffer purchase + hot-wallet scan/ingest
-// Adds: chain-scan Bazaar plugin registration (/bazaar/chain/*) and onReady XRPL init
+// index.js — XRPixel Jets API (2025-11-08-bazaarfix3a)
+// Base: your 2025-11-06 build + JWT auth + battles + claim
+// Change: remove legacy JSON/chain Bazaar; add hot-wallet Bazaar plugin only
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -10,28 +10,10 @@ import * as keypairs from 'ripple-keypairs';
 import crypto from 'crypto';
 import { decode, encodeForSigning } from 'ripple-binary-codec';
 
-// XRPL (for Bazaar offers)
+// XRPL (for hot-wallet offers)
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
+// NEW: hot bazaar plugin (must exist in repo)
 import { registerBazaarHotRoutes } from './bazaar-hot.js';
-// ...
-await registerBazaarHotRoutes(app);
-
-// —— ADD: chain-scan bazaar plugin ——
-import bazaarRoutes from './bazaar-routes.js';
-
-// Bazaar JSON store (with automation helpers)
-import {
-  loadBazaarFromFiles,
-  getLiveSkus,
-  getSku,
-  reserveOneFromInventory,
-  markSold,
-  getLoadedInfo,
-  startFileWatchers,
-  appendInventory,
-  reclaimExpiredOffers,
-  scanHotWalletAndCollect
-} from './bazaar-store.js';
 
 const { Pool } = pkg;
 const app = Fastify({ logger: true });
@@ -49,10 +31,10 @@ const REWARD_SCALE    = Number.isFinite(Number(process.env.REWARD_SCALE))
   ? Number(process.env.REWARD_SCALE)
   : ECON_SCALE_ENV;
 
-// XRPL config for Bazaar
+// XRPL config (hot-bazaar)
 const XRPL_WSS = process.env.XRPL_WSS || process.env.NETWORK || 'wss://xrplcluster.com';
-const HOT_WALLET_SEED = process.env.HOT_WALLET_SEED || process.env.HOT_SEED || ''; // secp seed for rJz…
-const OFFER_TTL_SEC = Number(process.env.BAZAAR_OFFER_TTL_SEC || 900); // 15 min
+const HOT_WALLET_SEED = process.env.HOT_WALLET_SEED || process.env.HOT_SEED || ''; // secp256k1 seed for rJz…
+const OFFER_TTL_SEC = Number(process.env.BAZAAR_OFFER_TTL_SEC || 900); // 15m
 const ISSUER_ADDR = process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || null;
 
 const xrpl = {
@@ -60,9 +42,7 @@ const xrpl = {
   wallet: HOT_WALLET_SEED ? XRPLWallet.fromSeed(HOT_WALLET_SEED) : null
 };
 
-// Bazaar feature/env
 const BAZAAR_ENABLED = (process.env.BAZAAR_ENABLED || 'true').toLowerCase() !== 'false';
-const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 await app.register(cors, {
   origin: (origin, cb) => { if (!origin) return cb(null, true); cb(null, ALLOW.includes(origin)); },
@@ -104,7 +84,9 @@ const OPEN_ROUTES = [
   '/session/verify',
   '/config',
   '/healthz',
-  '/bazaar/skus'
+  // NEW: hot-bazaar public reads
+  '/bazaar/hot/list',
+  '/bazaar/hot/ping'
 ];
 
 app.addHook('onRequest', async (req, reply) => {
@@ -192,54 +174,6 @@ async function ensureXRPL() {
   if (!xrpl.wallet) throw new Error('hot_wallet_missing');
   if (!xrpl.client.isConnected()) await xrpl.client.connect();
 }
-async function createDirectedSellOffer({ nftoken_id, buyer, amountDrops }) {
-  await ensureXRPL();
-  const tx = {
-    TransactionType: 'NFTokenCreateOffer',
-    Account: xrpl.wallet.address,
-    NFTokenID: nftoken_id,
-    Amount: String(amountDrops ?? 0), // drops, "0" allowed
-    Flags: 1,                         // tfSellNFToken
-    Destination: buyer,
-    Expiration: rippleEpoch(Math.floor(Date.now()/1000) + OFFER_TTL_SEC)
-  };
-  const prepared = await xrpl.client.autofill(tx);
-  const signed = xrpl.wallet.sign(prepared);
-  const sub = await xrpl.client.submitAndWait(signed.tx_blob, { failHard:false });
-  const r = sub?.result;
-  if ((r?.engine_result || r?.meta?.TransactionResult) !== 'tesSUCCESS') {
-    const detail = r?.engine_result || r?.meta?.TransactionResult || 'unknown';
-    throw new Error(`xrpl_offer_failed:${detail}`);
-  }
-  const nodes = r?.meta?.AffectedNodes || [];
-  for (const n of nodes) {
-    const cn = n.CreatedNode;
-    if (cn && cn.LedgerEntryType === 'NFTokenOffer') {
-      return cn.LedgerIndex || cn.NewFields?.OfferID || cn.LedgerIndexHex || null;
-    }
-  }
-  throw new Error('offer_id_parse_failed');
-}
-
-// ---------- initial Bazaar JSON load + automation ----------
-if (BAZAAR_ENABLED) {
-  try {
-    const info = await loadBazaarFromFiles();
-    app.log.info({ info }, '[Bazaar] JSON loaded');
-  } catch (e) {
-    app.log.error(e, '[Bazaar] Failed to load JSON');
-  }
-  // auto-reload when JSON files change
-  startFileWatchers((msg)=>app.log.info(msg));
-
-  // simple janitor: reclaim stale offers every 5 minutes (older than 15m)
-  setInterval(() => {
-    try {
-      const n = reclaimExpiredOffers(15*60*1000);
-      if (n>0) app.log.info(`[Bazaar] Reclaimed ${n} stale offers`);
-    } catch {}
-  }, 5*60*1000);
-}
 
 // ---------------- config ----------------
 app.get('/config', async (_req, reply) => {
@@ -314,7 +248,7 @@ async function verifyOrFinish(req, reply) {
 }
 
 app.post('/session/verify', verifyOrFinish);
-app.post('/session/finish', verifyOrFinish); // alias for client helper that calls /finish
+app.post('/session/finish', verifyOrFinish); // alias for client helper
 
 // ---------------- profile + battles ----------------
 app.get('/profile', async (req, reply) => {
@@ -410,7 +344,7 @@ app.post('/claim/start', async (req, reply) => {
   const COOL = Number(process.env.CLAIM_COOLDOWN_SEC || 300);
   if (COOL>0 && (nowS-lastS)<COOL) return reply.code(429).send({ error:'cooldown' });
 
-  // Atomic debit (no cooldown set yet)
+  // Atomic debit
   const debit = await pool.query(
 `update player_profiles
    set jet_fuel = jet_fuel - $2,
@@ -423,9 +357,8 @@ app.post('/claim/start', async (req, reply) => {
   if (debit.rows.length === 0) return reply.code(400).send({ error:'insufficient_funds' });
 
   try {
-    // You already have claim.sendIssued wired in your real codebase:
-    // const sent = await claim.sendIssued({ to:req.wallet, amount: amt });
-    const sent = { txid: null, txJSON: null }; // placeholder, keep your original call
+    // Plug your real issuer send here:
+    const sent = { txid: null, txJSON: null };
 
     await pool.query(`update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1`, [req.wallet]);
     await pool.query(`insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`, [req.wallet, amt, sent?.txid||null]).catch(()=>{});
@@ -445,164 +378,39 @@ app.post('/claim/start', async (req, reply) => {
   }
 });
 
-// ---------- Bazaar (public read, server-purchased) ----------
-app.get('/bazaar/skus', async (_req, reply) => {
-  if (!BAZAAR_ENABLED) return reply.send({ skus: [] });
-  try {
-    const list = getLiveSkus();
-    reply.send({ skus: list });
-  } catch (e) {
-    reply.send({ skus: [] });
-  }
-});
-
-app.get('/bazaar/sku/:id', async (req, reply) => {
-  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
-  const s = getSku(req.params.id);
-  if (!s || !s.active) return reply.code(404).send({ error:'not_found' });
-  const live = getLiveSkus().find(x => x.sku === s.sku);
-  reply.send({ sku: { ...s, available: live?.available ?? 0 } });
-});
-
-// Purchase = JWT + JFUEL hold + directed sell offer (uses inventory reservation)
-// (Chain-scan routes are mounted separately via plugin; this path stays green.)
-app.post('/bazaar/purchase', async (req, reply) => {
-  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
-  const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
-
-  try {
-    const buyer = req.wallet;
-    const { sku } = req.body || {};
-    const s = getSku(sku);
-    if (!s || !s.active) return reply.code(400).send({ error:'invalid_sku' });
-
-    // 1) Reserve one inventory item (transitions to offered_to_wallet)
-    const stock = reserveOneFromInventory(sku);
-    if (!stock) return reply.code(409).send({ error:'sold_out' });
-
-    // 2) Atomic JetFuel debit (server-side)
-    if ((s.priceJetFuel|0) > 0) {
-      const debit = await pool.query(
-        `update player_profiles
-            set jet_fuel = jet_fuel - $2,
-                updated_at = now()
-          where wallet = $1
-            and jet_fuel >= $2
-        returning *`,
-        [buyer, s.priceJetFuel|0]
-      );
-      if (debit.rows.length === 0) {
-        // revert reservation on failure
-        stock.status = 'minted_stock';
-        return reply.code(402).send({ error:'insufficient_funds' });
-      }
-    }
-
-    // 3) Directed SellOffer (player pays accept fee + tiny XRP price)
-    const sellOfferId = await createDirectedSellOffer({
-      nftoken_id: stock.nftoken_id,
-      buyer,
-      amountDrops: s.priceXrpDrops|0
-    });
-
-    // 4) Return details; client will AcceptOffer then call /bazaar/settle
-    const orderId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    reply.send({ ok:true, orderId, sellOfferId, nftokenId: stock.nftoken_id, inventoryId: stock.id });
-  } catch (e) {
-    const msg = String(e?.message || '');
-    if (msg.startsWith('xrpl_offer_failed')) return reply.code(500).send({ error:'xrpl_offer_failed', detail: msg.split(':')[1]||'unknown' });
-    if (msg.includes('hot_wallet_missing')) return reply.code(500).send({ error:'server_hot_wallet_missing' });
-    return reply.code(500).send({ error:'server_error' });
-  }
-});
-
-// Settle = finalize JetFuel debit and markSold
-app.post('/bazaar/settle', async (req, reply) => {
-  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
-  const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
-
-  const { offerId, inventoryId } = req.body || {};
-  if (inventoryId != null) markSold(inventoryId);
-  reply.send({ ok:true });
-});
-
-// --- Admin: hot-reload bazaar JSON (safe; requires ADMIN_KEY) ---
-app.post('/admin/bazaar/reload', async (req, reply) => {
-  const key = req.headers['x-admin-key'] || '';
-  if (!ADMIN_KEY || key !== ADMIN_KEY) return reply.code(401).send({ error:'unauthorized' });
-  try{
-    const info = await loadBazaarFromFiles();
-    reply.send({ ok:true, info });
-  }catch(e){
-    reply.code(500).send({ error:'reload_failed', detail:String(e.message||e) });
-  }
-});
-app.get('/admin/bazaar/status', async (_req, reply) => {
-  const info = getLoadedInfo();
-  reply.send({ ok:true, info });
-});
-
-// --- Admin: append inventory (paste NFTokenIDs) ---
-app.post('/admin/bazaar/inventory/append', async (req, reply) => {
-  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
-  const key = req.headers['x-admin-key'] || '';
-  if (!ADMIN_KEY || key !== ADMIN_KEY) return reply.code(401).send({ error:'unauthorized' });
-
-  const { items } = req.body || {};
-  if (!Array.isArray(items) || !items.length) return reply.code(400).send({ error:'bad_request' });
-
-  try{
-    const res = await appendInventory(items); // items: [{ sku, nftoken_id, status? }]
-    reply.send({ ok:true, ...res });
-  }catch(e){
-    reply.code(400).send({ error:'append_failed', detail:String(e.message||e) });
-  }
-});
-
-// --- Admin: scan hot wallet & auto-ingest by SKU ---
-app.post('/admin/bazaar/scan-hotwallet', async (req, reply) => {
-  if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
-  const key = req.headers['x-admin-key'] || '';
-  if (!ADMIN_KEY || key !== ADMIN_KEY) return reply.code(401).send({ error:'unauthorized' });
-
-  const { sku, uriPrefix } = req.body || {};
-  if (!sku) return reply.code(400).send({ error:'bad_request' });
-
-  try{
-    const owner = xrpl.wallet?.address;
-    if (!owner) return reply.code(500).send({ error:'server_hot_wallet_missing' });
-
-    const res = await scanHotWalletAndCollect({ xrplClient: xrpl.client, owner, sku, uriPrefix });
-    reply.send({ ok:true, ...res });
-  }catch(e){
-    reply.code(400).send({ error:'scan_failed', detail:String(e.message||e) });
-  }
-});
-
-// —— ADD: mount chain-scan routes at /bazaar/chain/* (keeps existing paths green) ——
+// ---------- Hot-wallet Bazaar (ONLY) ----------
 if (BAZAAR_ENABLED) {
-  app.register(bazaarRoutes, { prefix: '/bazaar' });
-  app.log.info('[Bazaar] chain-scan enabled at /bazaar/chain/*');
+  await registerBazaarHotRoutes(app, {
+    prefix: '/bazaar/hot',
+    xrplClient: xrpl.client,
+    xrplWallet: xrpl.wallet,
+    issuer: ISSUER_ADDR,
+    offerTtlSec: OFFER_TTL_SEC,
+    // optional hints for defaults in plugin
+    upgradeTaxon: Number(process.env.UPGRADE_TAXON || 201),
+    defaultPrices: {
+      jf: Number(process.env.PRICE_DEFAULT_JFUEL || 0),
+      xrpDrops: Number(process.env.PRICE_DEFAULT_XRP_DROPS || 0)
+    }
+  });
 }
 
 // ---------------- /healthz ----------------
 app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
 
-// —— ADD: onReady hook to ensure XRPL is connected before serving chain-scan ——
+// Ensure XRPL is connected at boot so first offer creation is fast
 app.addHook('onReady', async () => {
   try {
-    if (BAZAAR_ENABLED) {
-      if (xrpl.wallet && !xrpl.client.isConnected()) {
-        await xrpl.client.connect();
-      }
-      app.log.info({
-        wss: XRPL_WSS,
-        issuer: ISSUER_ADDR,
-        hot: xrpl.wallet?.address || '(none)'
-      }, '[Bazaar] Ready');
+    if (BAZAAR_ENABLED && xrpl.wallet && !xrpl.client.isConnected()) {
+      await xrpl.client.connect();
     }
+    app.log.info({
+      wss: XRPL_WSS,
+      issuer: ISSUER_ADDR,
+      hot: xrpl.wallet?.address || '(none)'
+    }, '[Boot] Ready');
   } catch (e) {
-    app.log.error(e, '[Bazaar] onReady init failed');
+    app.log.error(e, '[Boot] XRPL init failed');
   }
 });
 
@@ -612,4 +420,3 @@ app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   if (xrpl.wallet) app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address}`);
   else app.log.warn('[XRPL] HOT_WALLET_SEED missing — Bazaar offer creation will fail.');
 });
-
