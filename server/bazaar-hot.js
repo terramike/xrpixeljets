@@ -1,8 +1,19 @@
-// server/bazaar-hot.js — v=2025-11-08-hot-simple
-// Minimal hot-wallet bazaar plugin: POST /bazaar/hot/purchase
-// Notes:
-//  * Lists can be done client-side by scanning HOT wallet; this server only creates SellOffers + debits JFUEL.
-//  * ENV: HOT_SEED (or HOT_WALLET_SEED), ISSUER_ADDR, XRPL_WSS, JWT_SECRET, DATABASE_URL
+// server/bazaar-hot.js — v=2025-11-08-hot-simple+debug2
+// Minimal hot-wallet bazaar plugin + diagnostics
+// - Lists can be client-side by scanning HOT wallet
+// - This server does: verify JWT, atomic JFUEL debit, CreateOffer → client AcceptOffer
+//
+// ENV required:
+//   HOT_SEED (or HOT_WALLET_SEED)  -> secp seed for rJz… hot wallet
+//   ISSUER_ADDR                    -> rfYZ… (Jets issuer; must match NFT metadata properties.issuer)
+//   XRPL_WSS                       -> wss://xrplcluster.com
+//   JWT_SECRET                     -> same one your /session uses
+//   DATABASE_URL                   -> same DB the game uses (player_profiles.jet_fuel)
+//
+// Optional ENV:
+//   BAZAAR_TAXON                   -> defaults 201
+//   BAZAAR_OFFER_TTL_SEC           -> defaults 900
+
 import jwt from 'jsonwebtoken';
 import pkg from 'pg';
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
@@ -30,6 +41,15 @@ function requireJWT(req, reply){
   try { return jwt.verify(token, JWT_SECRET, { algorithms:['HS256'] }); }
   catch { reply.code(401).send({ error:'unauthorized' }); return null; }
 }
+function needWallet(req, reply){
+  const w = req.headers['x-wallet'];
+  if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)){
+    reply.code(400).send({ error:'missing_or_bad_X-Wallet' });
+    return null;
+  }
+  return w;
+}
+
 function hexToUtf8(h){
   try{
     const hex = String(h||"").replace(/^0x/i,'').trim();
@@ -80,7 +100,23 @@ async function ensureXRPL(){
   if (!HOT_SEED) throw new Error('hot_wallet_missing');
   if (!hotWallet) hotWallet = XRPLWallet.fromSeed(HOT_SEED);
   if (!xrplClient){ xrplClient = new XRPLClient(XRPL_WSS); }
-  if (!xrplClient.isConnected()) await xrplClient.connect();
+  if (!xrplClient.isConnected()){
+    try{ await xrplClient.connect(); }
+    catch(e){ throw new Error(`xrpl_connect_failed:${e?.message||'unknown'}`); }
+  }
+}
+
+async function countNftsOwnedByHot(){
+  await ensureXRPL();
+  let marker=null, n=0;
+  do{
+    const req = { command:'account_nfts', account: hotWallet.address, limit: 400 };
+    if (marker) req.marker = marker;
+    const res = await xrplClient.request(req);
+    marker = res.result.marker;
+    n += (res.result.account_nfts||[]).length;
+  } while(marker);
+  return n;
 }
 
 async function findMatchingNFT({ skuWanted }){
@@ -118,9 +154,24 @@ async function createDirectedSellOffer({ nftoken_id, buyer, amountDrops }){
     Destination: buyer,
     Expiration: rippleEpoch(Math.floor(Date.now()/1000) + OFFER_TTL)
   };
-  const prepared = await xrplClient.autofill(tx);
-  const { tx_blob } = hotWallet.sign(prepared);
-  const sub = await xrplClient.submitAndWait(tx_blob, { failHard:false });
+  let prepared;
+  try{
+    prepared = await xrplClient.autofill(tx);
+  }catch(e){
+    throw new Error(`xrpl_autofill_failed:${e?.data?.error || e?.message || 'unknown'}`);
+  }
+  let tx_blob;
+  try{
+    ({ tx_blob } = hotWallet.sign(prepared));
+  }catch(e){
+    throw new Error(`xrpl_sign_failed:${e?.message||'unknown'}`);
+  }
+  let sub;
+  try{
+    sub = await xrplClient.submitAndWait(tx_blob, { failHard:false });
+  }catch(e){
+    throw new Error(`xrpl_submit_failed:${e?.data?.error || e?.message || 'unknown'}`);
+  }
   const r = sub?.result;
   const ok = (r?.engine_result || r?.meta?.TransactionResult) === 'tesSUCCESS';
   if (!ok) throw new Error(`xrpl_offer_failed:${r?.engine_result || r?.meta?.TransactionResult || 'unknown'}`);
@@ -134,48 +185,126 @@ async function createDirectedSellOffer({ nftoken_id, buyer, amountDrops }){
 }
 
 export async function registerBazaarHotRoutes(app){
-  // Health ping (optional)
-  app.get('/bazaar/hot/ping', async (_req, reply) => reply.send({ ok:true, hot: HOT_SEED? 'configured':'missing' }));
+  // quick health
+  app.get('/bazaar/hot/ping', async (_req, reply) => {
+    reply.send({
+      ok:true,
+      issuer: ISSUER || '(missing)',
+      taxon: TAXON,
+      hotConfigured: !!HOT_SEED
+    });
+  });
 
-  // Purchase directly from HOT inventory by SKU (JWT + X-Wallet required)
-  app.post('/bazaar/hot/purchase', async (req, reply) => {
+  // deep debug (no secrets)
+  app.get('/bazaar/hot/debug', async (_req, reply) => {
     try{
-      const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
-      const buyer = req.wallet;
-      const { sku } = req.body || {};
-      if (!buyer || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(buyer)) return reply.code(400).send({ error:'bad_wallet' });
+      await ensureXRPL();
+      const count = await countNftsOwnedByHot().catch(()=>-1);
+      reply.send({
+        ok:true,
+        wss: XRPL_WSS,
+        hot: hotWallet?.address || '(none)',
+        issuer: ISSUER || '(missing)',
+        taxon: TAXON,
+        xrplConnected: xrplClient?.isConnected() || false,
+        hotNftCount: count
+      });
+    }catch(e){
+      reply.code(500).send({ error:'debug_failed', detail:String(e?.message||e) });
+    }
+  });
+
+  // peek a SKU (helps confirm metadata/issuer/taxon matching)
+  app.get('/bazaar/hot/peek', async (req, reply) => {
+    try{
+      const sku = String(req.query?.sku || '').toUpperCase();
       if (!sku) return reply.code(400).send({ error:'bad_sku' });
+      const m = await findMatchingNFT({ skuWanted: sku });
+      if (!m) return reply.code(404).send({ error:'not_found' });
+      reply.send({
+        ok:true,
+        nftoken_id: m.nf.NFTokenID,
+        price: m.price,
+        name: m.meta?.name || null,
+        uri: hexToUtf8(m.nf.URI||'')
+      });
+    }catch(e){
+      reply.code(500).send({ error:'peek_failed', detail:String(e?.message||e) });
+    }
+  });
 
-      const match = await findMatchingNFT({ skuWanted: String(sku).toUpperCase() });
+  // BUY: JWT + X-Wallet required; does atomic JFUEL debit + creates directed SellOffer
+  app.post('/bazaar/hot/purchase', async (req, reply) => {
+    // validate headers
+    const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
+    const buyer = needWallet(req, reply); if (!buyer) return;
+
+    const { sku } = req.body || {};
+    if (!sku) return reply.code(400).send({ error:'bad_sku' });
+
+    // 1) find item
+    let match;
+    try{
+      match = await findMatchingNFT({ skuWanted: String(sku).toUpperCase() });
       if (!match) return reply.code(409).send({ error:'sold_out' });
+    }catch(e){
+      return reply.code(500).send({ error:'scan_failed', detail:String(e?.message||e) });
+    }
 
-      // Atomic JFUEL debit
-      const needJF = match.price.jf|0;
+    // 2) atomic JFUEL debit
+    const needJF = match.price.jf|0;
+    let debited = false;
+    try{
       if (needJF>0){
-        const debit = await pool.query(
+        const res = await pool.query(
           `update player_profiles
               set jet_fuel = jet_fuel - $2,
                   updated_at = now()
             where wallet = $1
               and jet_fuel >= $2
-           returning *`,
+          returning wallet`,
           [buyer, needJF]
         );
-        if (debit.rows.length===0) return reply.code(402).send({ error:'insufficient_funds' });
+        if (res.rows.length===0) return reply.code(402).send({ error:'insufficient_funds' });
+        debited = true;
       }
+    }catch(e){
+      return reply.code(500).send({ error:'db_debit_failed', detail:String(e?.message||e) });
+    }
 
+    // 3) create offer; on failure refund JFUEL
+    try{
       const sellOfferId = await createDirectedSellOffer({
         nftoken_id: match.nf.NFTokenID,
         buyer,
         amountDrops: match.price.xrpDrops|0
       });
-
-      reply.send({ ok:true, sellOfferId, nftokenId: match.nf.NFTokenID, price: match.price });
+      return reply.send({
+        ok:true,
+        sellOfferId,
+        nftokenId: match.nf.NFTokenID,
+        price: match.price
+      });
     }catch(e){
-      const m = String(e?.message||'');
-      if (m.startsWith('xrpl_offer_failed')) return reply.code(500).send({ error:'xrpl_offer_failed', detail: m.split(':')[1]||'unknown' });
-      if (m.includes('hot_wallet_missing')) return reply.code(500).send({ error:'server_hot_wallet_missing' });
-      reply.code(500).send({ error:'purchase_failed' });
+      // refund if we debited
+      if (debited){
+        try{
+          await pool.query(
+            `update player_profiles
+                set jet_fuel = jet_fuel + $2,
+                    updated_at = now()
+              where wallet = $1`,
+            [buyer, needJF]
+          );
+        }catch{}
+      }
+      const msg = String(e?.message||'');
+      if (msg.startsWith('xrpl_connect_failed')) return reply.code(502).send({ error:'xrpl_connect_failed' });
+      if (msg.startsWith('xrpl_autofill_failed')) return reply.code(502).send({ error:'xrpl_autofill_failed' });
+      if (msg.startsWith('xrpl_sign_failed'))     return reply.code(502).send({ error:'xrpl_sign_failed' });
+      if (msg.startsWith('xrpl_submit_failed'))   return reply.code(502).send({ error:'xrpl_submit_failed' });
+      if (msg.startsWith('xrpl_offer_failed'))    return reply.code(502).send({ error:'xrpl_offer_failed', detail: msg.split(':')[1]||'unknown' });
+      return reply.code(500).send({ error:'purchase_failed', detail: msg });
     }
   });
 }
