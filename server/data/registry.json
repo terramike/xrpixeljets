@@ -5,52 +5,32 @@
   },
   "skus": [
     {
-      "sku": "BAZ-ATTACK-V1",
-      "active": true,
-      "name": "XRPixel Bazaar ATTACK +1",
-      "image": "ipfs://REPLACE_ATTACK_IMAGE_CID",
+  "chainSkus": {
+    "BAZ-ATTACK-V1": {
+      "uriPrefixes": ["ipfs://QmATTACK_META_1", "ipfs://QmATTACK_META_2"],
       "issuer": "rfYZ17wwhA4Be23fw8zthVmQQnrcdDRi52",
       "taxon": 201,
-      "hotWallet": "rJz7ooSyXQKEiS5dSucEyjxz5t6Ewded6n",
-      "kind": "attack",
-      "stackable": true,
-      "previewBonuses": ["+1 ATTACK"],
-      "priceJetFuel": 15000,
-      "priceXrpDrops": 250000,
-      "uriPrefix": "",
-      "inventory": []
+      "jf": 15000,
+      "xrpDrops": 250000
     },
-    {
-      "sku": "BAZ-DEFENSE-V1",
-      "active": true,
-      "name": "XRPixel Bazaar DEFENSE +1",
-      "image": "ipfs://bafybeih4ciqlwh2mt64eql7q2dfwb3iwxbmshe6lzubnhxrhfz2iljy2pu",
+    "BAZ-SPEED-V1": {
+      "uriPrefixes": ["ipfs://QmSPEED_META_1"],
       "issuer": "rfYZ17wwhA4Be23fw8zthVmQQnrcdDRi52",
       "taxon": 201,
-      "hotWallet": "rJz7ooSyXQKEiS5dSucEyjxz5t6Ewded6n",
-      "kind": "defense",
-      "stackable": true,
-      "previewBonuses": ["+1 DEFENSE"],
-      "priceJetFuel": 15000,
-      "priceXrpDrops": 250000,
-      "uriPrefix": "",
-      "inventory": []
+      "jf": 15000,
+      "xrpDrops": 250000
     },
-    {
-      "sku": "BAZ-SPEED-V1",
-      "active": true,
-      "name": "XRPixel Bazaar SPEED +1",
-      "image": "ipfs://REPLACE_SPEED_IMAGE_CID",
+    "BAZ-DEFENSE-V1": {
+      "uriPrefixes": [
+        "ipfs://QmQ14Df2RHCanzf5Eaf53PsmmiLkywmMEShDMmVYSNSP6a",
+        "ipfs://QmRYfhz8P5j8Xrne96byojdzZ9msoXsfajDEyoHYBSdiGa"
+      ],
       "issuer": "rfYZ17wwhA4Be23fw8zthVmQQnrcdDRi52",
       "taxon": 201,
-      "hotWallet": "rJz7ooSyXQKEiS5dSucEyjxz5t6Ewded6n",
-      "kind": "speed",
-      "stackable": true,
-      "previewBonuses": ["+1 SPEED"],
-      "priceJetFuel": 15000,
-      "priceXrpDrops": 250000,
-      "uriPrefix": "",
-      "inventory": []
+      "jf": 15000,
+      "xrpDrops": 250000
     }
+  }
+}
   ]
 }
