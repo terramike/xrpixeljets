@@ -76,7 +76,7 @@ const RATE = { windowMs: 10_000, maxPerWindow: 30 };
 const bucket = new Map();
 
 // ===== allowlist for requests w/o X-Wallet header =====
-// ADDED: '/bazaar/hot/list' so the UI can fetch inventory without headers.
+// allowlist for requests w/o X-Wallet header
 const OPEN_ROUTES = [
   '/session/start',
   '/session/finish',
@@ -84,7 +84,14 @@ const OPEN_ROUTES = [
   '/config',
   '/healthz',
   '/bazaar/skus',
-  '/bazaar/hot/list'
+
+  // HOT bazaar: public diagnostics & listing
+  '/bazaar/hot/ping',
+  '/bazaar/hot/debug',
+  '/bazaar/hot/peek',
+  '/bazaar/hot/list',
+  '/bazaar/hot/wallet',
+  '/bazaar/hot/check-account'
 ];
 
 app.addHook('onRequest', async (req, reply) => {
@@ -406,3 +413,4 @@ app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   if (xrpl.wallet) app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address}`);
   else app.log.warn('[XRPL] HOT_WALLET_SEED missing — Bazaar offer creation will fail.');
 });
+
