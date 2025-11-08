@@ -1,5 +1,6 @@
-// index.js — XRPixel Jets API (2025-11-08-bazaarfix2)
+// index.js — XRPixel Jets API (2025-11-08-bazaarfix3)
 // Base: your 2025-11-06 build + JWT auth + directed SellOffer purchase + hot-wallet scan/ingest
+// Adds: chain-scan Bazaar plugin registration (/bazaar/chain/*) and onReady XRPL init
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -11,6 +12,9 @@ import { decode, encodeForSigning } from 'ripple-binary-codec';
 
 // XRPL (for Bazaar offers)
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
+
+// —— ADD: chain-scan bazaar plugin ——
+import bazaarRoutes from './bazaar-routes.js';
 
 // Bazaar JSON store (with automation helpers)
 import {
@@ -458,7 +462,7 @@ app.get('/bazaar/sku/:id', async (req, reply) => {
 });
 
 // Purchase = JWT + JFUEL hold + directed sell offer (uses inventory reservation)
-// (We'll wire chain-scan route next without breaking this path.)
+// (Chain-scan routes are mounted separately via plugin; this path stays green.)
 app.post('/bazaar/purchase', async (req, reply) => {
   if (!BAZAAR_ENABLED) return reply.code(404).send({ error:'not_found' });
   const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
@@ -572,8 +576,32 @@ app.post('/admin/bazaar/scan-hotwallet', async (req, reply) => {
   }
 });
 
+// —— ADD: mount chain-scan routes at /bazaar/chain/* (keeps existing paths green) ——
+if (BAZAAR_ENABLED) {
+  app.register(bazaarRoutes, { prefix: '/bazaar' });
+  app.log.info('[Bazaar] chain-scan enabled at /bazaar/chain/*');
+}
+
 // ---------------- /healthz ----------------
 app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
+
+// —— ADD: onReady hook to ensure XRPL is connected before serving chain-scan ——
+app.addHook('onReady', async () => {
+  try {
+    if (BAZAAR_ENABLED) {
+      if (xrpl.wallet && !xrpl.client.isConnected()) {
+        await xrpl.client.connect();
+      }
+      app.log.info({
+        wss: XRPL_WSS,
+        issuer: ISSUER_ADDR,
+        hot: xrpl.wallet?.address || '(none)'
+      }, '[Bazaar] Ready');
+    }
+  } catch (e) {
+    app.log.error(e, '[Bazaar] onReady init failed');
+  }
+});
 
 // Startup
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
