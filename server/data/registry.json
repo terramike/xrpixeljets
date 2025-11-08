@@ -3,8 +3,6 @@
     "version": "2025-11-07-reg-v1",
     "notes": "XRPixel Bazaar canonical SKUs; inventory is populated by /admin/bazaar/scan-hotwallet"
   },
-  "skus": [
-    {
   "chainSkus": {
     "BAZ-ATTACK-V1": {
       "uriPrefixes": ["ipfs://QmATTACK_META_1", "ipfs://QmATTACK_META_2"],
@@ -31,6 +29,4 @@
       "xrpDrops": 250000
     }
   }
-}
-  ]
 }
