@@ -12,6 +12,9 @@ import { decode, encodeForSigning } from 'ripple-binary-codec';
 
 // XRPL (for Bazaar offers)
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
+import { registerBazaarHotRoutes } from './bazaar-hot.js';
+// ...
+await registerBazaarHotRoutes(app);
 
 // —— ADD: chain-scan bazaar plugin ——
 import bazaarRoutes from './bazaar-routes.js';
@@ -609,3 +612,4 @@ app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   if (xrpl.wallet) app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address}`);
   else app.log.warn('[XRPL] HOT_WALLET_SEED missing — Bazaar offer creation will fail.');
 });
+
