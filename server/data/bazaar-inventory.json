@@ -1,14 +1,3 @@
 {
-  "items": [
-    {
-      "id": "inv-DEF-001",            
-      "sku": "BAZ-DEFENSE-V1",
-      "nftoken_id": "0008...NFT_ID...",  
-      "uri": "ipfs://Qm...metadata_cid", 
-      "owner": "rJz7ooSyXQKEiS5dSucEyjxz5t6Ewded6n", 
-      "status": "available",             
-      "addedAt": 1731000000              
-    }
-  ]
+  "items": []
 }
-
