@@ -1,13 +1,14 @@
 {
   "items": [
     {
-      "id": "inv-DEF-001",              // any unique id you like
+      "id": "inv-DEF-001",            
       "sku": "BAZ-DEFENSE-V1",
-      "nftoken_id": "0008...NFT_ID...",  // exact NFTokenID on XRPL
-      "uri": "ipfs://Qm...metadata_cid", // NFT metadata URI (pinata/ipfs)
-      "owner": "rJz7ooSyXQKEiS5dSucEyjxz5t6Ewded6n", // hot wallet
-      "status": "available",             // available | reserved | sold | expired
-      "addedAt": 1731000000              // (optional) unix seconds
+      "nftoken_id": "0008...NFT_ID...",  
+      "uri": "ipfs://Qm...metadata_cid", 
+      "owner": "rJz7ooSyXQKEiS5dSucEyjxz5t6Ewded6n", 
+      "status": "available",             
+      "addedAt": 1731000000              
     }
   ]
 }
+
