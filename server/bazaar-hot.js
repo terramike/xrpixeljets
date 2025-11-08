@@ -7,7 +7,6 @@
 // Optional: UPGRADE_TAXON=201, PRICE_DEFAULT_JFUEL=15000, PRICE_DEFAULT_XRP_DROPS=250000
 
 import { Client as XRPLClient, Wallet as XRPLWallet } from "xrpl";
-import fetch from "node-fetch";
 
 const XRPL_WSS  = process.env.XRPL_WSS || "wss://xrplcluster.com";
 const HOT_SEED  = process.env.HOT_SEED || process.env.HOT_WALLET_SEED || "";
