@@ -1,6 +1,5 @@
-// server/index.js — XRPixel Jets API (2025-11-09 hot-algo + open-check)
-// Green routes kept intact. Adds HOT_ALGO-aware readiness wallet and opens /bazaar/hot/check.
-
+// server/index.js — XRPixel Jets API (2025-11-09 hot-live r2)
+// Keeps green routes intact. CORS-first. Opens /bazaar/hot/* (incl. /live).
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import pkg from 'pg';
@@ -27,10 +26,10 @@ const REWARD_SCALE    = Number.isFinite(Number(process.env.REWARD_SCALE))
   ? Number(process.env.REWARD_SCALE)
   : ECON_SCALE_ENV;
 
-// ===== XRPL (for readiness logs; Bazaar-Hot uses its own client) =====
-const XRPL_WSS = process.env.XRPL_WSS || process.env.NETWORK || 'wss://xrplcluster.com';
-const HOT_SEED = process.env.HOT_SEED || process.env.HOT_WALLET_SEED || ''; // we prefer HOT_SEED; HOT_WALLET_SEED only for legacy
-const HOT_ALGO = (process.env.HOT_ALGO || 'secp').toLowerCase();             // 'secp' | 'ed' (default secp)
+// ===== XRPL (for logs; Bazaar-Hot uses its own client) =====
+const XRPL_WSS = process.env.XRPL_WSS || 'wss://xrplcluster.com';
+const HOT_SEED = process.env.HOT_SEED || process.env.HOT_WALLET_SEED || '';
+const HOT_ALGO = (process.env.HOT_ALGO || 'secp').toLowerCase(); // 'secp' | 'ed'
 const algoOpt  = HOT_ALGO === 'ed' ? { algorithm:'ed25519' } : { algorithm:'secp256k1' };
 
 const ISSUER_ADDR = process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || null;
@@ -44,6 +43,7 @@ const xrpl = {
 const BAZAAR_ENABLED = (process.env.BAZAAR_ENABLED || 'true').toLowerCase() !== 'false';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
+// ---------- CORS FIRST ----------
 await app.register(cors, {
   origin: (origin, cb) => { if (!origin) return cb(null, true); cb(null, ALLOW.includes(origin)); },
   methods: ['GET','POST','OPTIONS'],
@@ -71,7 +71,6 @@ const nowSec = () => Math.floor(Date.now()/1000);
 const asciiToHex = (s) => Buffer.from(String(s),'utf8').toString('hex').toUpperCase();
 const isSecpPublicKeyHex   = (pk) => typeof pk==='string' && /^(02|03)[0-9A-Fa-f]{64}$/.test(pk);
 const isEd25519PublicKeyHex= (pk) => typeof pk==='string' && /^ED[0-9A-Fa-f]{64}$/.test(pk);
-const rippleEpoch = (unix) => unix - 946684800;
 
 // simple rate-limit (per IP + wallet)
 const RATE = { windowMs: 10_000, maxPerWindow: 30 };
@@ -85,14 +84,10 @@ const OPEN_ROUTES = [
   '/config',
   '/healthz',
   '/bazaar/skus',
-
   // HOT bazaar: public diagnostics & listing
   '/bazaar/hot/ping',
-  '/bazaar/hot/debug',
-  '/bazaar/hot/peek',
-  '/bazaar/hot/list',
-  '/bazaar/hot/wallet',
-  '/bazaar/hot/check' // <- make sure the real check route is open
+  '/bazaar/hot/check',
+  '/bazaar/hot/live'
 ];
 
 app.addHook('onRequest', async (req, reply) => {
@@ -231,8 +226,7 @@ async function verifyOrFinish(req, reply) {
       if (derived !== address) return reply.code(401).send({ error:'unauthorized' });
 
       return reply.send({ ok:true, jwt: signJWT(address, scope) });
-    } catch (e) {
-      req.log.error({ err:e }, 'wc_txproof_verify_failed');
+    } catch {
       return reply.code(400).send({ error:'bad_tx_proof' });
     }
   }
@@ -252,11 +246,10 @@ async function verifyOrFinish(req, reply) {
 
   reply.send({ ok:true, jwt: signJWT(address, scope) });
 }
-
 app.post('/session/verify', verifyOrFinish);
 app.post('/session/finish', verifyOrFinish); // alias
 
-// ---------------- profile + battles ----------------
+// ---------------- profile + battles (green) ----------------
 app.get('/profile', async (req, reply) => {
   await ensureProfile(req.wallet);
   const rowR = await regenEnergyIfDue(req.wallet);
@@ -265,6 +258,8 @@ app.get('/profile', async (req, reply) => {
   reply.send(toClient(row));
 });
 
+// costs/upgrade/battle remain unchanged… (keep your working implementations here)
+// [BEGIN keep-green block]
 function getEconScaleFrom(arg){ const n=Number(arg); return (Number.isFinite(n)&&n>=0) ? n : ECON_SCALE_ENV; }
 function levelsFromRow(row){
   const lv=row?.ms_level||{};
@@ -273,7 +268,6 @@ function levelsFromRow(row){
 function unitCost(level,s){ const raw=BASE_PER_LEVEL*(toInt(level,0)+1); return Math.max(1, Math.round(raw*s)); }
 function calcCosts(levels,s){ return { health:unitCost(levels.health,s), energyCap:unitCost(levels.energyCap,s), regenPerMin:unitCost(levels.regenPerMin,s), hit:unitCost(levels.hit,s), crit:unitCost(levels.crit,s), dodge:unitCost(levels.dodge,s) }; }
 function missionReward(l){ const level = Math.max(1, Number(l) || 1); const base = level<=5 ? [0,100,150,200,250,300][level] : Math.round(300*Math.pow(1.01, level-5)); const reward=Math.round(base*REWARD_SCALE); const cap=Math.max(1,Math.round(10000*REWARD_SCALE)); return Math.max(1,Math.min(cap,reward)); }
-
 app.get('/ms/costs', async (req, reply) => {
   const scale = getEconScaleFrom(req.query?.econScale);
   const row = await getProfileRaw(req.wallet);
@@ -281,14 +275,12 @@ app.get('/ms/costs', async (req, reply) => {
   const levels = levelsFromRow(row);
   reply.send({ costs: calcCosts(levels, scale), levels, scale });
 });
-
 app.post('/ms/upgrade', async (req, reply) => {
   const q = req.body || {}; const scale = getEconScaleFrom(q.econScale);
   let row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
   const levels = levelsFromRow(row);
   const order=['health','energyCap','regenPerMin','hit','crit','dodge'];
   let jf=row.jet_fuel|0; const applied={health:0,energyCap:0,regenPerMin:0,hit:0,crit:0,dodge:0}; let spent=0;
-
   for (const key of order) {
     const want = Math.max(0, toInt(q[key],0));
     for(let i=0;i<want;i++){
@@ -309,7 +301,6 @@ app.post('/ms/upgrade', async (req, reply) => {
   );
   reply.send({ ok:true, applied, spent, profile: toClient(rows[0]), scale });
 });
-
 app.post('/battle/start', async (req, reply) => {
   const level = toInt((req.body||{}).level, 1);
   let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
@@ -318,7 +309,6 @@ app.post('/battle/start', async (req, reply) => {
   const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [req.wallet, energy]);
   reply.send({ ok:true, level, spent, profile: toClient(rows[0]) });
 });
-
 app.post('/battle/turn', async (req, reply) => {
   let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error:'not_found' });
@@ -326,7 +316,6 @@ app.post('/battle/turn', async (req, reply) => {
   const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [req.wallet, energy]);
   reply.send({ ok:true, spent, profile: toClient(rows[0]) });
 });
-
 app.post('/battle/finish', async (req, reply) => {
   const lvl=Math.max(1, toInt((req.body||{}).level,1)); const victory=!!(req.body||{}).victory;
   let row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
@@ -335,14 +324,13 @@ app.post('/battle/finish', async (req, reply) => {
   const { rows } = await pool.query(`update player_profiles set jet_fuel=$2, unlocked_level=$3, updated_at=now() where wallet=$1 returning *`, [req.wallet, jf, unlocked]);
   reply.send({ ok:true, reward, victory, level:lvl, profile: toClient(rows[0]) });
 });
+// [END keep-green block]
 
-// ---------- claim ----------
+// ---------- claim (kept) ----------
 app.post('/claim/start', async (req, reply) => {
   const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
-
   const amt = toInt(req.body?.amount, 0);
   if (!Number.isFinite(amt) || amt <= 0) return reply.code(400).send({ error:'bad_amount' });
-
   const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
 
   const nowS = nowSec();
@@ -357,34 +345,22 @@ app.post('/claim/start', async (req, reply) => {
        updated_at = now()
  where wallet = $1
    and jet_fuel >= $2
- returning *`,
-    [req.wallet, amt]
-  );
+ returning *`, [req.wallet, amt]);
   if (debit.rows.length === 0) return reply.code(400).send({ error:'insufficient_funds' });
 
   try {
-    // TODO: wire issued token send here (kept green).
-    const sent = { txid: null, txJSON: null }; // placeholder
-
+    const sent = { txid: null, txJSON: null }; // keep green; no on-ledger send here
     await pool.query(`update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1`, [req.wallet]);
     await pool.query(`insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`, [req.wallet, amt, sent?.txid||null]).catch(()=>{});
-
     const latest = await getProfileRaw(req.wallet);
     return reply.send({ ok:true, txid: sent?.txid || null, txJSON: sent?.txJSON || null, profile: toClient(latest || debit.rows[0]) });
   } catch (e) {
     await pool.query(`update player_profiles set jet_fuel = jet_fuel + $2, updated_at=now() where wallet=$1`, [req.wallet, amt]).catch(()=>{});
-    const msg = String(e?.message||'');
-    if (msg.includes('trustline_required'))         return reply.code(400).send({ error:'trustline_required' });
-    if (msg.includes('issuer_rippling_disabled'))   return reply.code(500).send({ error:'issuer_rippling_disabled' });
-    if (msg.includes('hot_wallet_no_inventory'))    return reply.code(500).send({ error:'server_hot_no_inventory' });
-    if (msg.includes('hot_wallet_needs_trustline')) return reply.code(500).send({ error:'server_hot_needs_trustline' });
-    if (msg.includes('hot_wallet_missing'))         return reply.code(500).send({ error:'server_hot_wallet_missing' });
-    if (msg.includes('issuer_missing'))             return reply.code(500).send({ error:'server_issuer_missing' });
     return reply.code(500).send({ error:'claim_failed' });
   }
 });
 
-// ---------- (Legacy) Bazaar JSON endpoints kept green ----------
+// ---------- legacy bazaar JSON kept no-op ----------
 app.get('/bazaar/skus', async (_req, reply) => reply.send({ skus: [] }));
 
 // ===== Register Bazaar-Hot =====
@@ -396,7 +372,7 @@ if (BAZAAR_ENABLED) {
 // ---------------- /healthz ----------------
 app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
 
-// Ensure XRPL ready (for logs only)
+// Ensure XRPL ready (logs)
 app.addHook('onReady', async () => {
   try {
     if (BAZAAR_ENABLED) {
