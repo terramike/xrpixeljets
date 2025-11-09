@@ -1,6 +1,5 @@
-// index.js — XRPixel Jets API (2025-11-08-bazaarhot-secp-enforced)
-// Green routes kept: /config, /session/*, /profile, /ms/*, /battle/*, /claim/start
-// Adds: /bazaar/hot/* allowlist (ping/check/list are open) + strict secp256k1 policy for hot wallet
+// server/index.js — XRPixel Jets API (2025-11-09 hot-algo + open-check)
+// Green routes kept intact. Adds HOT_ALGO-aware readiness wallet and opens /bazaar/hot/check.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -15,32 +14,40 @@ import { registerBazaarHotRoutes } from './bazaar-hot.js';
 const { Pool } = pkg;
 const app = Fastify({ logger: true });
 
-// ---------- env ----------
 const PORT = Number(process.env.PORT || 10000);
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_only_change_me';
 const ALLOW = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeygo.io,http://localhost:8000')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-const DATABASE_URL = process.env.DATABASE_URL;
-
-const XRPL_WSS = process.env.XRPL_WSS || 'wss://xrplcluster.com';
-const HOT_SEED = process.env.HOT_SEED || process.env.HOT_WALLET_SEED || ''; // REQUIRED (secp)
-const HOT_ADDR = process.env.HOT_ADDR || ''; // optional assert
-const ISSUER_ADDR = process.env.ISSUER_ADDR || process.env.ISSUER_ADDRESS || null;
-
-const BAZAAR_ENABLED = (process.env.BAZAAR_ENABLED || 'true').toLowerCase() !== 'false';
-
-// ---------- econ/game tuning ----------
+// ===== Econ/game tuning =====
 const ECON_SCALE_ENV = Number(process.env.ECON_SCALE || 0.10);
 const BASE_PER_LEVEL  = Number(process.env.BASE_PER_LEVEL || 300);
-const REWARD_SCALE    = Number.isFinite(Number(process.env.REWARD_SCALE)) ? Number(process.env.REWARD_SCALE) : ECON_SCALE_ENV;
 const REGEN_STEP      = Number(process.env.REGEN_STEP || 0.1);
+const REWARD_SCALE    = Number.isFinite(Number(process.env.REWARD_SCALE))
+  ? Number(process.env.REWARD_SCALE)
+  : ECON_SCALE_ENV;
 
-// ---------- CORS / error handler ----------
+// ===== XRPL (for readiness logs; Bazaar-Hot uses its own client) =====
+const XRPL_WSS = process.env.XRPL_WSS || process.env.NETWORK || 'wss://xrplcluster.com';
+const HOT_SEED = process.env.HOT_SEED || process.env.HOT_WALLET_SEED || ''; // we prefer HOT_SEED; HOT_WALLET_SEED only for legacy
+const HOT_ALGO = (process.env.HOT_ALGO || 'secp').toLowerCase();             // 'secp' | 'ed' (default secp)
+const algoOpt  = HOT_ALGO === 'ed' ? { algorithm:'ed25519' } : { algorithm:'secp256k1' };
+
+const ISSUER_ADDR = process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || null;
+
+const xrpl = {
+  client: new XRPLClient(XRPL_WSS),
+  wallet: HOT_SEED ? XRPLWallet.fromSeed(HOT_SEED, algoOpt) : null
+};
+
+// Feature flags / secrets
+const BAZAAR_ENABLED = (process.env.BAZAAR_ENABLED || 'true').toLowerCase() !== 'false';
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
 await app.register(cors, {
   origin: (origin, cb) => { if (!origin) return cb(null, true); cb(null, ALLOW.includes(origin)); },
   methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Accept','Origin','X-Wallet','Authorization','X-Idempotency-Key'],
+  allowedHeaders: ['Content-Type','Accept','Origin','X-Wallet','Authorization','X-Idempotency-Key','X-Admin-Key'],
   credentials: false
 });
 app.addHook('onSend', async (req, reply, payload) => {
@@ -51,56 +58,52 @@ app.addHook('onSend', async (req, reply, payload) => {
 app.setErrorHandler((err, req, reply) => {
   const origin = req.headers.origin;
   if (origin && ALLOW.includes(origin)) { reply.header('Access-Control-Allow-Origin', origin); reply.header('Vary', 'Origin'); }
-  const code = Number.isFinite(err.statusCode) ? err.statusCode : 500;
+  const code = err.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
   req.log.error({ err }, 'request_error');
   reply.code(code).send({ error: 'internal_error' });
 });
 
-// ---------- DB ----------
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false }
-});
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 // ---------- utils ----------
 const toInt  = (x, d=0) => { const n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : d; };
 const nowSec = () => Math.floor(Date.now()/1000);
 const asciiToHex = (s) => Buffer.from(String(s),'utf8').toString('hex').toUpperCase();
-const isSecpPK = (pk) => typeof pk==='string' && /^(02|03)[0-9A-F]{64}$/i.test(pk);
-const isEdPK   = (pk) => typeof pk==='string' && /^ED[0-9A-F]{64}$/i.test(pk);
+const isSecpPublicKeyHex   = (pk) => typeof pk==='string' && /^(02|03)[0-9A-Fa-f]{64}$/.test(pk);
+const isEd25519PublicKeyHex= (pk) => typeof pk==='string' && /^ED[0-9A-Fa-f]{64}$/.test(pk);
+const rippleEpoch = (unix) => unix - 946684800;
 
 // simple rate-limit (per IP + wallet)
 const RATE = { windowMs: 10_000, maxPerWindow: 30 };
 const bucket = new Map();
 
-// ---------- OPEN routes (no headers/JWT required) ----------
+// ===== allowlist for requests w/o X-Wallet header =====
 const OPEN_ROUTES = [
+  '/session/start',
+  '/session/finish',
+  '/session/verify',
   '/config',
   '/healthz',
-  '/session/start',
-  '/session/verify',
-  '/session/finish',
   '/bazaar/skus',
-  // Bazaar hot-wallet diagnostics & listing
+
+  // HOT bazaar: public diagnostics & listing
   '/bazaar/hot/ping',
-  '/bazaar/hot/check',
-  '/bazaar/hot/list'
+  '/bazaar/hot/debug',
+  '/bazaar/hot/peek',
+  '/bazaar/hot/list',
+  '/bazaar/hot/wallet',
+  '/bazaar/hot/check' // <- make sure the real check route is open
 ];
 
-// ---------- global guard ----------
 app.addHook('onRequest', async (req, reply) => {
   const url = (req.raw.url || '').split('?')[0];
   if (req.method === 'OPTIONS') return;
-  if (OPEN_ROUTES.some(p => url === p)) return;
+  if (OPEN_ROUTES.some(p => url === p || url.startsWith(p + '/'))) return;
 
-  // X-Wallet header (classic r-addr)
   const w = req.headers['x-wallet'];
-  if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
-    return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
-  }
+  if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) return reply.code(400).send({ error:'missing_or_bad_X-Wallet' });
   req.wallet = w;
 
-  // very light rate limit per IP+wallet
   const key = `${req.ip}|${w}`;
   const now = Date.now();
   const cur = bucket.get(key) || { count: 0, ts: now };
@@ -131,20 +134,11 @@ async function getProfileRaw(wallet){
 function recomputeCurrent(b, lv){
   const base = b || { health:20, energyCap:100, regenPerMin:1 };
   const L    = lv|| { health:0,  energyCap:0,   regenPerMin:0 };
-  return {
-    health:(base.health|0)+(L.health|0),
-    energyCap:(base.energyCap|0)+(L.energyCap|0),
-    regenPerMin:Number(base.regenPerMin||0)+Number(L.regenPerMin||0)*REGEN_STEP
-  };
+  return { health:(base.health|0)+(L.health|0), energyCap:(base.energyCap|0)+(L.energyCap|0), regenPerMin:Number(base.regenPerMin||0)+Number(L.regenPerMin||0)*REGEN_STEP };
 }
 function toClient(row){
   const cur=row.ms_current || recomputeCurrent(row.ms_base,row.ms_level);
-  return {
-    ms:{ base:row.ms_base, level:row.ms_level, current:cur },
-    pct:{ hit:row.ms_hit|0, crit:row.ms_crit|0, dodge:row.ms_dodge|0 },
-    jetFuel:row.jet_fuel|0, energy:row.energy|0, energyCap:row.energy_cap|0,
-    unlockedLevel:row.unlocked_level|0
-  };
+  return { ms:{ base:row.ms_base, level:row.ms_level, current:cur }, pct:{ hit:row.ms_hit|0, crit:row.ms_crit|0, dodge:row.ms_dodge|0 }, jetFuel:row.jet_fuel|0, energy:row.energy|0, energyCap:row.energy_cap|0, unlockedLevel:row.unlocked_level|0 };
 }
 async function regenEnergyIfDue(wallet){
   let row = await getProfileRaw(wallet); if (!row) return null;
@@ -181,23 +175,10 @@ function requireJWT(req, reply){
   catch { reply.code(401).send({ error:'unauthorized' }); return null; }
 }
 
-// ---------- XRPL (logs + secp enforcement for HOT) ----------
-const xrpl = {
-  client: new XRPLClient(XRPL_WSS),
-  wallet: HOT_SEED ? XRPLWallet.fromSeed(HOT_SEED) : null
-};
-function assertHotIsSecpOrWarn() {
-  if (!xrpl.wallet) { app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation will fail.'); return false; }
-  const pub = String(xrpl.wallet.publicKey || '').toUpperCase();
-  if (!isSecpPK(pub)) {
-    app.log.error({ pub }, '[XRPL] secp_required: Hot wallet public key must start with 02/03 (secp256k1). Ed25519 (ED…) is not allowed.');
-    return false;
-  }
-  if (HOT_ADDR && xrpl.wallet.address !== HOT_ADDR) {
-    app.log.error({ expected: HOT_ADDR, derived: xrpl.wallet.address }, '[XRPL] HOT_ADDR mismatch — check HOT_SEED.');
-    return false;
-  }
-  return true;
+// ---------- XRPL helpers for WC tx-proof ----------
+async function ensureXRPL() {
+  if (!xrpl.wallet) throw new Error('hot_wallet_missing');
+  if (!xrpl.client.isConnected()) await xrpl.client.connect();
 }
 
 // ---------------- config ----------------
@@ -228,14 +209,14 @@ async function verifyOrFinish(req, reply) {
   const now = nowSec(); const tsNum = Number(ts || now);
   if (!Number.isFinite(tsNum) || Math.abs(now-tsNum)>300) return reply.code(400).send({ error:'expired_nonce' });
 
-  // WalletConnect tx-proof path (secp only)
+  // WalletConnect tx-proof path
   if (txProof && txProof.tx_blob) {
     try {
       const tx = decode(txProof.tx_blob);
       if (tx.TransactionType !== 'AccountSet') return reply.code(400).send({ error:'bad_tx_type' });
       if (tx.Account !== address) return reply.code(401).send({ error:'unauthorized' });
       const pub = String(tx.SigningPubKey || '').toUpperCase();
-      if (!isSecpPK(pub)) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
+      if (!(pub.startsWith('02') || pub.startsWith('03'))) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
 
       const wantMemo = asciiToHex(`XRPixelJets|${taken.nonce}|${scope}|${tsNum}`);
       const memos = (tx.Memos || []).map(m => (m?.Memo?.MemoData || '').toUpperCase());
@@ -259,13 +240,13 @@ async function verifyOrFinish(req, reply) {
   // Simple signMessage path (secp only)
   if (!signature) return reply.code(400).send({ error:'bad_signature' });
   if (!publicKey) return reply.code(400).send({ error:'bad_key' });
-  const pkU = String(publicKey).toUpperCase();
-  if (!isSecpPK(pkU)) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
+  if (isEd25519PublicKeyHex(publicKey)) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
+  if (!isSecpPublicKeyHex(publicKey)) return reply.code(400).send({ error:'bad_key' });
 
   const expectedHex = payloadHex && payloadHex.length>=8 ? String(payloadHex).toUpperCase()
     : asciiToHex(`${taken.nonce}||${scope}||${tsNum}||${address}`);
   let okSig=false, derived='';
-  try { okSig = keypairs.verify(expectedHex, String(signature).toUpperCase(), pkU)===true; derived = keypairs.deriveAddress(pkU); } catch {}
+  try { okSig = keypairs.verify(expectedHex, String(signature).toUpperCase(), String(publicKey).toUpperCase())===true; derived = keypairs.deriveAddress(publicKey); } catch {}
   if (!okSig) return reply.code(401).send({ error:'bad_signature' });
   if (derived !== address) return reply.code(401).send({ error:'unauthorized' });
 
@@ -275,7 +256,7 @@ async function verifyOrFinish(req, reply) {
 app.post('/session/verify', verifyOrFinish);
 app.post('/session/finish', verifyOrFinish); // alias
 
-// ---------------- profile + missions ----------------
+// ---------------- profile + battles ----------------
 app.get('/profile', async (req, reply) => {
   await ensureProfile(req.wallet);
   const rowR = await regenEnergyIfDue(req.wallet);
@@ -287,31 +268,11 @@ app.get('/profile', async (req, reply) => {
 function getEconScaleFrom(arg){ const n=Number(arg); return (Number.isFinite(n)&&n>=0) ? n : ECON_SCALE_ENV; }
 function levelsFromRow(row){
   const lv=row?.ms_level||{};
-  return {
-    health:toInt(lv.health,0),
-    energyCap:toInt(lv.energyCap,0),
-    regenPerMin:toInt(lv.regenPerMin,0),
-    hit:toInt(row?.ms_hit,0),
-    crit:toInt(row?.ms_crit,10),
-    dodge:toInt(row?.ms_dodge,0)
-  };
+  return { health:toInt(lv.health,0), energyCap:toInt(lv.energyCap,0), regenPerMin:toInt(lv.regenPerMin,0), hit:toInt(row?.ms_hit,0), crit:toInt(row?.ms_crit,10), dodge:toInt(row?.ms_dodge,0) };
 }
 function unitCost(level,s){ const raw=BASE_PER_LEVEL*(toInt(level,0)+1); return Math.max(1, Math.round(raw*s)); }
-function calcCosts(levels,s){ return {
-  health:unitCost(levels.health,s),
-  energyCap:unitCost(levels.energyCap,s),
-  regenPerMin:unitCost(levels.regenPerMin,s),
-  hit:unitCost(levels.hit,s),
-  crit:unitCost(levels.crit,s),
-  dodge:unitCost(levels.dodge,s)
-}; }
-function missionReward(l){
-  const level = Math.max(1, Number(l) || 1);
-  const base = level<=5 ? [0,100,150,200,250,300][level] : Math.round(300*Math.pow(1.01, level-5));
-  const reward=Math.round(base*REWARD_SCALE);
-  const cap=Math.max(1,Math.round(10000*REWARD_SCALE));
-  return Math.max(1,Math.min(cap,reward));
-}
+function calcCosts(levels,s){ return { health:unitCost(levels.health,s), energyCap:unitCost(levels.energyCap,s), regenPerMin:unitCost(levels.regenPerMin,s), hit:unitCost(levels.hit,s), crit:unitCost(levels.crit,s), dodge:unitCost(levels.dodge,s) }; }
+function missionReward(l){ const level = Math.max(1, Number(l) || 1); const base = level<=5 ? [0,100,150,200,250,300][level] : Math.round(300*Math.pow(1.01, level-5)); const reward=Math.round(base*REWARD_SCALE); const cap=Math.max(1,Math.round(10000*REWARD_SCALE)); return Math.max(1,Math.min(cap,reward)); }
 
 app.get('/ms/costs', async (req, reply) => {
   const scale = getEconScaleFrom(req.query?.econScale);
@@ -325,15 +286,14 @@ app.post('/ms/upgrade', async (req, reply) => {
   const q = req.body || {}; const scale = getEconScaleFrom(q.econScale);
   let row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
   const levels = levelsFromRow(row);
-
   const order=['health','energyCap','regenPerMin','hit','crit','dodge'];
   let jf=row.jet_fuel|0; const applied={health:0,energyCap:0,regenPerMin:0,hit:0,crit:0,dodge:0}; let spent=0;
 
   for (const key of order) {
     const want = Math.max(0, toInt(q[key],0));
     for(let i=0;i<want;i++){
-      const lvlNow = (key==='health'||key==='energyCap'||key==='regenPerMin') ? levels[key] : (key==='hit'?levels.hit:(key==='crit'?levels.crit:levels.dodge));
-      const price = Math.max(1, Math.round(BASE_PER_LEVEL*(lvlNow+1)*getEconScaleFrom(scale)));
+      const lvlNow=(key==='health'||key==='energyCap'||key==='regenPerMin')?levels[key]:(key==='hit'?levels.hit:(key==='crit'?levels.crit:levels.dodge));
+      const price=Math.max(1, Math.round(BASE_PER_LEVEL*(lvlNow+1)*getEconScaleFrom(scale)));
       if (jf<price) break;
       jf-=price; spent+=price; applied[key]+=1;
       if (key==='health'||key==='energyCap'||key==='regenPerMin') levels[key]+=1;
@@ -350,7 +310,6 @@ app.post('/ms/upgrade', async (req, reply) => {
   reply.send({ ok:true, applied, spent, profile: toClient(rows[0]), scale });
 });
 
-// ---------------- battle ----------------
 app.post('/battle/start', async (req, reply) => {
   const level = toInt((req.body||{}).level, 1);
   let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
@@ -377,7 +336,7 @@ app.post('/battle/finish', async (req, reply) => {
   reply.send({ ok:true, reward, victory, level:lvl, profile: toClient(rows[0]) });
 });
 
-// ---------------- claim ----------------
+// ---------- claim ----------
 app.post('/claim/start', async (req, reply) => {
   const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
 
@@ -404,8 +363,8 @@ app.post('/claim/start', async (req, reply) => {
   if (debit.rows.length === 0) return reply.code(400).send({ error:'insufficient_funds' });
 
   try {
-    // TODO: send issued JETS on-chain (left intact; green path unchanged)
-    const sent = { txid: null, txJSON: null };
+    // TODO: wire issued token send here (kept green).
+    const sent = { txid: null, txJSON: null }; // placeholder
 
     await pool.query(`update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1`, [req.wallet]);
     await pool.query(`insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`, [req.wallet, amt, sent?.txid||null]).catch(()=>{});
@@ -413,36 +372,45 @@ app.post('/claim/start', async (req, reply) => {
     const latest = await getProfileRaw(req.wallet);
     return reply.send({ ok:true, txid: sent?.txid || null, txJSON: sent?.txJSON || null, profile: toClient(latest || debit.rows[0]) });
   } catch (e) {
-    // rollback debit
     await pool.query(`update player_profiles set jet_fuel = jet_fuel + $2, updated_at=now() where wallet=$1`, [req.wallet, amt]).catch(()=>{});
+    const msg = String(e?.message||'');
+    if (msg.includes('trustline_required'))         return reply.code(400).send({ error:'trustline_required' });
+    if (msg.includes('issuer_rippling_disabled'))   return reply.code(500).send({ error:'issuer_rippling_disabled' });
+    if (msg.includes('hot_wallet_no_inventory'))    return reply.code(500).send({ error:'server_hot_no_inventory' });
+    if (msg.includes('hot_wallet_needs_trustline')) return reply.code(500).send({ error:'server_hot_needs_trustline' });
+    if (msg.includes('hot_wallet_missing'))         return reply.code(500).send({ error:'server_hot_wallet_missing' });
+    if (msg.includes('issuer_missing'))             return reply.code(500).send({ error:'server_issuer_missing' });
     return reply.code(500).send({ error:'claim_failed' });
   }
 });
 
-// ---------------- legacy bazaar (kept green/no-op) ----------------
+// ---------- (Legacy) Bazaar JSON endpoints kept green ----------
 app.get('/bazaar/skus', async (_req, reply) => reply.send({ skus: [] }));
 
-// ---------------- register Bazaar-Hot (preminted inventory) ----------------
+// ===== Register Bazaar-Hot =====
 if (BAZAAR_ENABLED) {
-  await registerBazaarHotRoutes(app); // plugin enforces secp for hot internally too
+  await registerBazaarHotRoutes(app);
   app.log.info('[BazaarHot] routes mounted at /bazaar/hot/*');
 }
 
-// ---------------- health ----------------
+// ---------------- /healthz ----------------
 app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
 
-// ---------------- onReady: XRPL connect + secp assert ----------------
+// Ensure XRPL ready (for logs only)
 app.addHook('onReady', async () => {
   try {
-    const ok = assertHotIsSecpOrWarn(); // loud error if ED key is detected
-    if (ok && !xrpl.client.isConnected()) await xrpl.client.connect();
-    app.log.info({ wss: XRPL_WSS, issuer: ISSUER_ADDR, hot: xrpl.wallet?.address || '(none)' }, '[XRPL] Ready');
+    if (BAZAAR_ENABLED) {
+      if (xrpl.wallet && !xrpl.client.isConnected()) await xrpl.client.connect();
+      app.log.info({ wss: XRPL_WSS, issuer: ISSUER_ADDR, hot: xrpl.wallet?.address || '(none)', hotAlgo: HOT_ALGO }, '[Bazaar] Ready');
+    }
   } catch (e) {
-    app.log.error(e, '[XRPL] onReady init failed');
+    app.log.error(e, '[Bazaar] onReady init failed');
   }
 });
 
-// ---------------- start ----------------
+// Startup
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`XRPixel Jets API listening on :${PORT}`);
+  if (xrpl.wallet) app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
+  else app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation will fail.');
 });
