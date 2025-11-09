@@ -1,59 +1,65 @@
 // server/bazaar-hot.js
-// XRPixel Jets — Hot Wallet Bazaar (SECP-only, self-diagnosing)
-// v=2025-11-08-hot-diagnose3
+// XRPixel Jets — Hot Wallet Bazaar (SECP default, optional ED override for hot only)
+// v=2025-11-08-hot-allow-ed1
 
 import { Client as XRPLClient, Wallet as XRPLWallet } from "xrpl";
 
 // ===== ENV =====
 const XRPL_WSS  = process.env.XRPL_WSS || "wss://xrplcluster.com";
-const HOT_SEED  = process.env.HOT_SEED || process.env.HOT_WALLET_SEED || ""; // REQUIRED (secp256k1 family seed that derives rJz…)
-const HOT_ADDR  = process.env.HOT_ADDR || ""; // OPTIONAL sanity check (should be rJz7oo…)
+const HOT_SEED  = process.env.HOT_SEED || process.env.HOT_WALLET_SEED || "";
+const HOT_ADDR  = process.env.HOT_ADDR || ""; // optional safety: assert derived == this
+const ALLOW_ED_HOT = String(process.env.ALLOW_ED_HOT || "false").toLowerCase() === "true";
+
 const TAXON     = Number(process.env.BAZAAR_TAXON ?? 201);
 const ISSUER    = process.env.ISSUER_ADDR || process.env.ISSUER_ADDRESS || "rfYZ17wwhA4Be23fw8zthVmQQnrcdDRi52";
-const OFFER_TTL_SEC = Number(process.env.BAZAAR_OFFER_TTL_SEC || 15 * 60); // 15 min
+const OFFER_TTL_SEC = Number(process.env.BAZAAR_OFFER_TTL_SEC || 15 * 60);
 
 // ===== XRPL bootstrap =====
+function detectAlgo(pubHex) {
+  const PK = String(pubHex || "").toUpperCase();
+  if (PK.startsWith("02") || PK.startsWith("03")) return "secp256k1";
+  if (PK.startsWith("ED")) return "ed25519";
+  return "unknown";
+}
+
 const xrpl = (() => {
-  let wallet = null;
+  let wallet = null, algo = "unknown", initErr = null;
   try {
     if (!HOT_SEED) throw new Error("HOT_SEED missing");
-    wallet = XRPLWallet.fromSeed(HOT_SEED); // xrpl.js auto-detects family seed type
-    const pk = String(wallet.publicKey || "").toUpperCase();
-    // Ban Ed25519, require compressed secp256k1 (02/03…)
-    if (!pk.startsWith("02") && !pk.startsWith("03")) {
+    wallet = XRPLWallet.fromSeed(HOT_SEED);
+    const pk = String(wallet.publicKey || "");
+    algo = detectAlgo(pk);
+
+    // Default: require SECP for hot wallet; allow ED only if ALLOW_ED_HOT=true
+    if (algo !== "secp256k1" && !ALLOW_ED_HOT) {
       throw new Error("secp_required: public key must start with 02/03; Ed25519 (ED…) is banned");
     }
     if (HOT_ADDR && HOT_ADDR !== wallet.address) {
-      // Hard guard: your known good rJz… must match what we derive from HOT_SEED
       throw new Error(`hot_addr_mismatch: derived=${wallet.address} expected=${HOT_ADDR}`);
     }
   } catch (e) {
-    // defer throwing until a route calls ensureXRPL(), so /ping reports it cleanly
-    wallet = { _bad: String(e && e.message || e) };
+    initErr = String(e && e.message || e);
   }
   return {
     client: new XRPLClient(XRPL_WSS),
-    wallet
+    wallet,
+    algo,
+    initErr
   };
 })();
 
 async function ensureXRPL() {
-  if (!xrpl.wallet || xrpl.wallet._bad) {
-    const why = xrpl.wallet?._bad || "HOT_SEED not configured";
-    const err = new Error(`hot_wallet_init_failed: ${why}`);
+  if (xrpl.initErr) {
+    const err = new Error(`hot_wallet_init_failed: ${xrpl.initErr}`);
     err.code = "hot_wallet_init_failed";
     throw err;
   }
-  if (!xrpl.client.isConnected()) {
-    await xrpl.client.connect();
-  }
+  if (!xrpl.client.isConnected()) await xrpl.client.connect();
 }
 
-function rippleEpoch(unixSeconds) {
-  return unixSeconds - 946684800;
-}
+function rippleEpoch(unixSeconds) { return unixSeconds - 946684800; }
 
-// ===== tiny helpers =====
+// ===== utils =====
 function hexToUtf8(h) {
   try {
     const hex = String(h || "").replace(/^0x/i, "").trim();
@@ -88,7 +94,6 @@ async function fetchMeta(uri) {
   return null;
 }
 
-// ===== metadata → SKU / prices =====
 function skuFromMeta(meta) {
   const explicit = String(meta?.properties?.sku || "").toUpperCase().replace(/[^A-Z0-9_-]/g, "");
   if (explicit) return explicit;
@@ -121,7 +126,7 @@ function deriveBuff(meta) {
   return cand ? `+${Number(atts[cand]) || 1} ${cand.toUpperCase()}` : null;
 }
 
-// ===== on-chain scan =====
+// ===== XRPL helpers =====
 async function accountInfo(addr) {
   await ensureXRPL();
   try {
@@ -152,9 +157,10 @@ async function listHotSkus() {
       const meta = await fetchMeta(uri);
       if (!meta) continue;
       if (String(meta?.properties?.issuer || "") !== ISSUER) continue;
-      const sku = skuFromMeta(meta);
+
       const price = priceFromMeta(meta);
-      const buff = deriveBuff(meta);
+      const sku   = skuFromMeta(meta);
+      const buff  = deriveBuff(meta);
 
       items.push({
         nftoken_id: nf.NFTokenID,
@@ -226,21 +232,19 @@ async function createDirectedSellOffer({ nftoken_id, buyer, amountDrops }) {
     TransactionType: "NFTokenCreateOffer",
     Account: xrpl.wallet.address,
     NFTokenID: nftoken_id,
-    Amount: String(amountDrops ?? 0), // drops; 0 is allowed
-    Flags: 1,                         // tfSellNFToken
+    Amount: String(amountDrops ?? 0),
+    Flags: 1, // tfSellNFToken
     Destination: buyer,
-    Expiration: rippleEpoch(Math.floor(Date.now() / 1000) + OFFER_TTL_SEC)
+    Expiration: rippleEpoch(Math.floor(Date.now()/1000) + OFFER_TTL_SEC)
   };
   const prepared = await xrpl.client.autofill(tx);
-  const signed = xrpl.wallet.sign(prepared);
-  const sub = await xrpl.client.submitAndWait(signed.tx_blob, { failHard: false });
+  const signed   = xrpl.wallet.sign(prepared);
+  const sub      = await xrpl.client.submitAndWait(signed.tx_blob, { failHard:false });
   const r = sub?.result;
   const ok = (r?.engine_result || r?.meta?.TransactionResult) === "tesSUCCESS";
   if (!ok) {
     const d = r?.engine_result || r?.meta?.TransactionResult || "unknown";
-    const e = new Error(`xrpl_offer_failed:${d}`);
-    e.detail = r;
-    throw e;
+    const e = new Error(`xrpl_offer_failed:${d}`); e.detail = r; throw e;
   }
   const nodes = r?.meta?.AffectedNodes || [];
   for (const n of nodes) {
@@ -254,28 +258,25 @@ async function createDirectedSellOffer({ nftoken_id, buyer, amountDrops }) {
 
 // ===== ROUTES =====
 export async function registerBazaarHotRoutes(app) {
-  // Debug: show what we derived from HOT_SEED and if it's SECP
+  // Debug: show algo + hot address
   app.get("/bazaar/hot/ping", async (_req, reply) => {
     try {
-      const pk = String(xrpl.wallet?.publicKey || "").toUpperCase();
-      const secp = !!pk && (pk.startsWith("02") || pk.startsWith("03"));
-      const hot = xrpl.wallet?._bad ? null : xrpl.wallet?.address || null;
       reply.send({
         ok: true,
         wss: XRPL_WSS,
-        hot,
-        pubkey_head: pk ? pk.slice(0, 6) : null,
-        secp,
+        hot: xrpl.wallet?.address || null,
+        algo: xrpl.algo,
+        secp: xrpl.algo === "secp256k1",
         taxon: TAXON,
         issuer: ISSUER,
-        note: xrpl.wallet?._bad || undefined
+        note: xrpl.initErr || undefined
       });
     } catch (e) {
       reply.code(500).send({ error: "ping_failed", detail: String(e.message || e) });
     }
   });
 
-  // Debug: prove the hot account exists (or return exact XRPL error)
+  // Debug: XRPL account_info on hot wallet
   app.get("/bazaar/hot/check", async (_req, reply) => {
     try {
       await ensureXRPL();
@@ -285,12 +286,12 @@ export async function registerBazaarHotRoutes(app) {
       reply.code(500).send({
         error: "account_info_failed",
         detail: String(e.message || e),
-        address: xrpl.wallet && !xrpl.wallet._bad ? xrpl.wallet.address : null
+        address: xrpl.wallet?.address || null
       });
     }
   });
 
-  // List inventory by SKU from hot wallet (metadata-derived)
+  // List by SKU using on-chain metadata
   app.get("/bazaar/hot/list", async (_req, reply) => {
     try {
       const skus = await listHotSkus();
@@ -301,23 +302,14 @@ export async function registerBazaarHotRoutes(app) {
     }
   });
 
-  // Create directed offer to buyer for one SKU
+  // Create directed offer for buyer for a SKU
   app.post("/bazaar/hot/purchase", async (req, reply) => {
     try {
       const buyer = req.headers["x-wallet"];
       if (!buyer || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(buyer)) {
         return reply.code(400).send({ error: "missing_or_bad_X-Wallet" });
       }
-      // Sanity: hot account must exist on-chain
-      await accountInfo(xrpl.wallet.address).catch((e) => {
-        const msg = String(e.message || "");
-        if (msg.includes("Account not found")) {
-          const err = new Error("account_not_found");
-          err.code = "account_not_found";
-          throw err;
-        }
-        throw e;
-      });
+      await ensureXRPL(); // includes algo checks
 
       const sku = String(req.body?.sku || "").toUpperCase();
       if (!sku) return reply.code(400).send({ error: "bad_request" });
@@ -334,12 +326,6 @@ export async function registerBazaarHotRoutes(app) {
       reply.send({ ok: true, sellOfferId: offerId, nftokenId: cand.nftoken_id });
     } catch (e) {
       const msg = String(e?.message || "");
-      if (msg === "account_not_found") {
-        return reply.code(500).send({
-          error: "account_info_failed",
-          detail: "Account not found."
-        });
-      }
       if (msg.startsWith("xrpl_offer_failed")) {
         return reply.code(500).send({ error: "purchase_failed", detail: msg.split(":")[1] || "xrpl" });
       }
@@ -357,6 +343,8 @@ export async function registerBazaarHotRoutes(app) {
   app.log.info({
     wss: XRPL_WSS,
     issuer: ISSUER,
-    hot: xrpl.wallet?._bad ? "(init failed)" : xrpl.wallet?.address || "(none)"
+    hot: xrpl.wallet?.address || "(none)",
+    algo: xrpl.algo,
+    allowEdForHot: ALLOW_ED_HOT
   }, "[BazaarHot] mounted");
 }
