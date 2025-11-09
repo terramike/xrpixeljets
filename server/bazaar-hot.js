@@ -1,10 +1,9 @@
-// server/bazaar-hot.js — 2025-11-09 live1
-// Adds /bazaar/hot/live that exposes active PUBLIC SellOffers (no Destination).
-// Keeps ping/check; leaves other green paths untouched.
+// server/bazaar-hot.js — 2025-11-09 live-feed r2
+// Public list of active PUBLIC SellOffers (no Destination) + diagnostics.
+// Removed old purchase JSON flow; client accepts offers directly.
 
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
 
-// ---------- env ----------
 const XRPL_WSS = process.env.XRPL_WSS || 'wss://xrplcluster.com';
 const HOT_PUBLIC_HEX  = (process.env.HOT_PUBLIC_HEX || process.env.HOT_PUB_HEX || '').toUpperCase().trim();
 const HOT_PRIVATE_HEX = (process.env.HOT_PRIVATE_HEX || process.env.HOT_PRV_HEX || '').toUpperCase().trim();
@@ -19,12 +18,10 @@ const ISSUER_ADDR  = process.env.BAZAAR_UPGRADES_ISSUER
   || process.env.ISSUER_ADDRESS
   || null;
 
-// ---------- helpers ----------
+const rippleNow = () => Math.floor(Date.now()/1000) - 946684800;
 const isSecpPK = (pk) => typeof pk === 'string' && /^(02|03)[0-9A-F]{64}$/i.test(pk);
 const isEdPK   = (pk) => typeof pk === 'string' && /^ED[0-9A-F]{64}$/i.test(pk);
-const rippleNow = () => Math.floor(Date.now()/1000) - 946684800; // UNIX - Ripple epoch
 
-// ---------- hot wallet state ----------
 let xrpl = { client: null, wallet: null, algo: 'unknown', note: null, source: 'unknown', pubPrefix: '??' };
 
 async function ensureXRPL() {
@@ -33,7 +30,7 @@ async function ensureXRPL() {
 
   if (HOT_PUBLIC_HEX && HOT_PRIVATE_HEX) {
     if (!(isSecpPK(HOT_PUBLIC_HEX) || isEdPK(HOT_PUBLIC_HEX))) {
-      xrpl.note = 'hot_keys_invalid: HOT_PUBLIC_HEX must be compressed secp (02/03 + 64 hex) or ED...';
+      xrpl.note = 'hot_keys_invalid: HOT_PUBLIC_HEX must be secp (02/03…) or ED…';
       throw new Error(xrpl.note);
     }
     xrpl.wallet = new XRPLWallet(HOT_PUBLIC_HEX, HOT_PRIVATE_HEX);
@@ -63,23 +60,21 @@ async function ensureXRPL() {
   return xrpl;
 }
 
-// ---------- cache ----------
+// cache for live feed
 let lastLive = { at: 0, items: [] };
 
-// Build public shop feed by joining account_offers (sell, public, active) with account_nfts (for URI)
 async function buildLiveFeed() {
   await ensureXRPL();
   const [offersRes, nftsRes] = await Promise.all([
     xrpl.client.request({ command: 'account_offers', account: xrpl.wallet.address, limit: 400 }),
     xrpl.client.request({ command: 'account_nfts',   account: xrpl.wallet.address, limit: 400 }),
   ]);
-
   const now = rippleNow();
   const nfts = new Map((nftsRes.result.account_nfts || []).map(n => [n.NFTokenID, n]));
   const items = (offersRes.result.offers || [])
-    .filter(o => ((Number(o.flags)||0) & 1) === 1)                 // sell
-    .filter(o => !o.destination)                                    // public (no Destination)
-    .filter(o => !o.expiration || Number(o.expiration) > now)       // active
+    .filter(o => ((Number(o.flags)||0) & 1) === 1)            // sell offers only
+    .filter(o => !o.destination)                               // public (no Destination)
+    .filter(o => !o.expiration || Number(o.expiration) > now)  // active
     .map(o => {
       const n = nfts.get(o.nft_id);
       return {
@@ -94,12 +89,10 @@ async function buildLiveFeed() {
       };
     })
     .filter(it => Number(it.taxon) === BAZAAR_TAXON);
-
   lastLive = { at: Date.now(), items };
   return items;
 }
 
-// ---------- routes ----------
 export async function registerBazaarHotRoutes(app) {
   app.get('/bazaar/hot/ping', async (_req, reply) => {
     try {
@@ -145,7 +138,6 @@ export async function registerBazaarHotRoutes(app) {
     }
   });
 
-  // NEW: public offers feed
   app.get('/bazaar/hot/live', async (_req, reply) => {
     try {
       const age = Date.now() - lastLive.at;
@@ -156,8 +148,6 @@ export async function registerBazaarHotRoutes(app) {
     }
   });
 
-  // Optional: keep a no-op settle endpoint so client doesn’t 404
-  app.post('/bazaar/settle', async (_req, reply) => {
-    reply.send({ ok: true, note: 'settle stub' });
-  });
+  // keep a settle stub so old clients don't 404 (no-op)
+  app.post('/bazaar/settle', async (_req, reply) => reply.send({ ok: true, note: 'settle stub' }));
 }
