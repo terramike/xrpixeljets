@@ -1,4 +1,4 @@
-// server/bazaar-hot.js — 2025-11-09 hot+reserves+preflights
+// server/bazaar-hot.js — 2025-11-09 r3 (hot + reserves + rich errors)
 // Routes:
 //   GET  /bazaar/hot/ping
 //   GET  /bazaar/hot/check
@@ -6,10 +6,11 @@
 //   POST /bazaar/hot/purchase  { sku: <NFTokenID>, priceXRP: <number> }
 //
 // Behavior:
-// - Prefer explicit HOT_PUBLIC_HEX/HOT_PRIVATE_HEX (no guessing), else HOT_SEED (+ HOT_ALGO=secp|ed; default secp).
+// - Prefer HOT_PUBLIC_HEX/HOT_PRIVATE_HEX (no guessing), else HOT_SEED (+ HOT_ALGO=secp|ed; default secp).
 // - Enforce secp unless ALLOW_ED_HOT=true. Assert HOT_ADDR if provided.
-// - Inventory = on-chain scan of HOT wallet (issuer/taxon + metadata handled client-side).
-// - Purchase = NFTokenCreateOffer directed to buyer; preflights for reserves, buyer presence, transferable, etc.
+// - Inventory = on-chain scan of HOT wallet (issuer/taxon filter is client-side).
+// - Purchase = NFTokenCreateOffer directed to buyer; preflights for reserves, buyer account, transferable, etc.
+// - Rich error details: engine_result, engine_result_message, tx hash, and a trimmed raw result.
 
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
 
@@ -39,7 +40,7 @@ const isSecpPK = (pk) => typeof pk === 'string' && /^(02|03)[0-9A-F]{64}$/i.test
 const isEdPK   = (pk) => typeof pk === 'string' && /^ED[0-9A-F]{64}$/i.test(pk);
 const toDrops  = (x) => {
   const n = Number(x);
-  if (!Number.isFinite(n) || n < 0) return null;
+  if (!Number.isFinite(n) || n <= 0) return null;
   return String(Math.round(n * 1_000_000));
 };
 const nowRippleEpoch = () => Math.floor(Date.now() / 1000) - 946684800; // UNIX - Ripple epoch
@@ -47,6 +48,16 @@ const bit = (flags, mask) => ((Number(flags) >>> 0) & mask) === mask;
 
 // DisallowIncoming flags (AccountRoot)
 const lsfDisallowIncomingNFTokenOffer = 0x04000000; // 67108864
+
+function trimJSON(obj, max = 2000) {
+  try {
+    const s = JSON.stringify(obj);
+    if (s.length <= max) return s;
+    return s.slice(0, max) + '…';
+  } catch {
+    return undefined;
+  }
+}
 
 // ---------- hot wallet state ----------
 let xrpl = { client: null, wallet: null, algo: 'unknown', note: null, source: 'unknown', pubPrefix: '??' };
@@ -121,6 +132,7 @@ async function fetchReserves() {
   const s = await xrpl.client.request({ command: 'server_info' });
   const info = s.result.info || {};
   const ledg = info.validated_ledger || info.closed_ledger || {};
+  // Live values (as of 2024/2025 typical: base=1 XRP, inc=0.2 XRP)
   const baseXRP = Number(ledg.reserve_base_xrp ?? info.reserve_base_xrp ?? 1);
   const incXRP  = Number(ledg.reserve_inc_xrp  ?? info.reserve_inc_xrp  ?? 0.2);
   return { baseDrops: BigInt(Math.round(baseXRP * 1_000_000)), incDrops: BigInt(Math.round(incXRP * 1_000_000)) };
@@ -213,7 +225,7 @@ export async function registerBazaarHotRoutes(app) {
         return reply.code(404).send({ error: 'buyer_unfunded', detail: 'Destination account does not exist (fund it first)' });
       }
 
-      // Verify HOT still owns the NFT (guard against sell-out)
+      // Verify HOT still owns the NFT (guard against race)
       const listAge = Date.now() - lastList.at;
       if (listAge > 10_000) await buildSkusFromHot();
       const owned = lastList.skus.find(x => x.nftokenId === sku);
@@ -224,7 +236,7 @@ export async function registerBazaarHotRoutes(app) {
         return reply.code(409).send({ error: 'not_transferable', detail: 'NFToken lacks lsfTransferable' });
       }
 
-      // Live reserves & balance preflight
+      // Live reserves & balance preflight (XRPL mainnet typical: base 1 XRP + 0.2 XRP per owned object)
       const [{ baseDrops, incDrops }, ai] = await Promise.all([
         fetchReserves(),
         xrpl.client.request({ command: 'account_info', account: xrpl.wallet.address, ledger_index: 'validated' })
@@ -260,31 +272,9 @@ export async function registerBazaarHotRoutes(app) {
       const signed = xrpl.wallet.sign(prepared);
       const sub = await xrpl.client.submitAndWait(signed.tx_blob);
 
-      const er = sub.result.engine_result || '';
-      const em = sub.result.engine_result_message || '';
-
-      if (er !== 'tesSUCCESS') {
-        // Friendly mappings
-        if (er === 'tecINSUFFICIENT_RESERVE') {
-          return reply.code(402).send({ error: 'hot_insufficient_reserve', detail: em || er });
-        }
-        if (er === 'tecNO_PERMISSION') {
-          return reply.code(409).send({ error: 'buyer_blocks_offers', detail: em || er });
-        }
-        if (er === 'tecNO_ENTRY') {
-          return reply.code(410).send({ error: 'not_owner', detail: em || er });
-        }
-        if (er === 'tecNO_DST') {
-          return reply.code(404).send({ error: 'buyer_unfunded', detail: em || er });
-        }
-        if (er === 'tefNFTOKEN_IS_NOT_TRANSFERABLE') {
-          return reply.code(409).send({ error: 'not_transferable', detail: em || er });
-        }
-        return reply.code(500).send({ error: 'create_offer_failed', detail: em || er });
-      }
-
-      // Extract the created NFTokenOffer id
-      const meta = sub.result.meta || sub.result.meta_json || {};
+      const er = sub?.result?.engine_result || sub?.engine_result || '';
+      const em = sub?.result?.engine_result_message || sub?.engine_result_message || '';
+      const meta = sub?.result?.meta || sub?.result?.meta_json || {};
       let sellOfferId = null;
       try {
         const obj = meta.AffectedNodes?.find(n =>
@@ -294,7 +284,31 @@ export async function registerBazaarHotRoutes(app) {
         sellOfferId = obj?.CreatedNode?.LedgerIndex || null;
       } catch {}
 
-      return reply.send({ ok: true, sellOfferId, nftokenId: sku });
+      if (er !== 'tesSUCCESS') {
+        // Friendly mappings
+        if (er === 'tecINSUFFICIENT_RESERVE' || er === 'tecINSUF_RESERVE') {
+          return reply.code(402).send({ error: 'hot_insufficient_reserve', detail: em || er, engine_result: er, hash: signed.hash });
+        }
+        if (er === 'tecNO_PERMISSION') {
+          return reply.code(409).send({ error: 'buyer_blocks_offers', detail: em || er, engine_result: er, hash: signed.hash });
+        }
+        if (er === 'tecNO_DST') {
+          return reply.code(404).send({ error: 'buyer_unfunded', detail: em || er, engine_result: er, hash: signed.hash });
+        }
+        if (er === 'tefNFTOKEN_IS_NOT_TRANSFERABLE') {
+          return reply.code(409).send({ error: 'not_transferable', detail: em || er, engine_result: er, hash: signed.hash });
+        }
+        // Unknown: return raw envelope trimmed so we can see what's up
+        return reply.code(500).send({
+          error: 'create_offer_failed',
+          detail: em || er || 'unknown_engine_result',
+          engine_result: er || null,
+          hash: signed.hash,
+          raw: trimJSON(sub, 1800)
+        });
+      }
+
+      return reply.send({ ok: true, sellOfferId, nftokenId: sku, hash: signed.hash });
     } catch (e) {
       const msg = String(e?.message || e);
       if (msg.includes('secp_required') || msg.includes('banned')) {
