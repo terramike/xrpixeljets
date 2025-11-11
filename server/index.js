@@ -51,10 +51,30 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 /* ============================== CORS / ERRORS ============================ */
 await app.register(cors, {
-  origin: (origin, cb) => { if (!origin) return cb(null, true); cb(null, ALLOW.includes(origin)); },
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);               // allow non-browser callers
+    cb(null, ALLOW.includes(origin));                 // strict allow-list
+  },
   methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Accept','Origin','X-Wallet','Authorization','X-Idempotency-Key','X-Admin-Key'],
+  allowedHeaders: '*',                                // mirror requested headers (prevents preflight mismatches)
   credentials: false
+});
+
+// Make every preflight bullet-proof (covers /profile with X-Wallet, etc.)
+app.options('/*', async (req, reply) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOW.includes(origin)) {
+    reply.header('Access-Control-Allow-Origin', origin);
+    reply.header('Vary', 'Origin');
+  }
+  const reqHdrs = req.headers['access-control-request-headers'];
+  reply.header(
+    'Access-Control-Allow-Headers',
+    reqHdrs || 'Content-Type, Accept, Origin, X-Wallet, Authorization, X-Idempotency-Key, X-Admin-Key'
+  );
+  const reqMethod = req.headers['access-control-request-method'];
+  reply.header('Access-Control-Allow-Methods', reqMethod || 'GET, POST, OPTIONS');
+  reply.code(204).send();
 });
 app.addHook('onSend', async (req, reply, payload) => {
   const origin = req.headers.origin;
@@ -417,3 +437,4 @@ app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   if (xrpl.wallet) app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
   else app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
 });
+
