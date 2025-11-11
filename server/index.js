@@ -1,5 +1,5 @@
-// server/index.js — XRPixel Jets API (2025-11-11 hot-claims r1)
-// Live JFUEL claims via sendIssued(); keeps green routes & Bazaar-Hot intact.
+// server/index.js — XRPixel Jets API (2025-11-11 hot-claims r2)
+// Fix: remove duplicate OPTIONS route, harden CORS, keep live claims & bazaar.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -10,7 +10,7 @@ import crypto from 'crypto';
 import { decode, encodeForSigning } from 'ripple-binary-codec';
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
 import { registerBazaarHotRoutes } from './bazaar-hot.js';
-import { sendIssued } from './claimJetFuel.js'; // ← LIVE CLAIMS HERE
+import { sendIssued } from './claimJetFuel.js';
 
 const { Pool } = pkg;
 const app = Fastify({ logger: true });
@@ -36,7 +36,7 @@ const algoOpt  = HOT_ALGO === 'ed' ? { algorithm:'ed25519' } : { algorithm:'secp
 
 const TOKEN_MODE = (process.env.TOKEN_MODE || 'mock').toLowerCase(); // 'hot' | 'prepare' | 'mock'
 
-/** JETS IOU settings (MUST match your in-game token!) */
+/** JETS IOU settings */
 const CURRENCY_CODE = process.env.CURRENCY_CODE || process.env.CURRENCY || 'JETS';
 const CURRENCY_HEX  = process.env.CURRENCY_HEX || null;
 const ISSUER_ADDR   = process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || null;
@@ -50,40 +50,45 @@ const BAZAAR_ENABLED = (process.env.BAZAAR_ENABLED || 'true').toLowerCase() !== 
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 /* ============================== CORS / ERRORS ============================ */
+// Use the plugin’s own OPTIONS handler; do NOT register our own.
 await app.register(cors, {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);               // allow non-browser callers
-    cb(null, ALLOW.includes(origin));                 // strict allow-list
+    if (!origin) return cb(null, true);               // allow server-to-server
+    cb(null, ALLOW.includes(origin));                 // strict allowlist
   },
   methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: '*',                                // mirror requested headers (prevents preflight mismatches)
-  credentials: false
+  allowedHeaders: '*',                                // mirror requested headers
+  credentials: false,
+  // extra safety when browsers send funky preflights
+  maxAge: 86400,
+  strictPreflight: false
 });
 
-// Make every preflight bullet-proof (covers /profile with X-Wallet, etc.)
-app.options('/*', async (req, reply) => {
+// Echo ACAO early so even early 4xx include it
+app.addHook('preHandler', async (req, reply) => {
   const origin = req.headers.origin;
   if (origin && ALLOW.includes(origin)) {
     reply.header('Access-Control-Allow-Origin', origin);
     reply.header('Vary', 'Origin');
   }
-  const reqHdrs = req.headers['access-control-request-headers'];
-  reply.header(
-    'Access-Control-Allow-Headers',
-    reqHdrs || 'Content-Type, Accept, Origin, X-Wallet, Authorization, X-Idempotency-Key, X-Admin-Key'
-  );
-  const reqMethod = req.headers['access-control-request-method'];
-  reply.header('Access-Control-Allow-Methods', reqMethod || 'GET, POST, OPTIONS');
-  reply.code(204).send();
 });
+
+// Also echo ACAO on the way out (covers normal flows)
 app.addHook('onSend', async (req, reply, payload) => {
   const origin = req.headers.origin;
-  if (origin && ALLOW.includes(origin)) { reply.header('Access-Control-Allow-Origin', origin); reply.header('Vary', 'Origin'); }
+  if (origin && ALLOW.includes(origin)) {
+    reply.header('Access-Control-Allow-Origin', origin);
+    reply.header('Vary', 'Origin');
+  }
   return payload;
 });
+
 app.setErrorHandler((err, req, reply) => {
   const origin = req.headers.origin;
-  if (origin && ALLOW.includes(origin)) { reply.header('Access-Control-Allow-Origin', origin); reply.header('Vary', 'Origin'); }
+  if (origin && ALLOW.includes(origin)) {
+    reply.header('Access-Control-Allow-Origin', origin);
+    reply.header('Vary', 'Origin');
+  }
   const code = err.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
   req.log.error({ err }, 'request_error');
   reply.code(code).send({ error: 'internal_error' });
@@ -115,6 +120,7 @@ const OPEN_ROUTES = [
   '/bazaar/hot/live'
 ];
 
+// Require X-Wallet for protected routes + simple rate-limit
 app.addHook('onRequest', async (req, reply) => {
   const url = (req.raw.url || '').split('?')[0];
   if (req.method === 'OPTIONS') return;
@@ -374,7 +380,7 @@ app.post('/claim/start', async (req, reply) => {
   if (debit.rows.length === 0) return reply.code(400).send({ error:'insufficient_funds' });
 
   try {
-    // XRPL send (hot | prepare | mock) — implemented in claimJetFuel.js
+    // XRPL send (hot | prepare | mock)
     const { ok, txid = null, txJSON = null, error: sendErr, detail } =
       await sendIssued({ to: req.wallet, amount });
 
@@ -437,4 +443,3 @@ app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   if (xrpl.wallet) app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
   else app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
 });
-
