@@ -1,5 +1,6 @@
-// server/index.js — XRPixel Jets API (2025-11-09 hot-live r2)
-// Keeps green routes intact. CORS-first. Opens /bazaar/hot/* (incl. /live).
+// server/index.js — XRPixel Jets API (2025-11-11 hot-claims r1)
+// Live JFUEL claims via sendIssued(); keeps green routes & Bazaar-Hot intact.
+
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import pkg from 'pg';
@@ -9,16 +10,17 @@ import crypto from 'crypto';
 import { decode, encodeForSigning } from 'ripple-binary-codec';
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
 import { registerBazaarHotRoutes } from './bazaar-hot.js';
+import { sendIssued } from './claimJetFuel.js'; // ← LIVE CLAIMS HERE
 
 const { Pool } = pkg;
 const app = Fastify({ logger: true });
 
+/* ============================ ENV / CONSTANTS ============================ */
 const PORT = Number(process.env.PORT || 10000);
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_only_change_me';
 const ALLOW = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeygo.io,http://localhost:8000')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-// ===== Econ/game tuning =====
 const ECON_SCALE_ENV = Number(process.env.ECON_SCALE || 0.10);
 const BASE_PER_LEVEL  = Number(process.env.BASE_PER_LEVEL || 300);
 const REGEN_STEP      = Number(process.env.REGEN_STEP || 0.1);
@@ -26,24 +28,28 @@ const REWARD_SCALE    = Number.isFinite(Number(process.env.REWARD_SCALE))
   ? Number(process.env.REWARD_SCALE)
   : ECON_SCALE_ENV;
 
-// ===== XRPL (for logs; Bazaar-Hot uses its own client) =====
+/** XRPL */
 const XRPL_WSS = process.env.XRPL_WSS || 'wss://xrplcluster.com';
 const HOT_SEED = process.env.HOT_SEED || process.env.HOT_WALLET_SEED || '';
 const HOT_ALGO = (process.env.HOT_ALGO || 'secp').toLowerCase(); // 'secp' | 'ed'
 const algoOpt  = HOT_ALGO === 'ed' ? { algorithm:'ed25519' } : { algorithm:'secp256k1' };
 
-const ISSUER_ADDR = process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || null;
+const TOKEN_MODE = (process.env.TOKEN_MODE || 'mock').toLowerCase(); // 'hot' | 'prepare' | 'mock'
+
+/** JETS IOU settings (MUST match your in-game token!) */
+const CURRENCY_CODE = process.env.CURRENCY_CODE || process.env.CURRENCY || 'JETS';
+const CURRENCY_HEX  = process.env.CURRENCY_HEX || null;
+const ISSUER_ADDR   = process.env.ISSUER_ADDRESS || process.env.ISSUER_ADDR || null;
 
 const xrpl = {
   client: new XRPLClient(XRPL_WSS),
   wallet: HOT_SEED ? XRPLWallet.fromSeed(HOT_SEED, algoOpt) : null
 };
 
-// Feature flags / secrets
 const BAZAAR_ENABLED = (process.env.BAZAAR_ENABLED || 'true').toLowerCase() !== 'false';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
-// ---------- CORS FIRST ----------
+/* ============================== CORS / ERRORS ============================ */
 await app.register(cors, {
   origin: (origin, cb) => { if (!origin) return cb(null, true); cb(null, ALLOW.includes(origin)); },
   methods: ['GET','POST','OPTIONS'],
@@ -63,20 +69,20 @@ app.setErrorHandler((err, req, reply) => {
   reply.code(code).send({ error: 'internal_error' });
 });
 
+/* ================================== DB =================================== */
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-// ---------- utils ----------
+/* ================================ UTILS ================================== */
 const toInt  = (x, d=0) => { const n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : d; };
 const nowSec = () => Math.floor(Date.now()/1000);
 const asciiToHex = (s) => Buffer.from(String(s),'utf8').toString('hex').toUpperCase();
 const isSecpPublicKeyHex   = (pk) => typeof pk==='string' && /^(02|03)[0-9A-Fa-f]{64}$/.test(pk);
 const isEd25519PublicKeyHex= (pk) => typeof pk==='string' && /^ED[0-9A-Fa-f]{64}$/.test(pk);
 
-// simple rate-limit (per IP + wallet)
 const RATE = { windowMs: 10_000, maxPerWindow: 30 };
 const bucket = new Map();
 
-// ===== allowlist for requests w/o X-Wallet header =====
+/* Routes allowed without X-Wallet */
 const OPEN_ROUTES = [
   '/session/start',
   '/session/finish',
@@ -84,7 +90,6 @@ const OPEN_ROUTES = [
   '/config',
   '/healthz',
   '/bazaar/skus',
-  // HOT bazaar: public diagnostics & listing
   '/bazaar/hot/ping',
   '/bazaar/hot/check',
   '/bazaar/hot/live'
@@ -107,7 +112,7 @@ app.addHook('onRequest', async (req, reply) => {
   if (cur.count > RATE.maxPerWindow) return reply.code(429).send({ error:'rate_limited' });
 });
 
-// ---------- profiles ----------
+/* ============================= PROFILES ============================= */
 async function ensureProfile(wallet){
   await pool.query(`insert into player_profiles (wallet) values ($1) on conflict (wallet) do nothing`, [wallet]);
 }
@@ -152,7 +157,7 @@ async function regenEnergyIfDue(wallet){
   return rows[0] || row;
 }
 
-// ---------- auth/JWT ----------
+/* ============================== AUTH/JWT ============================== */
 const NONCES = new Map();
 const newNonce = () => crypto.randomBytes(32).toString('hex');
 function storeNonce(address, nonce){ NONCES.set(address,{nonce,exp:Date.now()+5*60_000,used:false}); }
@@ -170,24 +175,24 @@ function requireJWT(req, reply){
   catch { reply.code(401).send({ error:'unauthorized' }); return null; }
 }
 
-// ---------- XRPL helpers for WC tx-proof ----------
+/* ================= XRPL helpers for WC tx-proof (secp only) ================ */
 async function ensureXRPL() {
   if (!xrpl.wallet) throw new Error('hot_wallet_missing');
   if (!xrpl.client.isConnected()) await xrpl.client.connect();
 }
 
-// ---------------- config ----------------
+/* ============================== /config =================================== */
 app.get('/config', async (_req, reply) => {
   reply.send({
-    tokenMode: (process.env.TOKEN_MODE || 'mock').toLowerCase(),
+    tokenMode: TOKEN_MODE,
     network: XRPL_WSS,
-    currencyCode: (process.env.CURRENCY_CODE || process.env.CURRENCY || 'JETS'),
-    currencyHex: process.env.CURRENCY_HEX || null,
+    currencyCode: CURRENCY_CODE,
+    currencyHex: CURRENCY_HEX,
     issuer: ISSUER_ADDR
   });
 });
 
-// ---------------- session (nonce + verify/finish) ----------------
+/* ============================= session (JWT) =============================== */
 app.post('/session/start', async (req, reply) => {
   const { address } = req.body || {};
   if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) return reply.code(400).send({ error:'bad_address' });
@@ -204,7 +209,7 @@ async function verifyOrFinish(req, reply) {
   const now = nowSec(); const tsNum = Number(ts || now);
   if (!Number.isFinite(tsNum) || Math.abs(now-tsNum)>300) return reply.code(400).send({ error:'expired_nonce' });
 
-  // WalletConnect tx-proof path
+  // WC AccountSet tx-proof path (secp)
   if (txProof && txProof.tx_blob) {
     try {
       const tx = decode(txProof.tx_blob);
@@ -249,17 +254,7 @@ async function verifyOrFinish(req, reply) {
 app.post('/session/verify', verifyOrFinish);
 app.post('/session/finish', verifyOrFinish); // alias
 
-// ---------------- profile + battles (green) ----------------
-app.get('/profile', async (req, reply) => {
-  await ensureProfile(req.wallet);
-  const rowR = await regenEnergyIfDue(req.wallet);
-  const row  = rowR || await getProfileRaw(req.wallet);
-  if (!row) return reply.code(404).send({ error:'not_found' });
-  reply.send(toClient(row));
-});
-
-// costs/upgrade/battle remain unchanged… (keep your working implementations here)
-// [BEGIN keep-green block]
+/* ======================= GREEN: profile / ms / battle ====================== */
 function getEconScaleFrom(arg){ const n=Number(arg); return (Number.isFinite(n)&&n>=0) ? n : ECON_SCALE_ENV; }
 function levelsFromRow(row){
   const lv=row?.ms_level||{};
@@ -268,6 +263,14 @@ function levelsFromRow(row){
 function unitCost(level,s){ const raw=BASE_PER_LEVEL*(toInt(level,0)+1); return Math.max(1, Math.round(raw*s)); }
 function calcCosts(levels,s){ return { health:unitCost(levels.health,s), energyCap:unitCost(levels.energyCap,s), regenPerMin:unitCost(levels.regenPerMin,s), hit:unitCost(levels.hit,s), crit:unitCost(levels.crit,s), dodge:unitCost(levels.dodge,s) }; }
 function missionReward(l){ const level = Math.max(1, Number(l) || 1); const base = level<=5 ? [0,100,150,200,250,300][level] : Math.round(300*Math.pow(1.01, level-5)); const reward=Math.round(base*REWARD_SCALE); const cap=Math.max(1,Math.round(10000*REWARD_SCALE)); return Math.max(1,Math.min(cap,reward)); }
+
+app.get('/profile', async (req, reply) => {
+  await ensureProfile(req.wallet);
+  const rowR = await regenEnergyIfDue(req.wallet);
+  const row  = rowR || await getProfileRaw(req.wallet);
+  if (!row) return reply.code(404).send({ error:'not_found' });
+  reply.send(toClient(row));
+});
 app.get('/ms/costs', async (req, reply) => {
   const scale = getEconScaleFrom(req.query?.econScale);
   const row = await getProfileRaw(req.wallet);
@@ -324,15 +327,16 @@ app.post('/battle/finish', async (req, reply) => {
   const { rows } = await pool.query(`update player_profiles set jet_fuel=$2, unlocked_level=$3, updated_at=now() where wallet=$1 returning *`, [req.wallet, jf, unlocked]);
   reply.send({ ok:true, reward, victory, level:lvl, profile: toClient(rows[0]) });
 });
-// [END keep-green block]
 
-// ---------- claim (kept) ----------
+/* =============================== CLAIM LIVE =============================== */
 app.post('/claim/start', async (req, reply) => {
   const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
-  const amt = toInt(req.body?.amount, 0);
-  if (!Number.isFinite(amt) || amt <= 0) return reply.code(400).send({ error:'bad_amount' });
-  const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
 
+  const amount = toInt(req.body?.amount, 0);
+  if (!Number.isFinite(amount) || amount <= 0) return reply.code(400).send({ error:'bad_amount' });
+
+  // Cooldown gate
+  const row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
   const nowS = nowSec();
   const lastS = row.last_claim_at ? Math.floor(new Date(row.last_claim_at).getTime()/1000) : 0;
   const COOL = Number(process.env.CLAIM_COOLDOWN_SEC || 300);
@@ -345,48 +349,71 @@ app.post('/claim/start', async (req, reply) => {
        updated_at = now()
  where wallet = $1
    and jet_fuel >= $2
- returning *`, [req.wallet, amt]);
+ returning *`, [req.wallet, amount]);
+
   if (debit.rows.length === 0) return reply.code(400).send({ error:'insufficient_funds' });
 
   try {
-    const sent = { txid: null, txJSON: null }; // keep green; no on-ledger send here
+    // XRPL send (hot | prepare | mock) — implemented in claimJetFuel.js
+    const { ok, txid = null, txJSON = null, error: sendErr, detail } =
+      await sendIssued({ to: req.wallet, amount });
+
+    if (!ok && TOKEN_MODE === 'hot') {
+      // Roll back debit on hard failure in HOT mode
+      await pool.query(`update player_profiles set jet_fuel = jet_fuel + $2, updated_at=now() where wallet=$1`, [req.wallet, amount]).catch(()=>{});
+      const code = (sendErr === 'trustline_required') ? 400 : 500;
+      return reply.code(code).send({ error: sendErr || 'claim_failed', detail });
+    }
+
+    // Record success (or mock/prepare acknowledgement)
     await pool.query(`update player_profiles set last_claim_at = now(), updated_at = now() where wallet = $1`, [req.wallet]);
-    await pool.query(`insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`, [req.wallet, amt, sent?.txid||null]).catch(()=>{});
+    await pool.query(`insert into claim_audit (wallet, amount, tx_hash) values ($1,$2,$3)`, [req.wallet, amount, txid]).catch(()=>{});
     const latest = await getProfileRaw(req.wallet);
-    return reply.send({ ok:true, txid: sent?.txid || null, txJSON: sent?.txJSON || null, profile: toClient(latest || debit.rows[0]) });
+
+    return reply.send({ ok: true, txid, txJSON, profile: toClient(latest || debit.rows[0]) });
   } catch (e) {
-    await pool.query(`update player_profiles set jet_fuel = jet_fuel + $2, updated_at=now() where wallet=$1`, [req.wallet, amt]).catch(()=>{});
+    // Safety rollback on unexpected errors
+    await pool.query(`update player_profiles set jet_fuel = jet_fuel + $2, updated_at=now() where wallet=$1`, [req.wallet, amount]).catch(()=>{});
+    req.log.error({ e }, '[claim] sendIssued failed');
     return reply.code(500).send({ error:'claim_failed' });
   }
 });
 
-// ---------- legacy bazaar JSON kept no-op ----------
+/* =========================== Legacy bazaar JSON =========================== */
 app.get('/bazaar/skus', async (_req, reply) => reply.send({ skus: [] }));
 
-// ===== Register Bazaar-Hot =====
+/* ============================ Bazaar-Hot routes =========================== */
 if (BAZAAR_ENABLED) {
   await registerBazaarHotRoutes(app);
   app.log.info('[BazaarHot] routes mounted at /bazaar/hot/*');
 }
 
-// ---------------- /healthz ----------------
+/* =============================== Healthz ================================== */
 app.get('/healthz', async (_req, reply) => reply.send({ ok:true }));
 
-// Ensure XRPL ready (logs)
+/* ============================== onReady logs ============================== */
 app.addHook('onReady', async () => {
   try {
-    if (BAZAAR_ENABLED) {
-      if (xrpl.wallet && !xrpl.client.isConnected()) await xrpl.client.connect();
-      app.log.info({ wss: XRPL_WSS, issuer: ISSUER_ADDR, hot: xrpl.wallet?.address || '(none)', hotAlgo: HOT_ALGO }, '[Bazaar] Ready');
+    if (xrpl.wallet && !xrpl.client.isConnected()) await xrpl.client.connect();
+    app.log.info({
+      wss: XRPL_WSS,
+      issuer: ISSUER_ADDR,
+      currency: CURRENCY_CODE,
+      tokenMode: TOKEN_MODE,
+      hot: xrpl.wallet?.address || '(none)',
+      hotAlgo: HOT_ALGO
+    }, '[XRPL] Ready');
+    if (process.env.NODE_ENV === 'production' && TOKEN_MODE === 'mock') {
+      app.log.warn('[CLAIM] TOKEN_MODE is mock in production — set TOKEN_MODE=hot to enable on-ledger sends.');
     }
   } catch (e) {
-    app.log.error(e, '[Bazaar] onReady init failed');
+    app.log.error(e, '[onReady] XRPL init failed');
   }
 });
 
-// Startup
+/* ================================ Startup ================================= */
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`XRPixel Jets API listening on :${PORT}`);
   if (xrpl.wallet) app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
-  else app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation will fail.');
+  else app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
 });
