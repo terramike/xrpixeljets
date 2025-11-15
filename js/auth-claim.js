@@ -1,4 +1,5 @@
-// /jets/js/auth-claim.js — trustline guard (2025-10-26v2-guard)
+// /jets/js/auth-claim.js — trustline guard (2025-10-31rel3)
+// Base: 2025-10-31rel2-compat (no behavior change; WC path is in wallet-wc.js)
 import { sessionStart, sessionVerify, setAuthToken, claimStart } from '/jets/js/serverApi.js';
 
 (function () {
@@ -17,28 +18,35 @@ import { sessionStart, sessionVerify, setAuthToken, claimStart } from '/jets/js/
       window.CURRENCY_HEX  = CFG.currencyHex;
       window.ISSUER_ADDR   = CFG.issuer;
     } catch {
-      // Hard fail closed: without config, do NOT allow Set Trustline
       CFG = { tokenMode:'mock', network:'', currencyCode:'JFUEL', currencyHex:null, issuer:null, _blocked:true };
     }
   }
-
   function hud(m){ (W.hud || console.log)(`[auth] ${m}`); }
   function qs(id){ return document.getElementById(id); }
   function status(msg, html=false){ const el=qs('claim-status')||qs('session-status')||qs('status'); if(!el) return; html? el.innerHTML=msg : el.textContent=msg; }
+  const toHex = (s)=>Array.from(new TextEncoder().encode(s)).map(b=>b.toString(16).padStart(2,'0')).join('');
+
+  function setWalletLocal(addr){
+    try { localStorage.setItem('WALLET', (addr||'').trim()); } catch {}
+    window.CURRENT_WALLET = (addr||'').trim();
+  }
 
   async function doSignIn(){
     try{
       const addrInput = qs('xrpl-address'); const address=(addrInput?.value||'').trim();
       const a = address && address.startsWith('r') ? address : (W.getClassicAddress? await W.getClassicAddress(): '');
       if (!a) throw new Error('No wallet');
+      setWalletLocal(a);
+
       const { nonce } = await sessionStart(a);
       const scope='play,upgrade,claim'; const ts=Math.floor(Date.now()/1000);
       const payload=`${nonce}||${scope}||${ts}||${a}`;
-      const hex = W.utf8ToHex ? W.utf8ToHex(payload) : Array.from(new TextEncoder().encode(payload)).map(b=>b.toString(16).padStart(2,'0')).join('');
+      const hex = W.utf8ToHex ? W.utf8ToHex(payload) : toHex(payload);
       const sig = (W.signMessageHexClassic)
         ? await W.signMessageHexClassic({ address:a, hex })
         : (W.signMessageClassic ? await W.signMessageClassic(a, payload) : null);
       if (!sig || !sig.signature || !sig.publicKey) throw new Error('Sign failed');
+
       const v = await sessionVerify({ address:a, signature:sig.signature, publicKey:sig.publicKey, ts, scope, payload, payloadHex:hex });
       if (v?.jwt){ setAuthToken(v.jwt); hud('Signed in (JWT stored).'); status('Signed in.'); return true; }
       throw new Error('No JWT');
@@ -65,6 +73,8 @@ import { sessionStart, sessionVerify, setAuthToken, claimStart } from '/jets/js/
     if (!a) return status('No wallet');
     if (!amt) return status('Enter a positive amount');
     if (!confirmClaim({ amount:amt, address:a })) return status('Claim cancelled');
+
+    setWalletLocal(a);
     try {
       status('Submitting claim…');
       const res = await claimStart(amt);
@@ -73,49 +83,17 @@ import { sessionStart, sessionVerify, setAuthToken, claimStart } from '/jets/js/
       else status('Claim acknowledged (mock mode).');
     } catch(e){
       const msg=String(e?.message||'');
-      if (msg.includes('trustline_required')) return status('Trustline required for JFUELv2. Click “Set Trustline” below.');
+      if (msg.includes('trustline_required')) return status('Trustline required for JETS. Use the WalletConnect trustline button.');
       if (msg.includes('unauthorized')) return status('JWT expired. Please sign in again.');
       if (msg.includes('server_path_liquidity') || msg.includes('issuer_rippling_disabled')) return status('Issuer rippling misconfigured. Admin check needed.');
+      if (msg.includes('cooldown')) return status('Claim on cooldown. Try again later.');
+      if (msg.includes('insufficient_funds')) return status('Not enough JetFuel.');
       status('Claim failed.');
     }
   }
 
-  function bindTrustlineButton(){
-    const btn = qs('btn-add-trustline') || qs('btnSetTrustline') || qs('btn-add-tl');
-    if (!btn || btn.__bound) return;
-    btn.__bound = true;
-    btn.addEventListener('click', async () => {
-      if (CFG._blocked) { return status('Config unavailable. Reload and try again.'); }
-      const issuer = CFG.issuer;
-      const code = CFG.currencyCode;
-      const hex  = CFG.currencyHex;
-
-      // Hard guard: only our issuer allowed
-      if (!issuer || issuer !== 'rHz5qqAo57UnEsrMtw5croE4WnK3Z3J52e') {
-        return status('Issuer mismatch — refusing to set trustline.');
-      }
-
-      const confirmText = `Set trustline to ${code} (${hex?.slice(0,8)}…) issued by ${issuer}?\n\nType: I TRUST ${issuer.slice(0,6)} to continue.`;
-      const ok = window.prompt(confirmText, '');
-      if (ok !== `I TRUST ${issuer.slice(0,6)}`) return status('Cancelled.');
-
-      try {
-        await (W.createTrustline?.({
-          issuer,
-          currencyCode: code,
-          currencyHex: hex,
-          limit: '10000000'
-        }));
-        status('Trustline set. You can claim now.');
-      } catch(e) {
-        status(`Trustline error: ${e.message||e}`);
-      }
-    }, { passive:true });
-  }
-
   async function init(){
     await loadConfig();
-    bindTrustlineButton();
 
     const btnLogin = document.getElementById('btn-login') || document.getElementById('btn-connect') || document.getElementById('btn-sign');
     if (btnLogin && !btnLogin.__bound){

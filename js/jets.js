@@ -1,8 +1,5 @@
 // jets/js/jets.js — XRPixel Jets MKG (2025-10-24 squad-fix)
-// - Mirror Main -> Wing when Wing empty (immediate, not just at Start)
-// - Recompute + repaint squad pills on every selection/unselection
-// - Button badges reflect current role(s)
-// - Allows same jet to be both Main and Wing; clicking again unselects.
+// Reverted intact (no layout experiments). See ui.js for selected image change.
 
 import { GameState } from './state.js';
 import { renderSquadStats, setMainCard, setWingCard } from './ui.js';
@@ -47,7 +44,6 @@ export function recalcSquad() {
 }
 
 function ensureTwoRolesAfterSelect() {
-  // If only one role is set, mirror it into the other so squad stats are never zero
   if (GameState.mainJet && !GameState.wingJet) {
     GameState.wingJet = GameState.mainJet;
     setWingCard(GameState.wingJet);
@@ -83,7 +79,6 @@ export function renderJets(onSetMain, onSetWing, jets) {
 
   grid.innerHTML = html || '<div class="tiny">No Jets found.</div>';
 
-  // Wire click handlers
   grid.querySelectorAll('.jet-card').forEach(card => {
     const id = card.getAttribute('data-id');
     const btnMain = card.querySelector('.btn-main');
@@ -93,8 +88,6 @@ export function renderJets(onSetMain, onSetWing, jets) {
 
     if (btnMain) btnMain.onclick = () => {
       const jet = findJet(); if (!jet) return;
-
-      // Toggle main selection
       if (GameState.mainJet && GameState.mainJet.id === jet.id) {
         GameState.mainJet = null;
         setMainCard(null);
@@ -102,7 +95,6 @@ export function renderJets(onSetMain, onSetWing, jets) {
         GameState.mainJet = jet;
         setMainCard(jet);
       }
-
       ensureTwoRolesAfterSelect();
       recalcSquad(); renderSquadStats();
       renderJets(onSetMain, onSetWing, jets);
@@ -111,8 +103,6 @@ export function renderJets(onSetMain, onSetWing, jets) {
 
     if (btnWing) btnWing.onclick = () => {
       const jet = findJet(); if (!jet) return;
-
-      // Toggle wing selection
       if (GameState.wingJet && GameState.wingJet.id === jet.id) {
         GameState.wingJet = null;
         setWingCard(null);
@@ -120,7 +110,6 @@ export function renderJets(onSetMain, onSetWing, jets) {
         GameState.wingJet = jet;
         setWingCard(jet);
       }
-
       ensureTwoRolesAfterSelect();
       recalcSquad(); renderSquadStats();
       renderJets(onSetMain, onSetWing, jets);
@@ -128,7 +117,6 @@ export function renderJets(onSetMain, onSetWing, jets) {
     };
   });
 
-  // If we loaded fresh and only one role is set, mirror now (e.g., single NFT case)
   ensureTwoRolesAfterSelect();
   recalcSquad(); renderSquadStats();
 }

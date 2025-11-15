@@ -1,8 +1,12 @@
-// jets/js/missions.js — XRPixel Jets MKG (2025-10-26-polish1)
+// jets/js/missions.js — XRPixel Jets MKG (2025-11-01-boss1)
 import { GameState } from './state.js';
 import { LS } from './constants.js';
 
 const KEY_LAST = 'JETS_LAST_MISSION';
+
+// === Boss constants ===
+export const BOSS_ID = 'BOSS';
+export function isBoss(id){ return String(id).toUpperCase() === BOSS_ID; }
 
 // Base 5 fixed missions; waves auto-extend past 5
 const BASE_MISSIONS = [
@@ -60,6 +64,12 @@ export function buildMissionOptions(unlocked){
   const max = Math.max(1, Number(unlocked) || 1);
   sel.innerHTML = '';
 
+  // Boss first for visibility
+  const boss = document.createElement('option');
+  boss.value = BOSS_ID;
+  boss.textContent = '🛡️ Daily Boss';
+  sel.appendChild(boss);
+
   for (let i = 1; i <= max; i++){
     const opt = document.createElement('option');
     const m = getMission(i);
@@ -68,13 +78,12 @@ export function buildMissionOptions(unlocked){
     sel.appendChild(opt);
   }
 
-  // Restore the player's last selection (clamped to unlocked)
-  let last = 1;
-  try {
-    last = parseInt(localStorage.getItem(KEY_LAST) || '1', 10) || 1;
-  } catch {}
-  if (isNaN(last) || last < 1) last = 1;
-  if (last > max) last = max;
-
-  sel.value = String(last);
+  // Restore the player's last selection (clamped to unlocked, but allow BOSS)
+  let lastRaw = '1';
+  try { lastRaw = String(localStorage.getItem(KEY_LAST) || '1'); } catch {}
+  if (lastRaw !== BOSS_ID) {
+    const lastNum = parseInt(lastRaw, 10);
+    lastRaw = (Number.isFinite(lastNum) && lastNum >= 1) ? String(Math.min(lastNum, max)) : '1';
+  }
+  sel.value = String(lastRaw);
 }

@@ -1,8 +1,5 @@
 // jets/js/ui.js — XRPixel Jets MKG (2025-10-24 bars-solid)
-// Fixes: selects bar fills by class per your current index.html.
-// Energy:  #hud-top .energyfill
-// Player:  #hud-top .playerfill
-// Enemy:   #hud-top .enemyfill
+// Minimal upgrade (2025-11-01revert1): resolve Main/Wing image to HTTP sprite xrpixeljet_<N>.png
 
 import { GameState } from './state.js';
 
@@ -15,6 +12,41 @@ function setBarFill(el, value, max) {
   const pct = (!max || max <= 0) ? 0 : Math.max(0, Math.min(100, Math.round((value / max) * 100)));
   el.style.width = pct + '%';
   el.setAttribute?.('data-pct', String(pct));
+}
+
+// -------- NEW: map selected jet image to HTTP sprite by hull index --------
+function resolveSelectedImg(jet) {
+  // Try the XRPixelJet trait (e.g., "jet42")
+  let raw = null;
+
+  // 1) From normalized traits map if present
+  if (jet?.traits && typeof jet.traits === 'object') {
+    raw = jet.traits.XRPixelJet || jet.traits['XRPixelJet'];
+  }
+
+  // 2) From attributes array (common in XRPL JSON)
+  if (!raw && Array.isArray(jet?.attributes)) {
+    const t = jet.attributes.find(a => String(a?.trait_type).toLowerCase() === 'xrpixeljet');
+    if (t?.value) raw = t.value;
+  }
+
+  // 3) From any field that looks like "jetNN"
+  if (!raw && typeof jet?.XRPixelJet === 'string') raw = jet.XRPixelJet;
+  if (!raw && typeof jet?.hull === 'string') raw = jet.hull;
+
+  // Parse number from "jet42" or "…_42"
+  let idx = 1;
+  const m = String(raw || '').match(/(\d{1,3})/);
+  if (m) {
+    idx = Math.max(1, Math.min(111, parseInt(m[1], 10)));
+  } else {
+    // fallback: try to infer from image filename
+    const im = String(jet?.image || '');
+    const m2 = im.match(/(?:jet|xrpixeljet)[^\d]*?(\d{1,3})/i);
+    if (m2) idx = Math.max(1, Math.min(111, parseInt(m2[1], 10)));
+  }
+
+  return `https://mykeygo.io/jets/assets/xrpixeljet_${idx}.png`;
 }
 
 // -------- Squad Stats --------
@@ -32,7 +64,7 @@ export function renderSquadStats() {
   setText(synEl, s.synergyText || `${(s.synergy||1).toFixed(1)}×`);
 }
 
-// -------- Main/Wing cards --------
+// -------- Main/Wing cards (reverted behavior; only image src logic tweaked) --------
 export function setMainCard(jetOrNull) {
   const nameEl = byIds(['main-name','main_name','mainName']);
   const gunsEl = byIds(['main-guns','main_guns','mainGuns']);
@@ -47,7 +79,10 @@ export function setMainCard(jetOrNull) {
   const j = jetOrNull;
   setText(nameEl, j.name || 'XRPixel Jet');
   setText(gunsEl, `${j.top_gun || '—'} | ${j.bottom_gun || '—'}`);
-  if (imgEl && j.image) imgEl.src = j.image;
+  if (imgEl) {
+    // Use local HTTP sprite by hull index for selected view
+    imgEl.src = resolveSelectedImg(j);
+  }
 }
 
 export function setWingCard(jetOrNull) {
@@ -64,7 +99,10 @@ export function setWingCard(jetOrNull) {
   const j = jetOrNull;
   setText(nameEl, j.name || 'XRPixel Jet');
   setText(gunsEl, `${j.top_gun || '—'} | ${j.bottom_gun || '—'}`);
-  if (imgEl && j.image) imgEl.src = j.image;
+  if (imgEl) {
+    // Use local HTTP sprite by hull index for selected view
+    imgEl.src = resolveSelectedImg(j);
+  }
 }
 
 // -------- Energy / JF / HP --------

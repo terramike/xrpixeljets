@@ -1,8 +1,5 @@
-// jets/js/scene.js — XRPixel Jets MKG (2025-10-28 hp-after-accessories + deflog)
-// HP is now derived AFTER accessories:
-//   HP(final) = (adj.health) + 0.5 * (adj.defense)
-// where adj.health starts from mothership HP and includes any HP accessory.
-// DEF shown in enemy hit log is the same adj.defense used in reduction.
+// jets/js/scene.js — XRPixel Jets MKG (2025-11-01-boss1)
+// Adds Daily Boss seeding (big HP reset daily). No change to energy or turn costs.
 
 import { GameState } from './state.js';
 import { updateHPBars } from './ui.js';
@@ -19,15 +16,33 @@ function logLine(msg) {
   el.scrollTop = el.scrollHeight;
 }
 
-function getLevel() {
+function getRawSelection() {
   const sel = document.getElementById('sel-mission') || document.getElementById('mission');
-  const v = parseInt(sel?.value || '1', 10);
+  return String(sel?.value || '1');
+}
+function isBossSelected() {
+  return getRawSelection().toUpperCase() === 'BOSS';
+}
+function getLevel() {
+  const raw = getRawSelection();
+  const v = parseInt(raw, 10);
   return Number.isFinite(v) && v > 0 ? v : 1;
+}
+
+// Boss HP seed: scales with day-of-year so it “resets” daily without backend state.
+function bossMaxHPForToday() {
+  const now = new Date();
+  const doy = Math.floor((now - new Date(now.getFullYear(),0,0)) / 86400000); // 1..366
+  const swing = Math.round(300 * Math.sin(doy/58));
+  return Math.max(800, 1200 + swing);
 }
 
 function enemyMaxHPFromLevel(level) {
   const hp = Math.round(20 * Math.pow(1.03, Math.max(0, level - 1)));
   return Math.max(1, hp);
+}
+function enemyMaxHPFromLevelOrBoss(level){
+  return isBossSelected() ? bossMaxHPForToday() : enemyMaxHPFromLevel(level);
 }
 
 function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
@@ -117,12 +132,13 @@ const SCENE = {
     };
 
     this.playerMaxHP = this.adj.health;
-    this.enemyMaxHP  = enemyMaxHPFromLevel(level);
+    this.enemyMaxHP  = enemyMaxHPFromLevelOrBoss(level);
 
     this.playerHP = this.playerMaxHP;
     this.enemyHP  = this.enemyMaxHP;
 
-    logLine(`Seeded L${level}: Enemy HP ${this.enemyMaxHP}, You HP ${this.playerMaxHP}.`);
+    const tag = isBossSelected() ? 'Daily Boss' : `L${level}`;
+    logLine(`Seeded ${tag}: Enemy HP ${this.enemyMaxHP}, You HP ${this.playerMaxHP}.`);
     updateHPBars();
   },
 
@@ -130,7 +146,8 @@ const SCENE = {
     if (!this.inBattle) {
       this.seed(getLevel());
       this.inBattle = true;
-      logLine(`Mission ${this.level} — Skirmish engaged!`);
+      const tag = isBossSelected() ? 'Daily Boss' : `Mission ${this.level}`;
+      logLine(`${tag} — Skirmish engaged!`);
     }
   },
 
