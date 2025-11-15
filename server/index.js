@@ -1,5 +1,5 @@
-// server/index.js — XRPixel Jets API (2025-11-11 hot-claims r2)
-// Fix: remove duplicate OPTIONS route, harden CORS, keep live claims & bazaar.
+// server/index.js — XRPixel Jets API (2025-11-11 hot-claims r3)
+// Fix: harden daily-cap query so claim route never 500s if claim_audit is missing/broken.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -60,12 +60,10 @@ await app.register(cors, {
   methods: ['GET','POST','OPTIONS'],
   allowedHeaders: '*',                                // mirror requested headers
   credentials: false,
-  // extra safety when browsers send funky preflights
   maxAge: 86400,
   strictPreflight: false
 });
 
-// Echo ACAO early so even early 4xx include it
 app.addHook('preHandler', async (req, reply) => {
   const origin = req.headers.origin;
   if (origin && ALLOW.includes(origin)) {
@@ -74,7 +72,6 @@ app.addHook('preHandler', async (req, reply) => {
   }
 });
 
-// Also echo ACAO on the way out (covers normal flows)
 app.addHook('onSend', async (req, reply, payload) => {
   const origin = req.headers.origin;
   if (origin && ALLOW.includes(origin)) {
@@ -121,7 +118,6 @@ const OPEN_ROUTES = [
   '/bazaar/hot/live'
 ];
 
-// Require X-Wallet for protected routes + simple rate-limit
 app.addHook('onRequest', async (req, reply) => {
   const url = (req.raw.url || '').split('?')[0];
   if (req.method === 'OPTIONS') return;
@@ -161,11 +157,22 @@ async function getProfileRaw(wallet){
 function recomputeCurrent(b, lv){
   const base = b || { health:20, energyCap:100, regenPerMin:1 };
   const L    = lv|| { health:0,  energyCap:0,   regenPerMin:0 };
-  return { health:(base.health|0)+(L.health|0), energyCap:(base.energyCap|0)+(L.energyCap|0), regenPerMin:Number(base.regenPerMin||0)+Number(L.regenPerMin||0)*REGEN_STEP };
+  return {
+    health:(base.health|0)+(L.health|0),
+    energyCap:(base.energyCap|0)+(L.energyCap|0),
+    regenPerMin:Number(base.regenPerMin||0)+Number(L.regenPerMin||0)*REGEN_STEP
+  };
 }
 function toClient(row){
   const cur=row.ms_current || recomputeCurrent(row.ms_base,row.ms_level);
-  return { ms:{ base:row.ms_base, level:row.ms_level, current:cur }, pct:{ hit:row.ms_hit|0, crit:row.ms_crit|0, dodge:row.ms_dodge|0 }, jetFuel:row.jet_fuel|0, energy:row.energy|0, energyCap:row.energy_cap|0, unlockedLevel:row.unlocked_level|0 };
+  return {
+    ms:{ base:row.ms_base, level:row.ms_level, current:cur },
+    pct:{ hit:row.ms_hit|0, crit:row.ms_crit|0, dodge:row.ms_dodge|0 },
+    jetFuel:row.jet_fuel|0,
+    energy:row.energy|0,
+    energyCap:row.energy_cap|0,
+    unlockedLevel:row.unlocked_level|0
+  };
 }
 async function regenEnergyIfDue(wallet){
   let row = await getProfileRaw(wallet); if (!row) return null;
@@ -180,7 +187,10 @@ async function regenEnergyIfDue(wallet){
   if (gain <= 0) return row;
   const before = row.energy|0; if (before >= cap) return row;
   const after = Math.min(cap, before + gain); if (after === before) return row;
-  const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [wallet, after]);
+  const { rows } = await pool.query(
+    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
+    [wallet, after]
+  );
   return rows[0] || row;
 }
 
@@ -188,7 +198,12 @@ async function regenEnergyIfDue(wallet){
 const NONCES = new Map();
 const newNonce = () => crypto.randomBytes(32).toString('hex');
 function storeNonce(address, nonce){ NONCES.set(address,{nonce,exp:Date.now()+5*60_000,used:false}); }
-function takeNonce(address){ const r=NONCES.get(address); if(!r){return {err:'expired_nonce'}}; NONCES.delete(address); if(r.used||Date.now()>r.exp){return {err:'expired_nonce'}}; r.used=true; return {ok:true, nonce:r.nonce}; }
+function takeNonce(address){
+  const r=NONCES.get(address); if(!r){return {err:'expired_nonce'};}
+  NONCES.delete(address);
+  if(r.used||Date.now()>r.exp){return {err:'expired_nonce'};}
+  r.used=true; return {ok:true, nonce:r.nonce};
+}
 
 function signJWT(address, scope='play,upgrade,claim,bazaar'){
   const now=nowSec(); const exp=now+60*60;
@@ -222,32 +237,51 @@ app.get('/config', async (_req, reply) => {
 /* ============================= session (JWT) =============================== */
 app.post('/session/start', async (req, reply) => {
   const { address } = req.body || {};
-  if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) return reply.code(400).send({ error:'bad_address' });
+  if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address))
+    return reply.code(400).send({ error:'bad_address' });
   await ensureProfile(address);
   const nonce = newNonce(); storeNonce(address, nonce);
   reply.send({ nonce, payload:`XRPixelJets|${nonce}` });
 });
 
 async function verifyOrFinish(req, reply) {
-  const { address, signature, publicKey, payloadHex, scope='play,upgrade,claim,bazaar', ts, txProof } = req.body || {};
-  if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) return reply.code(400).send({ error:'bad_address' });
+  const {
+    address,
+    signature,
+    publicKey,
+    payloadHex,
+    scope='play,upgrade,claim,bazaar',
+    ts,
+    txProof
+  } = req.body || {};
 
-  const taken = takeNonce(address); if (!taken.ok) return reply.code(400).send({ error:taken.err });
-  const now = nowSec(); const tsNum = Number(ts || now);
-  if (!Number.isFinite(tsNum) || Math.abs(now-tsNum)>300) return reply.code(400).send({ error:'expired_nonce' });
+  if (!address || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address))
+    return reply.code(400).send({ error:'bad_address' });
+
+  const taken = takeNonce(address);
+  if (!taken.ok) return reply.code(400).send({ error:taken.err });
+
+  const now = nowSec();
+  const tsNum = Number(ts || now);
+  if (!Number.isFinite(tsNum) || Math.abs(now-tsNum)>300)
+    return reply.code(400).send({ error:'expired_nonce' });
 
   // WC AccountSet tx-proof path (secp)
   if (txProof && txProof.tx_blob) {
     try {
       const tx = decode(txProof.tx_blob);
-      if (tx.TransactionType !== 'AccountSet') return reply.code(400).send({ error:'bad_tx_type' });
-      if (tx.Account !== address) return reply.code(401).send({ error:'unauthorized' });
+      if (tx.TransactionType !== 'AccountSet')
+        return reply.code(400).send({ error:'bad_tx_type' });
+      if (tx.Account !== address)
+        return reply.code(401).send({ error:'unauthorized' });
       const pub = String(tx.SigningPubKey || '').toUpperCase();
-      if (!(pub.startsWith('02') || pub.startsWith('03'))) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
+      if (!(pub.startsWith('02') || pub.startsWith('03')))
+        return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
 
       const wantMemo = asciiToHex(`XRPixelJets|${taken.nonce}|${scope}|${tsNum}`);
       const memos = (tx.Memos || []).map(m => (m?.Memo?.MemoData || '').toUpperCase());
-      if (!memos.includes(wantMemo)) return reply.code(400).send({ error:'memo_missing' });
+      if (!memos.includes(wantMemo))
+        return reply.code(400).send({ error:'memo_missing' });
 
       const preimageHex = encodeForSigning(tx).toUpperCase();
       const sigHex = String(tx.TxnSignature || '').toUpperCase();
@@ -266,30 +300,71 @@ async function verifyOrFinish(req, reply) {
   // Simple signMessage path (secp only)
   if (!signature) return reply.code(400).send({ error:'bad_signature' });
   if (!publicKey) return reply.code(400).send({ error:'bad_key' });
-  if (isEd25519PublicKeyHex(publicKey)) return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
-  if (!isSecpPublicKeyHex(publicKey)) return reply.code(400).send({ error:'bad_key' });
+  if (isEd25519PublicKeyHex(publicKey))
+    return reply.code(400).send({ error:'bad_key_algo', detail:'secp_required' });
+  if (!isSecpPublicKeyHex(publicKey))
+    return reply.code(400).send({ error:'bad_key' });
 
-  const expectedHex = payloadHex && payloadHex.length>=8 ? String(payloadHex).toUpperCase()
+  const expectedHex = payloadHex && payloadHex.length>=8
+    ? String(payloadHex).toUpperCase()
     : asciiToHex(`${taken.nonce}||${scope}||${tsNum}||${address}`);
+
   let okSig=false, derived='';
-  try { okSig = keypairs.verify(expectedHex, String(signature).toUpperCase(), String(publicKey).toUpperCase())===true; derived = keypairs.deriveAddress(publicKey); } catch {}
+  try {
+    okSig = keypairs.verify(
+      expectedHex,
+      String(signature).toUpperCase(),
+      String(publicKey).toUpperCase()
+    )===true;
+    derived = keypairs.deriveAddress(publicKey);
+  } catch {}
+
   if (!okSig) return reply.code(401).send({ error:'bad_signature' });
   if (derived !== address) return reply.code(401).send({ error:'unauthorized' });
 
   reply.send({ ok:true, jwt: signJWT(address, scope) });
 }
 app.post('/session/verify', verifyOrFinish);
-app.post('/session/finish', verifyOrFinish); // alias
+app.post('/session/finish', verifyOrFinish);
 
 /* ======================= GREEN: profile / ms / battle ====================== */
-function getEconScaleFrom(arg){ const n=Number(arg); return (Number.isFinite(n)&&n>=0) ? n : ECON_SCALE_ENV; }
+function getEconScaleFrom(arg){
+  const n=Number(arg); return (Number.isFinite(n)&&n>=0) ? n : ECON_SCALE_ENV;
+}
 function levelsFromRow(row){
   const lv=row?.ms_level||{};
-  return { health:toInt(lv.health,0), energyCap:toInt(lv.energyCap,0), regenPerMin:toInt(lv.regenPerMin,0), hit:toInt(row?.ms_hit,0), crit:toInt(row?.ms_crit,10), dodge:toInt(row?.ms_dodge,0) };
+  return {
+    health:toInt(lv.health,0),
+    energyCap:toInt(lv.energyCap,0),
+    regenPerMin:toInt(lv.regenPerMin,0),
+    hit:toInt(row?.ms_hit,0),
+    crit:toInt(row?.ms_crit,10),
+    dodge:toInt(row?.ms_dodge,0)
+  };
 }
-function unitCost(level,s){ const raw=BASE_PER_LEVEL*(toInt(level,0)+1); return Math.max(1, Math.round(raw*s)); }
-function calcCosts(levels,s){ return { health:unitCost(levels.health,s), energyCap:unitCost(levels.energyCap,s), regenPerMin:unitCost(levels.regenPerMin,s), hit:unitCost(levels.hit,s), crit:unitCost(levels.crit,s), dodge:unitCost(levels.dodge,s) }; }
-function missionReward(l){ const level = Math.max(1, Number(l) || 1); const base = level<=5 ? [0,100,150,200,250,300][level] : Math.round(300*Math.pow(1.01, level-5)); const reward=Math.round(base*REWARD_SCALE); const cap=Math.max(1,Math.round(10000*REWARD_SCALE)); return Math.max(1,Math.min(cap,reward)); }
+function unitCost(level,s){
+  const raw=BASE_PER_LEVEL*(toInt(level,0)+1);
+  return Math.max(1, Math.round(raw*s));
+}
+function calcCosts(levels,s){
+  return {
+    health:unitCost(levels.health,s),
+    energyCap:unitCost(levels.energyCap,s),
+    regenPerMin:unitCost(levels.regenPerMin,s),
+    hit:unitCost(levels.hit,s),
+    crit:unitCost(levels.crit,s),
+    dodge:unitCost(levels.dodge,s)
+  };
+}
+function missionReward(l){
+  const level = Math.max(1, Number(l) || 1);
+  const base = level<=5
+    ? [0,100,150,200,250,300][level]
+    : Math.round(300*Math.pow(1.01, level-5));
+  const reward=Math.round(base*REWARD_SCALE);
+  const cap=Math.max(1,Math.round(10000*REWARD_SCALE));
+  return Math.max(1,Math.min(cap,reward));
+}
 
 app.get('/profile', async (req, reply) => {
   await ensureProfile(req.wallet);
@@ -298,6 +373,7 @@ app.get('/profile', async (req, reply) => {
   if (!row) return reply.code(404).send({ error:'not_found' });
   reply.send(toClient(row));
 });
+
 app.get('/ms/costs', async (req, reply) => {
   const scale = getEconScaleFrom(req.query?.econScale);
   const row = await getProfileRaw(req.wallet);
@@ -305,6 +381,7 @@ app.get('/ms/costs', async (req, reply) => {
   const levels = levelsFromRow(row);
   reply.send({ costs: calcCosts(levels, scale), levels, scale });
 });
+
 app.post('/ms/upgrade', async (req, reply) => {
   const q = req.body || {}; const scale = getEconScaleFrom(q.econScale);
   let row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
@@ -331,27 +408,39 @@ app.post('/ms/upgrade', async (req, reply) => {
   );
   reply.send({ ok:true, applied, spent, profile: toClient(rows[0]), scale });
 });
+
 app.post('/battle/start', async (req, reply) => {
   const level = toInt((req.body||{}).level, 1);
   let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error:'not_found' });
   let energy=row.energy|0, spent=0; if (energy>=10){ energy-=10; spent=10; }
-  const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [req.wallet, energy]);
+  const { rows } = await pool.query(
+    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
+    [req.wallet, energy]
+  );
   reply.send({ ok:true, level, spent, profile: toClient(rows[0]) });
 });
+
 app.post('/battle/turn', async (req, reply) => {
   let row = await regenEnergyIfDue(req.wallet); if (!row) row = await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error:'not_found' });
   let energy=row.energy|0, spent=0; if (energy>=1){ energy-=1; spent=1; }
-  const { rows } = await pool.query(`update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`, [req.wallet, energy]);
+  const { rows } = await pool.query(
+    `update player_profiles set energy=$2, updated_at=now() where wallet=$1 returning *`,
+    [req.wallet, energy]
+  );
   reply.send({ ok:true, spent, profile: toClient(rows[0]) });
 });
+
 app.post('/battle/finish', async (req, reply) => {
   const lvl=Math.max(1, toInt((req.body||{}).level,1)); const victory=!!(req.body||{}).victory;
   let row = await getProfileRaw(req.wallet); if (!row) return reply.code(404).send({ error:'not_found' });
   let jf=row.jet_fuel|0, unlocked=row.unlocked_level|0, reward=0;
   if (victory){ reward=missionReward(lvl); jf+=reward; if (lvl>=unlocked) unlocked=lvl+1; }
-  const { rows } = await pool.query(`update player_profiles set jet_fuel=$2, unlocked_level=$3, updated_at=now() where wallet=$1 returning *`, [req.wallet, jf, unlocked]);
+  const { rows } = await pool.query(
+    `update player_profiles set jet_fuel=$2, unlocked_level=$3, updated_at=now() where wallet=$1 returning *`,
+    [req.wallet, jf, unlocked]
+  );
   reply.send({ ok:true, reward, victory, level:lvl, profile: toClient(rows[0]) });
 });
 
@@ -364,7 +453,7 @@ app.post('/claim/start', async (req, reply) => {
     return reply.code(400).send({ error:'bad_amount' });
   }
 
-  // Cooldown gate
+  // Cooldown + basic profile
   const row = await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error:'not_found' });
 
@@ -377,28 +466,29 @@ app.post('/claim/start', async (req, reply) => {
     return reply.code(429).send({ error:'cooldown' });
   }
 
-  // Daily cap (rolling 24h, across all successful claims)
+  // Daily cap (rolling 24h). Hardened so DB issues can't 500 the route.
   if (CLAIM_MAX_PER_24H > 0) {
-    const { rows: dayRows } = await pool.query(
-      `select coalesce(sum(amount), 0)::int as total
-         from claim_audit
-        where wallet = $1
-          and created_at >= now() - interval '24 hours'`,
-      [req.wallet]
-    );
-    const claimed   = (dayRows[0]?.total | 0);
-    const projected = claimed + amount;
+    try {
+      const { rows: dayRows } = await pool.query(
+        `select coalesce(sum(amount), 0)::int as total
+           from claim_audit
+          where wallet = $1
+            and created_at >= now() - interval '24 hours'`,
+        [req.wallet]
+      );
+      const claimed   = (dayRows[0]?.total | 0);
+      const projected = claimed + amount;
 
-    if (projected > CLAIM_MAX_PER_24H) {
-      const remaining = Math.max(0, CLAIM_MAX_PER_24H - claimed);
-      return reply.code(400).send({
-        error: 'daily_cap',
-        detail: {
-          max: CLAIM_MAX_PER_24H,
-          claimed,
-          remaining
-        }
-      });
+      if (projected > CLAIM_MAX_PER_24H) {
+        const remaining = Math.max(0, CLAIM_MAX_PER_24H - claimed);
+        return reply.code(400).send({
+          error: 'daily_cap',
+          detail: { max: CLAIM_MAX_PER_24H, claimed, remaining }
+        });
+      }
+    } catch (e) {
+      req.log.error({ e }, '[claim] daily_cap_query_failed');
+      // Soft-fail: do NOT block claims if the audit table is missing/misconfigured.
     }
   }
 
@@ -473,11 +563,22 @@ app.post('/claim/start', async (req, reply) => {
   }
 });
 
+/* ================================ BAZAAR ================================== */
+if (BAZAAR_ENABLED) {
+  await registerBazaarHotRoutes(app, {
+    xrpl,
+    XRPL_WSS,
+    HOT_SEED,
+    TOKEN_MODE,
+    CURRENCY_CODE,
+    CURRENCY_HEX,
+    ISSUER_ADDR
+  });
+}
+
 /* ================================ Startup ================================= */
 app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   app.log.info(`XRPixel Jets API listening on :${PORT}`);
   if (xrpl.wallet) app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
   else app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
 });
-
-
