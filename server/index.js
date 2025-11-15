@@ -22,6 +22,7 @@ const ALLOW = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeyg
   .split(',').map(s => s.trim()).filter(Boolean);
 
 const ECON_SCALE_ENV = Number(process.env.ECON_SCALE || 0.10);
+const CLAIM_MAX_PER_24H = Number(process.env.CLAIM_MAX_PER_24H || 15000);
 const BASE_PER_LEVEL  = Number(process.env.BASE_PER_LEVEL || 300);
 const REGEN_STEP      = Number(process.env.REGEN_STEP || 0.1);
 const REWARD_SCALE    = Number.isFinite(Number(process.env.REWARD_SCALE))
@@ -356,67 +357,64 @@ app.post('/battle/finish', async (req, reply) => {
 
 /* =============================== CLAIM LIVE =============================== */
 app.post('/claim/start', async (req, reply) => {
-  const jwtOk = requireJWT(req, reply);
-  if (!jwtOk) return;
+  const jwtOk = requireJWT(req, reply); if (!jwtOk) return;
 
   const amount = toInt(req.body?.amount, 0);
   if (!Number.isFinite(amount) || amount <= 0) {
-    return reply.code(400).send({ error: 'bad_amount' });
+    return reply.code(400).send({ error:'bad_amount' });
   }
 
-  // Load profile for cooldown + balance checks
+  // Cooldown gate
   const row = await getProfileRaw(req.wallet);
-  if (!row) return reply.code(404).send({ error: 'not_found' });
+  if (!row) return reply.code(404).send({ error:'not_found' });
 
   const nowS  = nowSec();
-  const lastS = row.last_claim_at ? Math.floor(new Date(row.last_claim_at).getTime() / 1000) : 0;
-
-  // ⏱ Cooldown gate (from env, default 300s)
-  if (CLAIM_COOLDOWN_SEC > 0 && (nowS - lastS) < CLAIM_COOLDOWN_SEC) {
-    return reply.code(429).send({ error: 'cooldown' });
+  const lastS = row.last_claim_at
+    ? Math.floor(new Date(row.last_claim_at).getTime()/1000)
+    : 0;
+  const COOL = Number(process.env.CLAIM_COOLDOWN_SEC || 300);
+  if (COOL > 0 && (nowS - lastS) < COOL) {
+    return reply.code(429).send({ error:'cooldown' });
   }
 
-  // 💰 Explicit in-game balance check (JetFuel)
-  const jfBal = row.jet_fuel | 0;
-  if (jfBal < amount) {
-    return reply.code(400).send({ error: 'insufficient_funds' });
-  }
-
-  // 📉 24h rolling cap: max CLAIM_MAX_PER_24H JetFuel per wallet
+  // Daily cap (rolling 24h, across all successful claims)
   if (CLAIM_MAX_PER_24H > 0) {
-    const { rows: capRows } = await pool.query(
-      `select coalesce(sum(amount),0)::int as total
+    const { rows: dayRows } = await pool.query(
+      `select coalesce(sum(amount), 0)::int as total
          from claim_audit
         where wallet = $1
           and created_at >= now() - interval '24 hours'`,
       [req.wallet]
     );
-    const used24h = (capRows[0]?.total | 0) || 0;
-    if (used24h + amount > CLAIM_MAX_PER_24H) {
-      const remaining = Math.max(0, CLAIM_MAX_PER_24H - used24h);
-      return reply.code(429).send({
-        error:      'daily_limit',
-        maxPer24h:  CLAIM_MAX_PER_24H,
-        used24h,
-        remaining
+    const claimed   = (dayRows[0]?.total | 0);
+    const projected = claimed + amount;
+
+    if (projected > CLAIM_MAX_PER_24H) {
+      const remaining = Math.max(0, CLAIM_MAX_PER_24H - claimed);
+      return reply.code(400).send({
+        error: 'daily_cap',
+        detail: {
+          max: CLAIM_MAX_PER_24H,
+          claimed,
+          remaining
+        }
       });
     }
   }
 
-  // 🔒 Atomic debit (server-authoritative JetFuel)
+  // Atomic debit – ensures player actually has this much JetFuel
   const debit = await pool.query(
     `update player_profiles
         set jet_fuel = jet_fuel - $2,
             updated_at = now()
       where wallet = $1
         and jet_fuel >= $2
-    returning *`,
+      returning *`,
     [req.wallet, amount]
   );
 
   if (debit.rows.length === 0) {
-    // Race-condition safety: balance changed between read + debit
-    return reply.code(400).send({ error: 'insufficient_funds' });
+    return reply.code(400).send({ error:'insufficient_funds' });
   }
 
   try {
@@ -432,13 +430,13 @@ app.post('/claim/start', async (req, reply) => {
                 updated_at = now()
           where wallet = $1`,
         [req.wallet, amount]
-      ).catch(() => {});
+      ).catch(()=>{});
 
       const code = (sendErr === 'trustline_required') ? 400 : 500;
       return reply.code(code).send({ error: sendErr || 'claim_failed', detail });
     }
 
-    // ✅ Record success (or mock/prepare acknowledgement)
+    // Record success (or mock/prepare acknowledgement)
     await pool.query(
       `update player_profiles
           set last_claim_at = now(),
@@ -448,11 +446,12 @@ app.post('/claim/start', async (req, reply) => {
     );
     await pool.query(
       `insert into claim_audit (wallet, amount, tx_hash)
-            values ($1, $2, $3)`,
+       values ($1, $2, $3)`,
       [req.wallet, amount, txid]
-    ).catch(() => {});
+    ).catch(()=>{});
 
     const latest = await getProfileRaw(req.wallet);
+
     return reply.send({
       ok: true,
       txid,
@@ -467,10 +466,10 @@ app.post('/claim/start', async (req, reply) => {
               updated_at = now()
         where wallet = $1`,
       [req.wallet, amount]
-    ).catch(() => {});
+    ).catch(()=>{});
 
     req.log.error({ e }, '[claim] sendIssued failed');
-    return reply.code(500).send({ error: 'claim_failed' });
+    return reply.code(500).send({ error:'claim_failed' });
   }
 });
 
@@ -480,4 +479,5 @@ app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   if (xrpl.wallet) app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
   else app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
 });
+
 
