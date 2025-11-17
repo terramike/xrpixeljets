@@ -1,5 +1,6 @@
-// server/index.js — XRPixel Jets API (2025-11-11 hot-claims r3)
+// server/index.js — XRPixel Jets API (2025-11-17 rewards+claim-fee r1)
 // Fixes: hardened claims + daily cap; CORS; reduced DB churn on /profile creation.
+// Adds: new missionReward curve; claim fee with env knob; richer claim response.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -23,13 +24,19 @@ const ALLOW = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeyg
   .map(s => s.trim())
   .filter(Boolean);
 
-const ECON_SCALE_ENV   = Number(process.env.ECON_SCALE || 0.10);
+const ECON_SCALE_ENV    = Number(process.env.ECON_SCALE || 0.10);
 const CLAIM_MAX_PER_24H = Number(process.env.CLAIM_MAX_PER_24H || 15000);
-const BASE_PER_LEVEL   = Number(process.env.BASE_PER_LEVEL || 300);
-const REGEN_STEP       = Number(process.env.REGEN_STEP || 0.1);
-const REWARD_SCALE     = Number.isFinite(Number(process.env.REWARD_SCALE))
+const BASE_PER_LEVEL    = Number(process.env.BASE_PER_LEVEL || 300);
+const REGEN_STEP        = Number(process.env.REGEN_STEP || 0.1);
+
+// Reward tuning
+const REWARD_SCALE = Number.isFinite(Number(process.env.REWARD_SCALE))
   ? Number(process.env.REWARD_SCALE)
-  : ECON_SCALE_ENV;
+  : ECON_SCALE_ENV; // default to old behavior if not set
+const REWARD_MAX   = Number(process.env.REWARD_MAX || 0); // optional hard cap per mission (0 = no cap)
+
+// Claim fee (basis points: 100 = 1%, 1500 = 15%)
+const CLAIM_FEE_BPS = Number(process.env.CLAIM_FEE_BPS || 0);
 
 /** XRPL */
 const XRPL_WSS = process.env.XRPL_WSS || 'wss://xrplcluster.com';
@@ -416,14 +423,29 @@ function calcCosts(levels, s) {
     dodge:       unitCost(levels.dodge, s)
   };
 }
+
+// NEW: missionReward curve (Mike's spec) + REWARD_SCALE + optional cap
 function missionReward(l) {
   const level = Math.max(1, Number(l) || 1);
-  const base = level <= 5
-    ? [0, 100, 150, 200, 250, 300][level]
-    : Math.round(300 * Math.pow(1.01, level - 5));
-  const reward = Math.round(base * REWARD_SCALE);
-  const cap    = Math.max(1, Math.round(10000 * REWARD_SCALE));
-  return Math.max(1, Math.min(cap, reward));
+  let base;
+
+  if (level <= 5) {
+    // 1–5: [1,1,2,2,3]
+    const table = [0, 1, 1, 2, 2, 3];
+    base = table[level] || 1;
+  } else {
+    // Then +1 every 3 levels, starting at 4 JF at level 6:
+    // 6–8: 4, 9–11: 5, 12–14: 6, etc.
+    const k = level - 6;
+    const block = Math.floor(k / 3); // 0 for 6–8, 1 for 9–11...
+    base = 4 + block;
+  }
+
+  let reward = Math.round(base * (REWARD_SCALE || 1));
+  if (REWARD_MAX > 0 && reward > REWARD_MAX) {
+    reward = REWARD_MAX;
+  }
+  return Math.max(1, reward);
 }
 
 app.get('/profile', async (req, reply) => {
@@ -596,6 +618,7 @@ app.post('/claim/start', async (req, reply) => {
     return reply.code(429).send({ error: 'cooldown' });
   }
 
+  // Daily cap is based on gross JetFuel spent (amount)
   if (CLAIM_MAX_PER_24H > 0) {
     try {
       const { rows: dayRows } = await pool.query(
@@ -619,6 +642,16 @@ app.post('/claim/start', async (req, reply) => {
     }
   }
 
+  // Compute claim fee and net payout (in-game JetFuel -> JETS on-ledger)
+  const feeBps = Math.max(0, Number.isFinite(CLAIM_FEE_BPS) ? CLAIM_FEE_BPS : 0);
+  const fee = feeBps > 0 ? Math.floor((amount * feeBps) / 10000) : 0;
+  const net = amount - fee;
+
+  if (net <= 0) {
+    return reply.code(400).send({ error: 'claim_fee_too_high' });
+  }
+
+  // Debit JetFuel by the full amount
   const debit = await pool.query(
     `update player_profiles
         set jet_fuel = jet_fuel - $2,
@@ -634,10 +667,12 @@ app.post('/claim/start', async (req, reply) => {
   }
 
   try {
+    // Send only the net amount as JETS on-ledger
     const { ok, txid = null, txJSON = null, error: sendErr, detail } =
-      await sendIssued({ to: req.wallet, amount });
+      await sendIssued({ to: req.wallet, amount: net });
 
     if (!ok && TOKEN_MODE === 'hot') {
+      // Refund the full amount of JetFuel if XRPL send failed
       await pool.query(
         `update player_profiles
             set jet_fuel = jet_fuel + $2,
@@ -650,6 +685,7 @@ app.post('/claim/start', async (req, reply) => {
       return reply.code(code).send({ error: sendErr || 'claim_failed', detail });
     }
 
+    // Record last_claim_at and audit the gross amount (JetFuel spent)
     await pool.query(
       `update player_profiles
           set last_claim_at = now(),
@@ -669,9 +705,13 @@ app.post('/claim/start', async (req, reply) => {
       ok: true,
       txid,
       txJSON,
+      amount, // JetFuel spent by player
+      fee,    // JetFuel burned as claim fee
+      net,    // JETS sent to wallet
       profile: toClient(latest || debit.rows[0])
     });
   } catch (e) {
+    // On unexpected error, refund the full JetFuel amount
     await pool.query(
       `update player_profiles
           set jet_fuel = jet_fuel + $2,
