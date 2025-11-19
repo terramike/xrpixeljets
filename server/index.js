@@ -279,11 +279,14 @@ async function ensureXRPL() {
 /* ============================== /config =================================== */
 app.get('/config', async (_req, reply) => {
   reply.send({
-    tokenMode:   TOKEN_MODE,
-    network:     XRPL_WSS,
+    tokenMode: TOKEN_MODE,
+    network: XRPL_WSS,
     currencyCode: CURRENCY_CODE,
     currencyHex: CURRENCY_HEX,
-    issuer:      ISSUER_ADDR
+    issuer: ISSUER_ADDR,
+    // New: surface claim economics to the client
+    claimFeeBps: CLAIM_FEE_BPS,        // e.g. 1500 = 15%
+    claimMaxPer24h: CLAIM_MAX_PER_24H  // e.g. 15000 JetFuel/day
   });
 });
 
@@ -747,3 +750,4 @@ app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
     app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
   }
 });
+
