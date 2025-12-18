@@ -15,7 +15,6 @@
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.11.5",
     "ripple-keypairs": "^1.0.1",
-    "xrpl": "^4.3.0",
-    "xumm-sdk": "^2.6.0"
+    "xrpl": "^4.3.0"
   }
 }
