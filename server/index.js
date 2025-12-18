@@ -12,10 +12,6 @@ import { decode, encodeForSigning } from 'ripple-binary-codec';
 import { Client as XRPLClient, Wallet as XRPLWallet } from 'xrpl';
 import { registerBazaarHotRoutes } from './bazaar-hot.js';
 import { sendIssued } from './claimJetFuel.js';
-import xaman from './xaman.js';
-if (process.env.XAMAN_API_KEY && process.env.XAMAN_API_SECRET) {
-  app.register(xaman);
-}
 
 const { Pool } = pkg;
 const app = Fastify({ logger: true });
@@ -754,6 +750,7 @@ app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
     app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
   }
 });
+
 
 
 
