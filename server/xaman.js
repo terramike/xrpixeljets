@@ -1,12 +1,20 @@
-// server/xaman.js — 2025-12-18r1 (Fastify plugin to create/poll Xaman payloads)
+// server/xaman.js — 2025-12-18r2 (safe: no top-level xumm-sdk import)
 import fp from 'fastify-plugin';
-import { XummSdk } from 'xumm-sdk'; // yarn add xumm-sdk
 
-export default fp(async function (app, _opts) {
+export default fp(async function (app) {
   const { XAMAN_API_KEY, XAMAN_API_SECRET, JETS_RETURN_WEB } = process.env;
   if (!XAMAN_API_KEY || !XAMAN_API_SECRET) {
     app.log.warn('[Xaman] Disabled (missing XAMAN_API_KEY / XAMAN_API_SECRET)');
     return;
+  }
+
+  // Lazy-load xumm-sdk only when configured
+  let XummSdk;
+  try {
+    ({ XummSdk } = await import('xumm-sdk'));
+  } catch (e) {
+    app.log.error(e, '[Xaman] xumm-sdk not installed — add it to dependencies or disable plugin');
+    throw e;
   }
 
   const sdk = new XummSdk(XAMAN_API_KEY, XAMAN_API_SECRET);
@@ -17,23 +25,14 @@ export default fp(async function (app, _opts) {
       if (!tx_json || typeof tx_json !== 'object') {
         return reply.code(400).send({ error: 'bad_tx_json' });
       }
-
       const payload = await sdk.payload.create({
         txjson: tx_json,
         options: {
           submit: options?.submit ?? true,
-          return_url: {
-            web: JETS_RETURN_WEB || 'https://mykeygo.io/jets'
-          }
+          return_url: { web: JETS_RETURN_WEB || 'https://mykeygo.io/jets' }
         }
       });
-
-      // shape: {uuid, next:{always,web,app}, refs:{qr_png}}
-      return reply.send({
-        uuid: payload.uuid,
-        next: payload.next,
-        refs: payload.refs
-      });
+      return reply.send({ uuid: payload.uuid, next: payload.next, refs: payload.refs });
     } catch (e) {
       req.log.error(e, '[Xaman] create failed');
       return reply.code(500).send({ error: 'xaman_create_failed' });
