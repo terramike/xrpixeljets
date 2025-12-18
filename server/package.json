@@ -2,7 +2,8 @@
   "name": "xrpixel-jets-server",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=18 <25" }
+  "engines": {
+    "node": ">=18 <25"
   },
   "scripts": {
     "start": "node index.js"
@@ -12,6 +13,7 @@
     "@fastify/cors": "^8.4.0",
     "pg": "^8.11.5",
     "xrpl": "^4.3.0",
+    "xumm-sdk": "^2.6.0"
     "jsonwebtoken": "^9.0.2",
     "ripple-keypairs": "^1.0.1"
   }
