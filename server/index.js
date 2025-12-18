@@ -1,6 +1,8 @@
-// server/index.js — XRPixel Jets API (2025-11-17 rewards+claim-fee r1)
-// Fixes: hardened claims + daily cap; CORS; reduced DB churn on /profile creation.
-// Adds: new missionReward curve; claim fee with env knob; richer claim response.
+// server.js — XRPixel Jets API (freshie 2025-12-18r3)
+// Base: last working index.js you provided; small additions:
+//  - GET /healthz
+//  - Guarded Bazaar registration (unchanged behavior, safer logs)
+//  - Optional Xaman plugin (dynamic import; only when keys present)
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -32,8 +34,8 @@ const REGEN_STEP        = Number(process.env.REGEN_STEP || 0.1);
 // Reward tuning
 const REWARD_SCALE = Number.isFinite(Number(process.env.REWARD_SCALE))
   ? Number(process.env.REWARD_SCALE)
-  : ECON_SCALE_ENV; // default to old behavior if not set
-const REWARD_MAX   = Number(process.env.REWARD_MAX || 0); // optional hard cap per mission (0 = no cap)
+  : ECON_SCALE_ENV;
+const REWARD_MAX   = Number(process.env.REWARD_MAX || 0); // 0 = no cap
 
 // Claim fee (basis points: 100 = 1%, 1500 = 15%)
 const CLAIM_FEE_BPS = Number(process.env.CLAIM_FEE_BPS || 0);
@@ -93,7 +95,6 @@ app.setErrorHandler((err, req, reply) => {
   const origin = req.headers.origin;
   if (origin && ALLOW.includes(origin)) {
     reply.header('Access-Control-Allow-Origin', origin);
-    reply.header('Vary', 'Origin');
   }
   const code = err.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
   req.log.error({ err }, 'request_error');
@@ -127,7 +128,8 @@ const OPEN_ROUTES = [
   '/bazaar/skus',
   '/bazaar/hot/ping',
   '/bazaar/hot/check',
-  '/bazaar/hot/live'
+  '/bazaar/hot/live',
+  '/xaman/payload' // note: also allows /xaman/payload/:uuid via startsWith check below
 ];
 
 app.addHook('onRequest', async (req, reply) => {
@@ -151,6 +153,9 @@ app.addHook('onRequest', async (req, reply) => {
     return reply.code(429).send({ error: 'rate_limited' });
   }
 });
+
+/* =============================== HEALTHZ ================================== */
+app.get('/healthz', async () => ({ ok: true }));
 
 /* ============================= PROFILES ============================= */
 async function ensureProfile(wallet) {
@@ -270,7 +275,7 @@ function requireJWT(req, reply) {
   }
 }
 
-/* ================= XRPL helpers for WC tx-proof (secp only) ================ */
+/* ============== XRPL helpers for WC tx-proof (secp only) ================== */
 async function ensureXRPL() {
   if (!xrpl.wallet) throw new Error('hot_wallet_missing');
   if (!xrpl.client.isConnected()) await xrpl.client.connect();
@@ -284,9 +289,8 @@ app.get('/config', async (_req, reply) => {
     currencyCode: CURRENCY_CODE,
     currencyHex: CURRENCY_HEX,
     issuer: ISSUER_ADDR,
-    // New: surface claim economics to the client
-    claimFeeBps: CLAIM_FEE_BPS,        // e.g. 1500 = 15%
-    claimMaxPer24h: CLAIM_MAX_PER_24H  // e.g. 15000 JetFuel/day
+    claimFeeBps: CLAIM_FEE_BPS,
+    claimMaxPer24h: CLAIM_MAX_PER_24H
   });
 });
 
@@ -427,32 +431,26 @@ function calcCosts(levels, s) {
   };
 }
 
-// NEW: missionReward curve (Mike's spec) + REWARD_SCALE + optional cap
+// NEW: missionReward curve + REWARD_SCALE + optional cap
 function missionReward(l) {
   const level = Math.max(1, Number(l) || 1);
   let base;
 
   if (level <= 5) {
-    // 1–5: [1,1,2,2,3]
     const table = [0, 1, 1, 2, 2, 3];
     base = table[level] || 1;
   } else {
-    // Then +1 every 3 levels, starting at 4 JF at level 6:
-    // 6–8: 4, 9–11: 5, 12–14: 6, etc.
     const k = level - 6;
-    const block = Math.floor(k / 3); // 0 for 6–8, 1 for 9–11...
+    const block = Math.floor(k / 3);
     base = 4 + block;
   }
 
   let reward = Math.round(base * (REWARD_SCALE || 1));
-  if (REWARD_MAX > 0 && reward > REWARD_MAX) {
-    reward = REWARD_MAX;
-  }
+  if (REWARD_MAX > 0 && reward > REWARD_MAX) reward = REWARD_MAX;
   return Math.max(1, reward);
 }
 
 app.get('/profile', async (req, reply) => {
-  // profile row is created during /session/start; no need to ensure here
   const rowR = await regenEnergyIfDue(req.wallet);
   const row  = rowR || await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error: 'not_found' });
@@ -621,7 +619,6 @@ app.post('/claim/start', async (req, reply) => {
     return reply.code(429).send({ error: 'cooldown' });
   }
 
-  // Daily cap is based on gross JetFuel spent (amount)
   if (CLAIM_MAX_PER_24H > 0) {
     try {
       const { rows: dayRows } = await pool.query(
@@ -645,7 +642,6 @@ app.post('/claim/start', async (req, reply) => {
     }
   }
 
-  // Compute claim fee and net payout (in-game JetFuel -> JETS on-ledger)
   const feeBps = Math.max(0, Number.isFinite(CLAIM_FEE_BPS) ? CLAIM_FEE_BPS : 0);
   const fee = feeBps > 0 ? Math.floor((amount * feeBps) / 10000) : 0;
   const net = amount - fee;
@@ -654,7 +650,6 @@ app.post('/claim/start', async (req, reply) => {
     return reply.code(400).send({ error: 'claim_fee_too_high' });
   }
 
-  // Debit JetFuel by the full amount
   const debit = await pool.query(
     `update player_profiles
         set jet_fuel = jet_fuel - $2,
@@ -670,12 +665,10 @@ app.post('/claim/start', async (req, reply) => {
   }
 
   try {
-    // Send only the net amount as JETS on-ledger
     const { ok, txid = null, txJSON = null, error: sendErr, detail } =
       await sendIssued({ to: req.wallet, amount: net });
 
     if (!ok && TOKEN_MODE === 'hot') {
-      // Refund the full amount of JetFuel if XRPL send failed
       await pool.query(
         `update player_profiles
             set jet_fuel = jet_fuel + $2,
@@ -688,7 +681,6 @@ app.post('/claim/start', async (req, reply) => {
       return reply.code(code).send({ error: sendErr || 'claim_failed', detail });
     }
 
-    // Record last_claim_at and audit the gross amount (JetFuel spent)
     await pool.query(
       `update player_profiles
           set last_claim_at = now(),
@@ -714,7 +706,6 @@ app.post('/claim/start', async (req, reply) => {
       profile: toClient(latest || debit.rows[0])
     });
   } catch (e) {
-    // On unexpected error, refund the full JetFuel amount
     await pool.query(
       `update player_profiles
           set jet_fuel = jet_fuel + $2,
@@ -730,27 +721,51 @@ app.post('/claim/start', async (req, reply) => {
 
 /* ================================ BAZAAR ================================== */
 if (BAZAAR_ENABLED) {
-  await registerBazaarHotRoutes(app, {
-    xrpl,
-    XRPL_WSS,
-    HOT_SEED,
-    TOKEN_MODE,
-    CURRENCY_CODE,
-    CURRENCY_HEX,
-    ISSUER_ADDR
-  });
+  try {
+    await registerBazaarHotRoutes(app, {
+      xrpl,
+      XRPL_WSS,
+      HOT_SEED,
+      TOKEN_MODE,
+      CURRENCY_CODE,
+      CURRENCY_HEX,
+      ISSUER_ADDR
+    });
+    app.log.info('[Bazaar] hot routes registered');
+  } catch (e) {
+    app.log.error(e, '[Bazaar] failed to register');
+  }
+}
+
+/* ============================ Optional Xaman ============================== */
+// Loads ONLY when keys are present; otherwise skipped (prevents xumm-sdk crashes)
+try {
+  if (process.env.XAMAN_API_KEY && process.env.XAMAN_API_SECRET) {
+    const { default: xaman } = await import('./xaman.js'); // xaman.js lazily imports xumm-sdk internally
+    await (async () => app.register(xaman))();
+    app.log.info('[Xaman] plugin registered');
+  } else {
+    app.log.info('[Xaman] plugin not configured');
+  }
+} catch (e) {
+  app.log.error(e, '[Xaman] plugin failed to register');
 }
 
 /* ================================ Startup ================================= */
-app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
-  app.log.info(`XRPixel Jets API listening on :${PORT}`);
-  if (xrpl.wallet) {
-    app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
-  } else {
-    app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
+const HOST = process.env.HOST || '0.0.0.0';
+const start = async () => {
+  try {
+    await app.ready();
+    await app.listen({ port: PORT, host: HOST });
+    app.log.info({ host: HOST, port: PORT }, '[Server] listening');
+    if (xrpl.wallet) {
+      app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
+    } else {
+      app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
+    }
+  } catch (err) {
+    app.log.error(err, '[Server] failed to start');
+    process.exit(1);
   }
-});
-
-
-
-
+};
+await start();
