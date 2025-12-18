@@ -2,8 +2,7 @@
   "name": "xrpixel-jets-server",
   "private": true,
   "type": "module",
-  "engines": {
-    "node": ">=18"
+  "engines": { "node": ">=18 <25" }
   },
   "scripts": {
     "start": "node index.js"
