@@ -6,15 +6,16 @@
     "node": ">=18 <25"
   },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "NODE_ENV=development node index.js"
   },
   "dependencies": {
-    "fastify": "^4.29.1",
     "@fastify/cors": "^8.4.0",
+    "fastify": "^4.29.1",
+    "jsonwebtoken": "^9.0.2",
     "pg": "^8.11.5",
+    "ripple-keypairs": "^1.0.1",
     "xrpl": "^4.3.0",
     "xumm-sdk": "^2.6.0"
-    "jsonwebtoken": "^9.0.2",
-    "ripple-keypairs": "^1.0.1"
   }
 }
