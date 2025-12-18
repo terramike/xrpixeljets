@@ -1,5 +1,6 @@
-// jets/js/scene.js — XRPixel Jets MKG (2025-11-01-boss1)
-// Adds Daily Boss seeding (big HP reset daily). No change to energy or turn costs.
+// jets/js/scene.js — XRPixel Jets MKG (2025-11-21-thorns1)
+// Adds Daily Boss seeding (big HP reset daily) + Damage Shield thorns.
+// No change to energy or turn costs.
 
 import { GameState } from './state.js';
 import { updateHPBars } from './ui.js';
@@ -95,9 +96,17 @@ const SCENE = {
   enemyHP: 20,
   enemyMaxHP: 20,
   adj: null, // accessory-adjusted snapshot for this seed
+  effects: { damageShieldPerHit: 0, bonusAttacksPerTurn: 0 }, // combat effects (thorns, extra swings)
 
   seed(level = getLevel()) {
     this.level = level;
+
+    // Snapshot combat effects from GameState (e.g., legendary jets + combat NFTs)
+    const fx = GameState?.combatEffects || {};
+    this.effects = {
+      damageShieldPerHit: Math.max(0, Number(fx.damageShieldPerHit || 0)),
+      bonusAttacksPerTurn: Math.max(0, Number(fx.bonusAttacksPerTurn || 0))
+    };
 
     // RAW base (no derived HP here):
     const msHP  = Number(GameState?.ms?.current?.health ?? 20);
@@ -168,16 +177,42 @@ const SCENE = {
     if (this.enemyHP <= 0) { this.inBattle = false; logLine(`🏆 Victory!`); return; }
 
     // Enemy action
+    let enemyHit = false;
+    let lastEnemyDamage = 0;
+
     if (rollEnemyHit()) {
       const { dmg: edmg, defUsed } = calcEnemyDamage(this.level);
       this.playerHP = Math.max(0, this.playerHP - edmg);
+      lastEnemyDamage = edmg;
+      enemyHit = true;
       logLine(`Enemy hits for ${edmg} (🛡️${Math.round(defUsed)}).`);
     } else {
       logLine(`Enemy misses.`);
     }
 
+    // Damage Shield / Thorns (from combat effects)
+    const fx = this.effects || GameState?.combatEffects || {};
+    const thorns = Math.max(0, Number(fx.damageShieldPerHit || 0));
+
+    if (enemyHit && thorns > 0 && this.playerHP > 0 && this.enemyHP > 0) {
+      const reflect = Math.min(thorns, this.enemyHP);
+      if (reflect > 0) {
+        this.enemyHP = Math.max(0, this.enemyHP - reflect);
+        logLine(`Your shield reflects ${reflect} damage back!`);
+      }
+    }
+
     updateHPBars();
-    if (this.playerHP <= 0) { this.inBattle = false; logLine(`💀 Defeat…`); }
+
+    if (this.playerHP <= 0) {
+      this.inBattle = false;
+      logLine(`💀 Defeat…`);
+      return;
+    }
+    if (this.enemyHP <= 0) {
+      this.inBattle = false;
+      logLine(`🏆 Victory!`);
+    }
   },
 
   resetBattle() { this.inBattle = false; this.seed(getLevel()); }

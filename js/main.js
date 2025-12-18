@@ -1,4 +1,4 @@
-// XRPixel Jets — main.js (2025-10-26-energy-single-writer + 2025-10-28 squad-totals-hotfix + ui-hooks)
+// XRPixel Jets — main.js (2025-11-21-thorns1)
 // Root: Energy is SERVER-AUTHORITATIVE. Minimal overlay that paints Squad ATK/SPD/DEF
 // as (Main + Wing + Accessories) and keeps HIT/CRIT/DODGE chips in sync.
 
@@ -14,6 +14,7 @@ import { renderJets, recalcSquad } from './jets.js';
 import * as SceneMod from './scene.js';
 import { installBattleTuning } from './battle-tuning.js';
 import { getAccessoryBonuses, applyAccessoryBonuses, refreshAccessoryPanel } from '/jets/js/accessories.js';
+import { getCombatEffectsForWallet } from '/jets/js/combat-effects.js';
 
 const ECON_SCALE = 0.10;
 const KEY_LAST   = 'JETS_LAST_MISSION';
@@ -238,6 +239,61 @@ async function updateAccessoriesForWallet(addr){
   } catch {}
 }
 
+// ------- Combat Effects wiring (Damage Shield, bonus attacks) -------
+// Merge: combat NFTs (from combat-effects.js) + legendary jet thorns (Main/Wing)
+async function updateCombatEffectsForWallet(addr){
+  const w = (addr || window.CURRENT_WALLET || '').trim();
+  if (!w || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(w)) {
+    GameState.combatEffects = { damageShieldPerHit: 0, bonusAttacksPerTurn: 0 };
+    if (SCENE && typeof SCENE === 'object') {
+      SCENE.effects = { damageShieldPerHit: 0, bonusAttacksPerTurn: 0 };
+    }
+    return;
+  }
+
+  try {
+    const base = await getCombatEffectsForWallet(w, { force: true });
+    const main = GameState.mainJet || {};
+    const wing = GameState.wingJet || {};
+
+    const dsMain = Number(
+      main.damageShieldPerHit ??
+      main.dmgShield ??
+      main.stats?.damageShieldPerHit ??
+      0
+    );
+    const dsWing = Number(
+      wing.damageShieldPerHit ??
+      wing.dmgShield ??
+      wing.stats?.damageShieldPerHit ??
+      0
+    );
+
+    const dsLedger = Number(base?.damageShieldPerHit || 0);
+    const bonusAttacks = Number(base?.bonusAttacksPerTurn || 0);
+
+    const totalDS = Math.max(0, Math.min(10, dsLedger + dsMain + dsWing));
+    const totalBA = Math.max(0, Math.min(2, bonusAttacks));
+
+    const effects = {
+      damageShieldPerHit: totalDS,
+      bonusAttacksPerTurn: totalBA
+    };
+
+    GameState.combatEffects = effects;
+    if (SCENE && typeof SCENE === 'object') {
+      SCENE.effects = { ...effects };
+    }
+
+    try {
+      window.dispatchEvent(new CustomEvent('jets:combatfx', { detail: { wallet: w, effects } }));
+    } catch {}
+    console.log('[Jets] CombatFX', effects);
+  } catch (e) {
+    console.warn('[Jets] combat effects load failed', e);
+  }
+}
+
 // ------- XRPL Jets render -------
 function loadScriptOnce(src){
   return new Promise((resolve, reject)=>{
@@ -253,8 +309,8 @@ function loadScriptOnce(src){
 }
 async function ensureXRPLStack() {
   if (!window.xrpl) await loadScriptOnce('/jets/js/vendor/xrpl-latest-min.js');
-  await loadScriptOnce('/jets/js/wallet-xrpl.js?v=2025-10-25claim2');
-  await loadScriptOnce('/jets/js/wallet-jets-meta.js?v=2025-10-28fix1');
+  await loadScriptOnce('/jets/js/wallet-xrpl.js?v=2025-11-20w2');
+  await loadScriptOnce('/jets/js/wallet-jets-meta.js?v=2025-11-21jets19ds1');
   if (!window.XRPLWallet || typeof window.XRPLWallet.loadXRPLJets !== 'function') {
     console.warn('[Jets] XRPLWallet.loadXRPLJets not available after meta load.');
   }
@@ -270,15 +326,42 @@ async function loadAndRenderJets(address){
     const jets = await window.XRPLWallet.loadXRPLJets(address);
     GameState.jets = jets || [];
     renderJets(
-      (jet)=>{ GameState.mainJet=jet; setMainCard(jet); if(!GameState.wingJet){ GameState.wingJet=GameState.mainJet; setWingCard(GameState.wingJet); } recalcSquad(); renderSquadStats(); renderSquadTotalsAdjusted(); },
-      (jet)=>{ GameState.wingJet=jet; setWingCard(jet); if(!GameState.mainJet){ GameState.mainJet=GameState.wingJet; setMainCard(GameState.mainJet); } recalcSquad(); renderSquadStats(); renderSquadTotalsAdjusted(); },
+      (jet)=>{
+        GameState.mainJet = jet;
+        setMainCard(jet);
+        if (!GameState.wingJet) {
+          GameState.wingJet = GameState.mainJet;
+          setWingCard(GameState.wingJet);
+        }
+        recalcSquad();
+        renderSquadStats();
+        renderSquadTotalsAdjusted();
+        // Recompute combat effects whenever Main changes
+        updateCombatEffectsForWallet(window.CURRENT_WALLET);
+      },
+      (jet)=>{
+        GameState.wingJet = jet;
+        setWingCard(jet);
+        if (!GameState.mainJet) {
+          GameState.mainJet = GameState.wingJet;
+          setMainCard(GameState.mainJet);
+        }
+        recalcSquad();
+        renderSquadStats();
+        renderSquadTotalsAdjusted();
+        // Recompute combat effects whenever Wing changes
+        updateCombatEffectsForWallet(window.CURRENT_WALLET);
+      },
       GameState.jets
     );
     if (!GameState.mainJet && GameState.jets[0]) { GameState.mainJet=GameState.jets[0]; setMainCard(GameState.mainJet); }
     if (!GameState.wingJet && GameState.mainJet) { GameState.wingJet=GameState.mainJet; setWingCard(GameState.wingJet); }
     recalcSquad(); renderSquadStats(); renderSquadTotalsAdjusted();
     await updateAccessoriesForWallet(address);
+    await updateCombatEffectsForWallet(address);
     log(`Loaded ${GameState.jets.length} XRPL Jets.`);
+    // NEW: update buttons now that we know if a Jet exists
+    refreshActionButtons();
   } catch(e){ console.error(e); }
 }
 
@@ -300,6 +383,13 @@ function setSelectedLevel(lvl){
   try { localStorage.setItem(KEY_LAST, want); } catch {}
 }
 
+// ------- jet gate helper -------
+// NEW: require at least one XRPixel Jet before missions can start
+function hasPixelJet(){
+  const jets = GameState?.jets;
+  return Array.isArray(jets) && jets.length > 0;
+}
+
 // ------- buttons state -------
 function refreshActionButtons(){
   const inBattle = !!SCENE?.inBattle;
@@ -307,15 +397,25 @@ function refreshActionButtons(){
   const next  = $('#btn-next');
   const reset = $('#btn-restart');
 
-  if (start) start.disabled = inBattle || !canSpend(10);
+  const canFly = hasPixelJet(); // NEW
+
+  if (start) start.disabled = inBattle || !canSpend(10) || !canFly;
   if (next)  next.disabled  = !inBattle || !canSpend(1);
   if (reset) reset.disabled = false;
 }
 
 // ------- battle handlers (no optimistic spending) -------
 async function handleStart(){
+  // NEW: hard gate start if no Jet loaded
+  if (!hasPixelJet()) {
+    logLine('⛔ You need an XRPixel Jet to fly missions. Load your Jets from the XRPL first.');
+    refreshActionButtons();
+    return;
+  }
+
   if (!canSpend(10)) { logLine('Not enough energy to start (10⚡).'); return; }
   await updateAccessoriesForWallet(window.CURRENT_WALLET);
+  await updateCombatEffectsForWallet(window.CURRENT_WALLET);
 
   const start = $('#btn-start'); if (start) start.disabled = true;
   try{
@@ -334,6 +434,7 @@ async function handleStart(){
     refreshActionButtons();
   }
 }
+
 async function handleNextTurn(){
   if (!SCENE?.inBattle) { logLine('⛔ No active battle. Press Start (10⚡).'); refreshActionButtons(); return; }
   if (!canSpend(1)) { logLine('Not enough energy for next turn (1⚡).'); return; }
@@ -426,7 +527,7 @@ function bindUpgradeButtons(){
   });
 }
 
-// ------- bindings -------
+// ------- bindings -------  
 let BOUND = false;
 function bindUI(){
   if (BOUND) return; BOUND = true;
@@ -452,10 +553,11 @@ function bindUI(){
   window.addEventListener('jets:auth', (ev) => {
     const w = ev?.detail?.address || window.CURRENT_WALLET;
     updateAccessoriesForWallet(w);
+    updateCombatEffectsForWallet(w);
     renderSquadTotalsAdjusted();
   });
   window.addEventListener('jets:accessories', ()=>renderSquadTotalsAdjusted());
-  window.addEventListener('jets:profile',     ()=>renderSquadTotalsAdjusted()); // << missing hook added
+  window.addEventListener('jets:profile',     ()=>renderSquadTotalsAdjusted());
 
   bindUpgradeButtons();
   refreshActionButtons();
@@ -471,6 +573,7 @@ async function init(){
   if (addr) {
     setWallet(addr);
     await updateAccessoriesForWallet(addr); // fetch bonuses and render panel on boot
+    await updateCombatEffectsForWallet(addr);
   }
 
   await loadProfileAndHUD();

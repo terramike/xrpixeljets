@@ -1,8 +1,15 @@
-/* XRPixel Jets — wallet-jets-meta.js (2025-10-28fix1)
+// --- idempotent guard (prevents double init if file is included twice) ---
+(function(g){
+  g.__JETS_WALLET_XRPL__ = g.__JETS_WALLET_XRPL__ || { inited:false };
+  if (g.__JETS_WALLET_XRPL__.inited) { console.debug('[wallet-xrpl] already inited; skipping'); return; }
+  g.__JETS_WALLET_XRPL__.inited = true;
+})(window);
+
+/* XRPixel Jets — wallet-jets-meta.js (2025-11-20stat19)
    Metadata-aware loader for XLS-20 NFTs with resilient IPFS gateways + caching.
    - Fetches account_nfts (mainnet)
    - Resolves NFT URI (hex → ascii; ipfs:// → http gateways)
-   - Parses attributes: Attack aN, Speed sN, Defense dN (N = 1..9), Top/Bottom Gun, Jet ID
+   - Parses attributes: Attack aN, Speed sN, Defense dN (N = 1..19), Top/Bottom Gun, Jet ID
    - Exposes camelCase + snake_case fields for UI compatibility
 */
 (function(){
@@ -14,7 +21,9 @@
   const metaCache = new Map(); // uriAscii -> parsed meta
 
   const isR = s => typeof s==='string' && /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(s);
-  const clamp19 = n => Math.max(1, Math.min(9, Number(n)||0));
+
+  // Allow stats up to 19 (future-proof for A13+/S13+/D13+)
+  const clampStat = n => Math.max(1, Math.min(19, Number(n) || 0));
 
   function hexToAscii(hex){
     try{
@@ -57,7 +66,7 @@
         const v = String(a.value || '').toLowerCase();
         const num = (prefix)=>{
           const m = v.match(new RegExp(`^${prefix}?(\\d+)`));
-          return m ? clamp19(parseInt(m[1],10)) : null;
+          return m ? clampStat(parseInt(m[1],10)) : null;
         };
         if (t==='attack' || t==='atk') attack = num('a');
         else if (t==='speed' || t==='spd') speed = num('s');
@@ -94,12 +103,17 @@
     }
   }
 
+  // Fallback path when metadata is missing: map ledger fields into 1..19 band
   function fallbackStats(nft){
     const fee   = Number(nft.transfer_fee ?? nft.TransferFee ?? 0);
     const flags = Number(nft.flags ?? nft.Flags ?? 0);
     const taxon = Number(nft.nftoken_taxon ?? nft.NFTokenTaxon ?? 0);
-    const to19  = (n)=> ((n % 9) + 1); // map to 1..9, not 5..14
-    return { attack: to19(fee), speed: to19(flags), defense: to19(taxon) };
+    const toStat = (n) => {
+      const x = Number(n) || 0;
+      const r = x % 19;
+      return r === 0 ? 19 : r;   // map into 1..19
+    };
+    return { attack: toStat(fee), speed: toStat(flags), defense: toStat(taxon) };
   }
 
   async function listAllNFTs(addr){
@@ -113,7 +127,7 @@
         if (marker) req.marker=marker;
         const resp = await client.request(req);
         const rows = (resp.result.account_nfts||[]);
-        out.push(...rows);                       // ← fixed (no stray ".")
+        out.push(...rows);
         marker = resp.result.marker;
       } while (marker);
     } finally { try { await client.disconnect(); } catch {} }
@@ -133,7 +147,7 @@
       const meta = await resolveMeta(nft);
       const has  = (v)=> typeof v==='number' && Number.isFinite(v);
 
-      // Prefer on-metadata a/s/d; fall back to 1..9 derived
+      // Prefer on-metadata a/s/d; fall back to 1..19 derived
       const fb    = fallbackStats(nft);
       const atk   = has(meta.attack)  ? meta.attack  : fb.attack;
       const spd   = has(meta.speed)   ? meta.speed   : fb.speed;

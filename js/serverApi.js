@@ -1,69 +1,130 @@
-// serverApi.js — 2025-10-31rel3 (JetsApi shim for WC + same API as rel2)
+// /jets/js/serverApi.js — 2025-11-19 rel4
+// JetsApi shim for XRPixel Jets (WC + browser modules)
+
 const API_BASE = window.JETS_API_BASE || 'https://xrpixeljets.onrender.com';
 
+// ---- Auth token handling ----
 let AUTH_JWT = null;
-try { AUTH_JWT = (localStorage.getItem('JWT') || '').trim() || null; } catch {}
+try {
+  AUTH_JWT = (localStorage.getItem('JWT') || '').trim() || null;
+} catch {}
 
-export function setWallet(addr){
-  try { localStorage.setItem('WALLET', (addr||'').trim()); } catch {}
-  window.CURRENT_WALLET = (addr||'').trim();
+// ---- Wallet helpers ----
+export function setWallet(addr) {
+  const clean = (addr || '').trim();
+  try {
+    localStorage.setItem('WALLET', clean);
+  } catch {}
+  window.CURRENT_WALLET = clean;
 }
+
 function getWallet() {
-  const el = document.getElementById('xrpl-address');
-  if (el && el.value && el.value.startsWith('r')) return el.value.trim();
+  const input = document.getElementById('xrpl-address');
+  if (input && input.value && input.value.startsWith('r')) {
+    return input.value.trim();
+  }
   const w = (window.CURRENT_WALLET || '').trim();
   if (w) return w;
-  try { const ls = (localStorage.getItem('WALLET') || '').trim(); if (ls) return ls; } catch {}
+  try {
+    const ls = (localStorage.getItem('WALLET') || '').trim();
+    if (ls) return ls;
+  } catch {}
   return '';
 }
+
+// ---- JWT helpers ----
 export function setAuthToken(jwt) {
   AUTH_JWT = jwt || null;
-  try { localStorage.setItem('JWT', AUTH_JWT || ''); } catch {}
+  try {
+    localStorage.setItem('JWT', AUTH_JWT || '');
+  } catch {}
 }
+
+// ---- HTTP helpers ----
 function headersJSON(includeWallet = true, extra = {}) {
   const h = { 'Content-Type': 'application/json', ...extra };
-  if (includeWallet) { const w = getWallet(); if (w) h['X-Wallet'] = w; }
-  if (AUTH_JWT) h['Authorization'] = 'Bearer ' + AUTH_JWT;
+  if (includeWallet) {
+    const w = getWallet();
+    if (w) h['X-Wallet'] = w;
+  }
+  if (AUTH_JWT) {
+    h['Authorization'] = 'Bearer ' + AUTH_JWT;
+  }
   return h;
 }
+
 async function fetchJSON(path, opts = {}) {
   const res = await fetch(API_BASE + path, opts);
-  const raw = await res.text().catch(()=>'');
-  const data = raw ? (()=>{ try{ return JSON.parse(raw); }catch{ return {}; } })() : {};
+  const raw = await res.text().catch(() => '');
+  const data = raw
+    ? (() => {
+        try {
+          return JSON.parse(raw);
+        } catch {
+          return {};
+        }
+      })()
+    : {};
+
   if (!res.ok) {
-    const msg = `[API] ${res.status} @ ${path} — ${(data.error || data.message || raw || res.statusText)}`;
+    const msg = `[API] ${res.status} @ ${path} — ${
+      data.error || data.message || raw || res.statusText
+    }`;
     console.error(msg);
-    try { document.dispatchEvent(new CustomEvent('server-error', { detail: msg })); } catch {}
+    try {
+      document.dispatchEvent(new CustomEvent('server-error', { detail: msg }));
+    } catch {}
     throw new Error(msg);
   }
+
   return data;
 }
 
-// AUTH
+// ---- AUTH ----
 export async function sessionStart(address) {
-  if (!address || !address.startsWith('r')) throw new Error('bad_address');
-  return fetchJSON('/session/start', { method:'POST', headers: headersJSON(false), body: JSON.stringify({ address }) });
+  const addr = (address || '').trim();
+  if (!addr || !addr.startsWith('r')) throw new Error('bad_address');
+  return fetchJSON('/session/start', {
+    method: 'POST',
+    headers: headersJSON(false),
+    body: JSON.stringify({ address: addr })
+  });
 }
-export async function sessionVerify({ address, signature, publicKey, scope='play,upgrade,claim', ts, payload, payloadHex } = {}) {
-  if (!address || !address.startsWith('r')) throw new Error('bad_address');
+
+export async function sessionVerify({
+  address,
+  signature,
+  publicKey,
+  scope = 'play,upgrade,claim',
+  ts,
+  payload,
+  payloadHex
+} = {}) {
+  const addr = (address || '').trim();
+  if (!addr || !addr.startsWith('r')) throw new Error('bad_address');
   if (!signature) throw new Error('bad_signature');
   if (!publicKey) throw new Error('bad_key');
-  const hdrs = headersJSON(true, { 'X-Wallet': address });
+
+  const hdrs = headersJSON(true, { 'X-Wallet': addr });
   const res = await fetchJSON('/session/verify', {
     method: 'POST',
     headers: hdrs,
-    body: JSON.stringify({ address, signature, publicKey, scope, ts, payload, payloadHex })
+    body: JSON.stringify({ address: addr, signature, publicKey, scope, ts, payload, payloadHex })
   });
+
   if (res?.jwt) setAuthToken(res.jwt);
   return res;
 }
-export const startSession  = sessionStart;
+
+// Back-compat aliases
+export const startSession = sessionStart;
 export const verifySession = sessionVerify;
 
-// GAMEPLAY
+// ---- GAMEPLAY / PROFILE ----
 function resolveScale(arg) {
   if (typeof arg === 'number' && Number.isFinite(arg)) return arg;
   if (typeof arg === 'string' && arg.trim() && !isNaN(arg)) return Number(arg);
+
   if (arg && typeof arg === 'object') {
     if ('econScale' in arg && !isNaN(arg.econScale)) return Number(arg.econScale);
     if ('scale' in arg && !isNaN(arg.scale)) return Number(arg.scale);
@@ -71,38 +132,101 @@ function resolveScale(arg) {
   }
   return null;
 }
-export async function getProfile() { return fetchJSON('/profile', { headers: headersJSON(true) }); }
+
+export async function getProfile() {
+  return fetchJSON('/profile', { headers: headersJSON(true) });
+}
+
+// NEW: alias so SrvAPI.profile() also works
+export async function profile() {
+  return getProfile();
+}
+
 export async function getMsCosts(arg) {
   const s = resolveScale(arg);
   const qs = `?econScale=${encodeURIComponent(s != null ? s : 0.10)}`;
-  try { return await fetchJSON('/ms/costs' + qs, { headers: headersJSON(true) }); }
-  catch (e) {
+
+  try {
+    // primary path
+    return await fetchJSON('/ms/costs' + qs, { headers: headersJSON(true) });
+  } catch (e) {
     const msg = String(e?.message || '');
+    // backwards-compat fallbacks if server is still on older routes
     if (msg.includes(' 404 @ /ms/costs')) {
-      try { return await fetchJSON('/ms/cost' + qs, { headers: headersJSON(true) }); } catch {}
-      try { return await fetchJSON('/mothership/costs' + qs, { headers: headersJSON(true) }); } catch {}
+      try {
+        return await fetchJSON('/ms/cost' + qs, { headers: headersJSON(true) });
+      } catch {}
+      try {
+        return await fetchJSON('/mothership/costs' + qs, { headers: headersJSON(true) });
+      } catch {}
     }
     throw e;
   }
 }
+
 export async function msUpgrade(queue) {
-  return fetchJSON('/ms/upgrade', { method:'POST', headers: headersJSON(true), body: JSON.stringify(queue||{}) });
+  return fetchJSON('/ms/upgrade', {
+    method: 'POST',
+    headers: headersJSON(true),
+    body: JSON.stringify(queue || {})
+  });
 }
-export async function battleStart(p)  { return fetchJSON('/battle/start',  { method:'POST', headers: headersJSON(true), body: JSON.stringify(p||{}) }); }
-export async function battleTurn(p)   { return fetchJSON('/battle/turn',   { method:'POST', headers: headersJSON(true), body: JSON.stringify(p||{}) }); }
-export async function battleFinish(p) { return fetchJSON('/battle/finish', { method:'POST', headers: headersJSON(true), body: JSON.stringify(p||{}) }); }
 
-// CLAIM
+export async function battleStart(payload) {
+  return fetchJSON('/battle/start', {
+    method: 'POST',
+    headers: headersJSON(true),
+    body: JSON.stringify(payload || {})
+  });
+}
+
+export async function battleTurn(payload) {
+  return fetchJSON('/battle/turn', {
+    method: 'POST',
+    headers: headersJSON(true),
+    body: JSON.stringify(payload || {})
+  });
+}
+
+export async function battleFinish(payload) {
+  return fetchJSON('/battle/finish', {
+    method: 'POST',
+    headers: headersJSON(true),
+    body: JSON.stringify(payload || {})
+  });
+}
+
+// ---- CLAIM ----
 export async function claimStart(amount) {
-  return fetchJSON('/claim/start', { method:'POST', headers: headersJSON(true), body: JSON.stringify({ amount: Number(amount||0) }) });
+  const amtNum = Number(amount || 0);
+  return fetchJSON('/claim/start', {
+    method: 'POST',
+    headers: headersJSON(true),
+    body: JSON.stringify({ amount: amtNum })
+  });
 }
 
-// ---- Tiny bridge so WC can call without importing modules ----
+// ---- Tiny bridge so non-module scripts (older WC, etc.) can call API ----
 try {
   window.JetsApi = window.JetsApi || {};
   Object.assign(window.JetsApi, {
-    setWallet, setAuthToken,
-    claimStart, sessionStart, sessionVerify, startSession, verifySession,
-    getProfile
+    setWallet,
+    setAuthToken,
+    // auth
+    sessionStart,
+    sessionVerify,
+    startSession,
+    verifySession,
+    // profile
+    getProfile,
+    profile,
+    // gameplay
+    getMsCosts,
+    msUpgrade,
+    battleStart,
+    battleTurn,
+    battleFinish,
+    // claim
+    claimStart
   });
 } catch {}

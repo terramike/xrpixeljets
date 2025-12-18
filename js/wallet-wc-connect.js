@@ -69,132 +69,78 @@ export default WC;
     if (!ModalCtor){
       const mod = await tryImport([
         'https://cdn.jsdelivr.net/npm/@walletconnect/modal@2.7.0/dist/index.js',
-        'https://unpkg.com/@walletconnect/modal@2.7.0/dist/index.js',
         'https://esm.sh/@walletconnect/modal@2.7.0'
       ]);
-      if (mod) g.WalletConnectModal = mod.WalletConnectModal || mod.default;
+      if (mod) g.WalletConnectModal = mod.default || mod.WalletConnectModal || mod;
       ModalCtor = g.WalletConnectModal;
     }
-    if (!ModalCtor) throw new Error('WalletConnectModal missing');
-    if (!SignClient)  throw new Error('SignClient missing');
 
-    // modal css (idempotent)
-    if (![...document.styleSheets].some(ss => (ss.href||'').includes('/modal@2.7.0/'))){
-      const link = document.createElement('link');
-      link.rel = 'stylesheet';
-      link.href = 'https://cdn.jsdelivr.net/npm/@walletconnect/modal@2.7.0/dist/styles.css';
-      document.head.appendChild(link);
-    }
+    if (!SignClient || !ModalCtor) throw new Error('wc_deps_missing');
   }
 
-  // ---------- init / connect / disconnect ----------
-  async function init({ projectId, relayUrl } = {}){
+  // ---------- init / connect ----------
+  async function init({ projectId }){
+    if (!projectId) throw new Error('wc_projectId_missing');
+    S.projectId = projectId;
     await ensureDeps();
-    S.projectId = (projectId || g.WC_PROJECT_ID || '').trim();
-    if (!S.projectId) throw new Error('WalletConnect projectId required');
-
-    const SignClient = g.WalletConnect.SignClient;
-    S.client = await SignClient.init({
-      projectId: S.projectId,
-      relayUrl: relayUrl || 'wss://relay.walletconnect.com',
-    });
-
-    const ModalCtor = g.WalletConnectModal;
-    S.modal = new ModalCtor({ projectId: S.projectId, enableExplorer: true });
-
-    // expose internals for advanced handlers (optional)
-    XRPLWallet.__Sclient = S.client;
-    XRPLWallet.__Smodal  = S.modal;
-
-    const sessions = S.client.session.getAll?.() || [];
-    if (sessions.length){
-      S.session = sessions[0];
-      const addr = parseFirstAccount(S.session);
-      if (addr) setCurrentWallet(addr);
-      hud('Ready (restored WC session).');
-    } else {
-      hud('Ready.');
-    }
-
-    wireUI();
-    return S.client;
-  }
-
-  async function openModalWithFallback(uri){
-    // Always try to open the modal (even with no uri — shows paired wallets)
-    if (uri) {
-      await S.modal.openModal({ uri, standaloneChains:[CHAIN_ID] });
-      // Mobile fallback: if modal didn't render, deep-link to resolver in the same click
-      setTimeout(() => {
-        const opened = document.querySelector('.walletconnect-modal__container');
-        if (!opened && isMobile()) {
-          const link = `https://r.walletconnect.com/?uri=${encodeURIComponent(uri)}`;
-          location.href = link;
-        }
-      }, 600);
-    } else {
-      await S.modal.openModal({ standaloneChains:[CHAIN_ID] });
-    }
+    S.client = await g.WalletConnect.SignClient.init({ projectId });
+    S.modal = new g.WalletConnectModal({ projectId, themeMode:'dark' });
+    S.__Sclient = S.client; // internal bridge
+    hud('WC inited.');
   }
 
   async function connect(){
-    if (!S.client || !S.modal) throw new Error('WalletConnect not initialized');
+    if (!S.client || !S.modal) throw new Error('wc_not_inited');
 
-    // request pairing
     const { uri, approval } = await S.client.connect({ requiredNamespaces: S.requiredNamespaces });
-
-    // show modal regardless of uri (existing pairing often yields undefined)
-    try { await openModalWithFallback(uri); }
-    catch (e) {
-      // As a last resort, deep-link if we have a URI
-      if (uri) location.href = `https://r.walletconnect.com/?uri=${encodeURIComponent(uri)}`;
+    if (uri) {
+      if (isMobile()) window.open(uri, '_blank');
+      else await S.modal.openModal({ uri });
     }
 
-    // wait for approval
-    const session = await approval();
-    S.session = session;
-    try { S.modal.closeModal(); } catch {}
+    S.session = await approval();
+    const address = parseFirstAccount(S.session);
+    setCurrentWallet(address);
+    hud(`Connected: ${address}`);
+    g.dispatchEvent(new CustomEvent('jets:auth', { detail:{ address } }));
 
-    const addr = parseFirstAccount(S.session);
-    if (!addr) throw new Error('No XRPL account in session');
-    setCurrentWallet(addr);
-    try{ localStorage.removeItem('JWT'); }catch{} // auth is separate per-wallet
-    hud(`Connected ${addr}`);
-    return addr;
+    // NEW: Auto-sign login tx after connect to get JWT
+    try {
+      const API_BASE = g.JETS_API_BASE || 'https://xrpixeljets.onrender.com';
+      const start = await g.JetsApi.sessionStart(address);
+      const ts = Date.now();
+      const scope = 'play,upgrade,claim';
+      const res = await wcSignLoginTx({ address, nonce: start.nonce, scope, ts });
+      const v = await g.JetsApi.sessionVerify({
+        address,
+        network: 'xrpl:mainnet',
+        signer: 'walletconnect',
+        tx_blob: res.tx_blob
+      });
+      await g.JetsApi.setAuthToken(v.token);
+      hud('Signed in with WalletConnect.');
+      const statusEl = document.getElementById('session-status');
+      if (statusEl) statusEl.textContent = `Connected & Signed In: ${address}`;
+    } catch (e) {
+      hud(`Sign-in failed: ${e?.message || e}`);
+    }
   }
 
   async function disconnect(){
     if (!S.session) return;
-    try{
-      await S.client.disconnect({ topic:S.session.topic, reason:{ code:6000, message:'User disconnect' } });
-    } finally {
-      S.session=null; setCurrentWallet(''); try{localStorage.removeItem('JWT');}catch{} hud('Disconnected.');
-    }
+    await S.client.disconnect({ topic: S.session.topic, reason: { code:1, message:'User disconnected' } });
+    S.session = null;
+    setCurrentWallet('');
+    hud('Disconnected.');
+    try { localStorage.removeItem('JWT'); g.JetsApi.setAuthToken(null); } catch {}
   }
 
   function wcGetAddress(){ return parseFirstAccount(S.session); }
   function wcHasSession(){ return !!S.session; }
 
-  // ---------- login (tx-proof) only ----------
-  function isHexBlob(x){ return typeof x==='string' && /^[A-F0-9]+$/i.test(x) && x.length>200; }
-  function deepFindHex(obj){
-    if (!obj) return '';
-    if (isHexBlob(obj)) return obj;
-    if (typeof obj==='object'){
-      for (const k of Object.keys(obj||{})){
-        const hit = deepFindHex(obj[k]); if (hit) return hit;
-      }
-    }
-    return '';
-  }
-  function extractTxBlob(res, fallbackTx){
-    const direct = res?.tx_blob || res?.signedTxn || res?.signedTransaction || res?.tx || res?.blob;
-    if (isHexBlob(direct)) return String(direct);
-    const nested = res?.result || res?.response || res?.data || res?.payload;
-    const nestedBlob = extractTxBlob(nested||{});
-    if (nestedBlob) return nestedBlob;
-    const scanned = deepFindHex(res); if (scanned) return scanned;
-    return isHexBlob(fallbackTx) ? fallbackTx : '';
+  function extractTxBlob(reply){
+    const r = reply?.result || reply;
+    return r?.tx_blob || r?.txBlob || r?.signedTransaction || r?.blob || r?.signedTx || '';
   }
 
   async function wcSignLoginTx({ address, nonce, scope, ts }){
@@ -219,7 +165,10 @@ export default WC;
     let lastErr, reply;
     for (const a of attempts){
       try{
-        reply = await S.client.request({ topic:S.session.topic, chainId:CHAIN_ID, request:{ method:a.method, params:a.params } });
+        reply = await S.client.request({
+          topic:S.session.topic, chainId:CHAIN_ID,
+          request: { method:a.method, params:a.params }
+        });
         const blob = extractTxBlob(reply);
         if (blob){ hud(`Signed via ${a.method}.`); return { tx_blob: blob, tx_json }; }
       }catch(e){ lastErr = e; }

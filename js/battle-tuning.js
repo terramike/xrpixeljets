@@ -1,6 +1,7 @@
-// XRPixel Jets — battle-tuning.js (2025-10-26-combat4 energy-gate)
+// XRPixel Jets — battle-tuning.js (2025-11-21-combat5-thorns)
 // Fixes: Respect battle state + clear it on KO so Next Turn can't bypass 10⚡ entry.
 // Features: initiative per turn, hit/crit/dodge, damage variance, emoji logs.
+// New: Damage Shield (thorns) from scene.effects / GameState.combatEffects.
 
 import { GameState } from './state.js';
 
@@ -24,7 +25,9 @@ const CRIT_MAX = 1.80;
 
 // --------------------------------------
 function emit(line){
-  try { window.dispatchEvent(new CustomEvent('jets:combatlog', { detail: line })); } catch {}
+  try {
+    window.dispatchEvent(new CustomEvent('jets:combatlog', { detail: line }));
+  } catch {}
 }
 function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
 function rint(lo, hi){ return Math.floor(Math.random()*(hi-lo+1))+lo; }
@@ -33,7 +36,7 @@ function rfloat(lo, hi){ return lo + Math.random()*(hi-lo); }
 function readIntTxt(id, fallback){
   const el = document.getElementById(id);
   if (!el) return fallback;
-  const n = parseInt(String(el.textContent||'').replace(/[^\d-]/g,''), 10);
+  const n = parseInt(String(el.textContent || '').replace(/[^\d-]/g, ''), 10);
   return Number.isFinite(n) ? n : fallback;
 }
 
@@ -51,27 +54,38 @@ function getPlayerStats(){
 }
 
 function getEnemyDerived(mission){
-  const { enemyAtk:atk=6, enemyDef:def=4, enemySpd:spd=5 } = mission||{};
-  const hit  = clamp(ENEMY_HIT_BASE + Math.round((spd-5)*3), ENEMY_HIT_MIN, ENEMY_HIT_MAX);
-  const crit = clamp(5 + Math.round((atk-5)*0.5), 5, 18);
-  const dodge= clamp(Math.round(spd*0.7), 0, ENEMY_DODGE_CAP);
+  const { enemyAtk:atk = 6, enemyDef:def = 4, enemySpd:spd = 5 } = mission || {};
+  const hit   = clamp(ENEMY_HIT_BASE + Math.round((spd - 5) * 3), ENEMY_HIT_MIN, ENEMY_HIT_MAX);
+  const crit  = clamp(5 + Math.round((atk - 5) * 0.5), 5, 18);
+  const dodge = clamp(Math.round(spd * 0.7), 0, ENEMY_DODGE_CAP);
   return { atk, def, spd, hit, crit, dodge };
 }
 
 function dmgRoll(att, def, opts){
-  const { hitPct=75, critPct=10 } = opts||{};
-  if (Math.random()*100 > hitPct) return { dmg:0, miss:true, crit:false };
+  const { hitPct = 75, critPct = 10 } = opts || {};
+  if (Math.random() * 100 > hitPct) return { dmg:0, miss:true, crit:false };
+
   const variance = rfloat(VARIANCE_MIN, VARIANCE_MAX);
-  let base = Math.round(Math.max(1, att*variance - def*rfloat(DEF_RAND_MIN, DEF_RAND_MAX)));
-  const isCrit = (Math.random()*100 < critPct);
+  let base = Math.round(Math.max(1, att * variance - def * rfloat(DEF_RAND_MIN, DEF_RAND_MAX)));
+
+  const isCrit = (Math.random() * 100 < critPct);
   if (isCrit) base = Math.round(base * rfloat(CRIT_MIN, CRIT_MAX));
+
   return { dmg: Math.max(0, base), miss:false, crit:isCrit };
+}
+
+// Pull current combat effects (Damage Shield, bonus attacks) from scene/GameState
+function getCombatEffects(scene){
+  const fx = (scene && scene.effects) || (GameState && GameState.combatEffects) || {};
+  const ds = Math.max(0, Number(fx.damageShieldPerHit || 0));
+  const ba = Math.max(0, Number(fx.bonusAttacksPerTurn || 0));
+  return { damageShieldPerHit: ds, bonusAttacksPerTurn: ba };
 }
 
 export function installBattleTuning({ scene, getMission, getCurrentLevel }){
   if (!scene || scene.__jetsTuningInstalled) return;
   scene.__jetsTuningInstalled = true;
-  console.log('[Jets] Combat tuning active (initiative + variance + energy gate)');
+  console.log('[Jets] Combat tuning active (initiative + variance + energy gate + thorns)');
 
   const tuned = function tunedNextTurn(){
     // HARD GATE: must be in an active battle (set by startBattle → 10⚡ server spend)
@@ -85,36 +99,84 @@ export function installBattleTuning({ scene, getMission, getCurrentLevel }){
     let   pHP  = Number(scene.playerHP    ?? 20) || 20;
     let   eHP  = Number(scene.enemyHP     ?? 20) || 20;
 
-    const lvl = typeof getCurrentLevel==='function' ? getCurrentLevel() : 1;
-    const mission = typeof getMission==='function' ? getMission(lvl) : {};
-    const P = getPlayerStats();
-    const E = getEnemyDerived(mission);
+    const lvl     = typeof getCurrentLevel === 'function' ? getCurrentLevel() : 1;
+    const mission = typeof getMission === 'function' ? getMission(lvl) : {};
+    const P       = getPlayerStats();
+    const E       = getEnemyDerived(mission);
+    const fx      = getCombatEffects(scene);
+    const damageShieldPerHit   = fx.damageShieldPerHit;
+    const bonusAttacksPerTurn  = fx.bonusAttacksPerTurn; // reserved for future use
 
     // Initiative per turn
-    const pRoll = P.spd + rint(0, Math.max(1, Math.ceil(P.spd/2)));
-    const eRoll = E.spd + rint(0, Math.max(1, Math.ceil(E.spd/2)));
-    const playerFirst = (pRoll>eRoll) || (pRoll===eRoll && Math.random()<0.5);
+    const pRoll = P.spd + rint(0, Math.max(1, Math.ceil(P.spd / 2)));
+    const eRoll = E.spd + rint(0, Math.max(1, Math.ceil(E.spd / 2)));
+    const playerFirst = (pRoll > eRoll) || (pRoll === eRoll && Math.random() < 0.5);
     emit(`🧭 Initiative — You ${pRoll} vs ${eRoll} (${playerFirst ? 'you first' : 'enemy first'})`);
 
     function resolve(label, A, D){
-      if (Math.random()*100 < D.dodge) { emit(label==='you' ? '💨 You were dodged!' : '🌀 Enemy was dodged!'); return 0; }
+      // returns a rich result so we can hook DS on enemy hits
+      if (Math.random() * 100 < D.dodge) {
+        emit(label === 'you' ? '💨 You were dodged!' : '🌀 Enemy was dodged!');
+        return { dmg:0, miss:false, dodged:true, crit:false, label };
+      }
+
       const out = dmgRoll(A.atk, D.def, { hitPct: A.hit, critPct: A.crit });
-      if (out.miss) { emit(label==='you' ? '💨 You miss!' : '💨 Enemy misses!'); return 0; }
-      if (out.crit) emit(label==='you' ? `✨ CRIT! ${out.dmg} dmg` : `⚡ Enemy CRIT! ${out.dmg} dmg`);
-      else          emit(label==='you' ? `💥 You hit for ${out.dmg}.` : `💢 Enemy hits for ${out.dmg}.`);
-      return out.dmg;
+      if (out.miss) {
+        emit(label === 'you' ? '💨 You miss!' : '💨 Enemy misses!');
+        return { dmg:0, miss:true, dodged:false, crit:false, label };
+      }
+
+      if (out.crit) {
+        emit(label === 'you'
+          ? `✨ CRIT! ${out.dmg} dmg`
+          : `⚡ Enemy CRIT! ${out.dmg} dmg`
+        );
+      } else {
+        emit(label === 'you'
+          ? `💥 You hit for ${out.dmg}.`
+          : `💢 Enemy hits for ${out.dmg}.`
+        );
+      }
+
+      return { dmg: out.dmg, miss:false, dodged:false, crit:out.crit, label };
     }
 
-    if (playerFirst){
-      const dealt = resolve('you', P, E); eHP = clamp(eHP - dealt, 0, eMax);
-      if (eHP>0){ const taken = resolve('enemy', E, P); pHP = clamp(pHP - taken, 0, pMax); }
+    function applyThornsIfAny(taken){
+      if (!damageShieldPerHit) return { pHP, eHP };
+      if (!taken || taken.dmg <= 0) return { pHP, eHP };
+      if (pHP <= 0 || eHP <= 0) return { pHP, eHP };
+
+      const reflect = Math.min(damageShieldPerHit, eHP);
+      if (reflect > 0) {
+        eHP = clamp(eHP - reflect, 0, eMax);
+        emit(`🛡️ Your shield reflects ${reflect} damage back!`);
+      }
+      return { pHP, eHP };
+    }
+
+    if (playerFirst) {
+      const dealt = resolve('you', P, E);
+      eHP = clamp(eHP - dealt.dmg, 0, eMax);
+
+      if (eHP > 0) {
+        const taken = resolve('enemy', E, P);
+        pHP = clamp(pHP - taken.dmg, 0, pMax);
+        ({ pHP, eHP } = applyThornsIfAny(taken));
+      }
     } else {
-      const taken = resolve('enemy', E, P); pHP = clamp(pHP - taken, 0, pMax);
-      if (pHP>0){ const dealt = resolve('you', P, E); eHP = clamp(eHP - dealt, 0, eMax); }
+      const taken = resolve('enemy', E, P);
+      pHP = clamp(pHP - taken.dmg, 0, pMax);
+      ({ pHP, eHP } = applyThornsIfAny(taken));
+
+      if (pHP > 0) {
+        const dealt = resolve('you', P, E);
+        eHP = clamp(eHP - dealt.dmg, 0, eMax);
+      }
     }
 
     // Write back
-    scene.playerHP = pHP; scene.enemyHP = eHP;
+    scene.playerHP = pHP;
+    scene.enemyHP  = eHP;
 
     // KO checks: clear battle state so client must press Start again (→ 10⚡)
     if (eHP <= 0 || pHP <= 0) {

@@ -1,0 +1,45 @@
+{
+  "version": "2025-11-01r1",
+  "rules": {
+    "evaluation": "presencePerCollection_bestOfInside_sumAcrossCollections",
+    "globalCaps": {
+      "attack": 999,
+      "speed": 999,
+      "defense": 999,
+      "health": 9999,
+      "energyCap": 9999,
+      "regen": 999,
+      "hit": 100,
+      "crit": 100,
+      "dodge": 100
+    }
+  },
+  "collections": [
+    {
+      "id": "fuzzy-bears",
+      "name": "Fuzzy Bears",
+      "type": "crew",
+      "logo": "https://mykeygo.io/jets/asset/fuzzybearlogo.webp",
+      "match": [
+        "https://xrp.cafe/collection/fuzzybears",
+        "fuzzy bear",
+        "fuzzybears"
+      ],
+      "bonuses": { "attack": 10, "speed": 10, "defense": 10 },
+      "stacking": "presence"
+    },
+    {
+      "id": "byron-zombies",
+      "name": "Byron Zombies",
+      "type": "crew",
+      "logo": "https://mykeygo.io/jets/asset/byronzombies.webp",
+      "match": [
+        "zombie",
+        "byron",
+        "xrp.cafe/collection/byronzombies"
+      ],
+      "bonuses": { "attack": 12, "crit": 5, "dodge": 3 },
+      "stacking": "presence"
+    }
+  ]
+}
