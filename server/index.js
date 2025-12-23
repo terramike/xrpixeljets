@@ -363,14 +363,12 @@ async function verifyOrFinish(req, reply) {
     }
   }
 
-  // GEM WALLET: Transaction-based auth (client sends decoded signature/publicKey from AccountSet tx)
-  // Better detection: Check if we have the typical Gem Wallet signature pattern (DER-encoded, 140-144 chars)
-  // OR if signature doesn't match expected message signature format
-  const sigLen = (signature || '').length;
-  const isLikelyGemWallet = sigLen >= 140 && sigLen <= 148; // DER-encoded ECDSA signatures
+  // GEM WALLET: Now uses txProof path (lines 330-363)
+  // This custom detection is DISABLED to avoid conflicts with Crossmark
+  // Both Crossmark and Gem can have ~140 char signatures!
+  const isLikelyGemWallet = false; // DISABLED - Gem uses txProof now
   
   if (isLikelyGemWallet) {
-    req.log.info('[Auth] Detected Gem Wallet transaction-based auth (sig length: %d)', sigLen);
     
     try {
       const pub = String(publicKey || '').toUpperCase();
