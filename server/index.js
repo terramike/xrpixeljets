@@ -363,7 +363,71 @@ async function verifyOrFinish(req, reply) {
     }
   }
 
-  // Simple signMessage path (secp only)
+  // GEM WALLET: Transaction-based auth (client sends decoded signature/publicKey from AccountSet tx)
+  // Detect by checking if signature looks like a transaction signature (longer than typical message signature)
+  const isLikelyGemWallet = signature && signature.length > 150;
+  
+  if (isLikelyGemWallet) {
+    req.log.info('[Auth] Detected Gem Wallet transaction-based auth');
+    
+    try {
+      const pub = String(publicKey || '').toUpperCase();
+      if (!(pub.startsWith('02') || pub.startsWith('03'))) {
+        return reply.code(400).send({ error: 'bad_key_algo', detail: 'secp_required' });
+      }
+      
+      // Expected message format: nonce||scope||ts||address
+      const expectedMessage = `${taken.nonce}||${scope}||${tsNum}||${address}`;
+      const expectedMessageHex = asciiToHex(expectedMessage).toUpperCase();
+      
+      // Verify payloadHex matches
+      if (!payloadHex || payloadHex.toUpperCase() !== expectedMessageHex) {
+        req.log.warn('[Auth] Gem Wallet: payloadHex mismatch');
+        return reply.code(401).send({ error: 'bad_signature', detail: 'payload_mismatch' });
+      }
+      
+      // Reconstruct the AccountSet transaction to verify signature
+      const reconstructedTx = {
+        TransactionType: 'AccountSet',
+        Account: address,
+        Memos: [{
+          Memo: {
+            MemoType: asciiToHex('XRPixelJets'),
+            MemoData: expectedMessageHex
+          }
+        }],
+        SigningPubKey: pub,
+        TxnSignature: signature.toUpperCase()
+      };
+      
+      // Encode for signing (without signature field)
+      const { TxnSignature, ...txWithoutSig } = reconstructedTx;
+      const preimageHex = encodeForSigning(txWithoutSig).toUpperCase();
+      
+      // Verify signature
+      const okSig = keypairs.verify(preimageHex, signature.toUpperCase(), pub) === true;
+      if (!okSig) {
+        req.log.warn('[Auth] Gem Wallet: signature verification failed');
+        return reply.code(401).send({ error: 'bad_signature' });
+      }
+      
+      // Verify publicKey derives to address
+      const derived = keypairs.deriveAddress(pub);
+      if (derived !== address) {
+        req.log.warn('[Auth] Gem Wallet: derived address mismatch');
+        return reply.code(401).send({ error: 'unauthorized' });
+      }
+      
+      req.log.info('[Auth] ✅ Gem Wallet auth successful');
+      return reply.send({ ok: true, jwt: signJWT(address, scope) });
+      
+    } catch (err) {
+      req.log.error({ err }, '[Auth] Gem Wallet verification error');
+      return reply.code(401).send({ error: 'bad_signature', detail: 'gem_verify_failed' });
+    }
+  }
+
+  // Simple signMessage path (secp only) - CROSSMARK and others
   if (!signature) return reply.code(400).send({ error: 'bad_signature' });
   if (!publicKey) return reply.code(400).send({ error: 'bad_key' });
   if (isEd25519PublicKeyHex(publicKey)) {
