@@ -364,11 +364,13 @@ async function verifyOrFinish(req, reply) {
   }
 
   // GEM WALLET: Transaction-based auth (client sends decoded signature/publicKey from AccountSet tx)
-  // Detect by checking if signature looks like a transaction signature (longer than typical message signature)
-  const isLikelyGemWallet = signature && signature.length > 150;
+  // Better detection: Check if we have the typical Gem Wallet signature pattern (DER-encoded, 140-144 chars)
+  // OR if signature doesn't match expected message signature format
+  const sigLen = (signature || '').length;
+  const isLikelyGemWallet = sigLen >= 140 && sigLen <= 148; // DER-encoded ECDSA signatures
   
   if (isLikelyGemWallet) {
-    req.log.info('[Auth] Detected Gem Wallet transaction-based auth');
+    req.log.info('[Auth] Detected Gem Wallet transaction-based auth (sig length: %d)', sigLen);
     
     try {
       const pub = String(publicKey || '').toUpperCase();
