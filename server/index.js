@@ -215,7 +215,7 @@ async function regenEnergyIfDue(wallet) {
   const nowS  = nowSec();
   const lastS = row.updated_at ? Math.floor(new Date(row.updated_at).getTime() / 1000) : nowS;
   const deltaS = Math.max(0, nowS - lastS);
-  const gain   = Math.floor((deltaS * rpm) / 60);
+  const gain   = Math.floor((deltaS * rpm) / 3600);
   if (gain <= 0) return row;
 
   const before = row.energy | 0;
@@ -814,3 +814,4 @@ app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
     app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
   }
 });
+
