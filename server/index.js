@@ -1,6 +1,6 @@
-// server/index.js — XRPixel Jets API (2025-11-17 rewards+claim-fee r1)
+// server/index.js — XRPixel Jets API (2025-01-09 NFT regen bonuses r1)
+// Adds: Server-side NFT scanning for regen bonuses (offline regen now includes +regen NFTs)
 // Fixes: hardened claims + daily cap; CORS; reduced DB churn on /profile creation.
-// Adds: new missionReward curve; claim fee with env knob; richer claim response.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -37,6 +37,10 @@ const REWARD_MAX   = Number(process.env.REWARD_MAX || 0); // optional hard cap p
 
 // Claim fee (basis points: 100 = 1%, 1500 = 15%)
 const CLAIM_FEE_BPS = Number(process.env.CLAIM_FEE_BPS || 0);
+
+// NFT Bonus scanning config
+const REGISTRY_URL = process.env.REGISTRY_URL || 'https://mykeygo.io/jets/asset/accessory-registry.json';
+const NFT_BONUS_CACHE_SEC = Number(process.env.NFT_BONUS_CACHE_SEC || 300); // 5 min cache
 
 /** XRPL */
 const XRPL_WSS = process.env.XRPL_WSS || 'wss://xrplcluster.com';
@@ -110,6 +114,7 @@ const pool = new Pool({
 const toInt  = (x, d = 0) => { const n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : d; };
 const nowSec = () => Math.floor(Date.now() / 1000);
 const asciiToHex = (s) => Buffer.from(String(s), 'utf8').toString('hex').toUpperCase();
+const hexToAscii = (h) => { try { return Buffer.from(String(h), 'hex').toString('utf8'); } catch { return ''; } };
 
 const isSecpPublicKeyHex    = (pk) => typeof pk === 'string' && /^(02|03)[0-9A-Fa-f]{64}$/.test(pk);
 const isEd25519PublicKeyHex = (pk) => typeof pk === 'string' && /^ED[0-9A-Fa-f]{64}$/.test(pk);
@@ -152,6 +157,241 @@ app.addHook('onRequest', async (req, reply) => {
   }
 });
 
+/* ========================= NFT BONUS SCANNING ============================= */
+// Server-side NFT scanning for regen bonuses (mirrors client accessories.js logic)
+
+let REGISTRY = null;
+let REGISTRY_TS = 0;
+const BONUS_CACHE = new Map(); // wallet -> { ts, regenBonus }
+
+const ACCESSORY_STATS = { attack:1, speed:1, defense:1, health:1, energyCap:1, regen:1, hit:1, crit:1, dodge:1 };
+
+async function loadRegistry(force = false) {
+  const now = Date.now();
+  if (!force && REGISTRY && (now - REGISTRY_TS < 300_000)) return REGISTRY; // 5 min cache
+
+  try {
+    const res = await fetch(REGISTRY_URL, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    REGISTRY = await res.json();
+    REGISTRY_TS = now;
+    app.log.info('[NFT] Registry loaded:', REGISTRY?.version || 'unknown');
+    return REGISTRY;
+  } catch (e) {
+    app.log.warn('[NFT] Registry fetch failed:', e.message);
+    // Fallback embedded registry
+    if (!REGISTRY) {
+      REGISTRY = {
+        version: 'embedded-fallback',
+        rules: {
+          evaluation: 'presencePerCollection_bestOfInside_sumAcrossCollections',
+          globalCaps: { attack:999, speed:999, defense:999, health:9999, energyCap:9999, regen:999, hit:100, crit:100, dodge:100 }
+        },
+        collections: []
+      };
+      REGISTRY_TS = now;
+    }
+    return REGISTRY;
+  }
+}
+
+async function fetchMeta(uri) {
+  if (!uri) return null;
+  try {
+    // Handle IPFS
+    let url = uri;
+    if (uri.startsWith('ipfs://')) {
+      url = 'https://ipfs.io/ipfs/' + uri.slice(7);
+    }
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+function matchesAny(haystack, needles) {
+  const hay = String(haystack || '').toLowerCase();
+  return (needles || []).some(nx => hay.includes(String(nx || '').toLowerCase()));
+}
+
+function metaHay(meta, uri, nft) {
+  return [
+    meta?.collection?.name, meta?.collection, meta?.name, meta?.series,
+    meta?.external_url, meta?.website, meta?.description,
+    meta?.image, meta?.animation_url, uri,
+    nft?.Issuer, nft?.NFTokenTaxon
+  ].filter(Boolean).join(' | ');
+}
+
+function nftMatchesRegistryCollection(nft, coll, hay) {
+  // 1) Issuer hard match (fast path)
+  const issuer = String(coll?.issuer || '').trim();
+  if (issuer && String(nft?.Issuer).trim() === issuer) {
+    const txs = Array.isArray(coll?.taxons) ? coll.taxons.map(Number).filter(Number.isFinite) : null;
+    if (txs && txs.length > 0) {
+      return txs.includes(Number(nft?.NFTokenTaxon || NaN));
+    }
+    return true;
+  }
+  // 2) Fallback to match strings (URLs/keywords)
+  if (Array.isArray(coll?.match) && coll.match.length) {
+    return matchesAny(hay, coll.match);
+  }
+  return false;
+}
+
+// Parse gear NFT for regen bonus
+async function parseGearRegen(nft) {
+  const uriHex = nft.URI || nft.NFTokenURI || '';
+  const uri = /^[0-9A-Fa-f]+$/.test(String(uriHex)) ? hexToAscii(uriHex) : String(uriHex || '');
+  if (!uri) return 0;
+
+  const j = await fetchMeta(uri);
+  if (!j) return 0;
+
+  let stat = (j.stat || '').toString().trim().toLowerCase();
+  let bonus = Number(j.bonus);
+  const props = j.properties || {};
+
+  if (!stat && props.stat != null) stat = String(props.stat).toLowerCase();
+  if (!Number.isFinite(bonus) && props.bonus != null) bonus = Number(props.bonus);
+
+  // Check attributes array
+  if ((!stat || !Number.isFinite(bonus)) && Array.isArray(j.attributes)) {
+    for (const a of j.attributes) {
+      const k = String(a.trait_type || a.type || '').toLowerCase();
+      const v = a.value;
+      if (!stat && k === 'stat' && v != null) stat = String(v).toLowerCase();
+      if (!Number.isFinite(bonus) && k === 'bonus' && v != null) bonus = Number(v);
+    }
+  }
+
+  // Only care about regen stat
+  if (stat === 'regen' && Number.isFinite(bonus) && bonus > 0) {
+    return bonus;
+  }
+  return 0;
+}
+
+// Detect registry collection regen bonuses
+async function detectRegistryRegen(nft) {
+  const uriHex = nft.URI || nft.NFTokenURI || '';
+  const uri = /^[0-9A-Fa-f]+$/.test(String(uriHex)) ? hexToAscii(uriHex) : String(uriHex || '');
+
+  await loadRegistry(false);
+  if (!REGISTRY?.collections) return 0;
+
+  const meta = uri ? await fetchMeta(uri) : null;
+  const hay = metaHay(meta, uri, nft);
+
+  let totalRegen = 0;
+  const seenColls = new Set();
+
+  for (const coll of REGISTRY.collections) {
+    if (!coll?.bonuses) continue;
+    if (seenColls.has(coll.id)) continue; // Only count each collection once (presence-based)
+    if (!nftMatchesRegistryCollection(nft, coll, hay)) continue;
+
+    const regenVal = Number(coll.bonuses.regen || 0);
+    if (regenVal > 0) {
+      totalRegen += regenVal;
+      seenColls.add(coll.id);
+    }
+  }
+
+  return totalRegen;
+}
+
+// Main function: get total regen bonus for a wallet
+async function getWalletRegenBonus(wallet) {
+  if (!wallet || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(wallet)) return 0;
+
+  const now = Date.now();
+  const cached = BONUS_CACHE.get(wallet);
+  if (cached && (now - cached.ts < NFT_BONUS_CACHE_SEC * 1000)) {
+    return cached.regenBonus;
+  }
+
+  let totalRegen = 0;
+  let client = null;
+
+  try {
+    client = new XRPLClient(XRPL_WSS);
+    await client.connect();
+
+    const nfts = [];
+    let marker = null;
+
+    do {
+      const req = { command: 'account_nfts', account: wallet, limit: 400 };
+      if (marker) req.marker = marker;
+      const res = await client.request(req);
+      nfts.push(...(res.result?.account_nfts || []));
+      marker = res.result?.marker;
+    } while (marker);
+
+    // Process NFTs in parallel batches (limit concurrency)
+    const BATCH_SIZE = 10;
+    const seenCollections = new Set();
+
+    for (let i = 0; i < nfts.length; i += BATCH_SIZE) {
+      const batch = nfts.slice(i, i + BATCH_SIZE);
+      const results = await Promise.allSettled(batch.map(async (nft) => {
+        // Gear-based regen (stacks additively)
+        const gearRegen = await parseGearRegen(nft);
+
+        // Registry-based regen (presence per collection)
+        let registryRegen = 0;
+        const uriHex = nft.URI || nft.NFTokenURI || '';
+        const uri = /^[0-9A-Fa-f]+$/.test(String(uriHex)) ? hexToAscii(uriHex) : String(uriHex || '');
+        await loadRegistry(false);
+
+        if (REGISTRY?.collections) {
+          const meta = uri ? await fetchMeta(uri) : null;
+          const hay = metaHay(meta, uri, nft);
+
+          for (const coll of REGISTRY.collections) {
+            if (!coll?.bonuses || seenCollections.has(coll.id)) continue;
+            if (!nftMatchesRegistryCollection(nft, coll, hay)) continue;
+
+            const regenVal = Number(coll.bonuses.regen || 0);
+            if (regenVal > 0) {
+              registryRegen += regenVal;
+              seenCollections.add(coll.id); // Only count collection once
+            }
+          }
+        }
+
+        return gearRegen + registryRegen;
+      }));
+
+      for (const r of results) {
+        if (r.status === 'fulfilled') totalRegen += r.value;
+      }
+    }
+
+    // Apply global cap
+    const cap = REGISTRY?.rules?.globalCaps?.regen || 999;
+    totalRegen = Math.min(totalRegen, cap);
+
+  } catch (e) {
+    app.log.warn('[NFT] getWalletRegenBonus failed for', wallet, e.message);
+    totalRegen = 0;
+  } finally {
+    if (client) {
+      try { await client.disconnect(); } catch {}
+    }
+  }
+
+  // Cache the result
+  BONUS_CACHE.set(wallet, { ts: now, regenBonus: totalRegen });
+  app.log.info(`[NFT] Wallet ${wallet} regen bonus: +${totalRegen}`);
+
+  return totalRegen;
+}
+
 /* ============================= PROFILES ============================= */
 async function ensureProfile(wallet) {
   await pool.query(
@@ -191,7 +431,7 @@ function recomputeCurrent(b, lv) {
   };
 }
 
-function toClient(row) {
+function toClient(row, nftRegenBonus = 0) {
   const cur = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
   return {
     ms:   { base: row.ms_base, level: row.ms_level, current: cur },
@@ -199,7 +439,9 @@ function toClient(row) {
     jetFuel:    row.jet_fuel    | 0,
     energy:     row.energy      | 0,
     energyCap:  row.energy_cap  | 0,
-    unlockedLevel: row.unlocked_level | 0
+    unlockedLevel: row.unlocked_level | 0,
+    // NEW: surface the NFT regen bonus so client can display it
+    nftRegenBonus: nftRegenBonus | 0
   };
 }
 
@@ -209,13 +451,25 @@ async function regenEnergyIfDue(wallet) {
 
   const cur = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
   const cap = Number(cur.energyCap ?? row.energy_cap ?? 100) || 100;
-  const rpm = Number(cur.regenPerMin || 0);
-  if (rpm <= 0) return row;
+  const baseRpm = Number(cur.regenPerMin || 0);
+
+  // NEW: Fetch NFT regen bonus and add to base regen
+  let nftRegenBonus = 0;
+  try {
+    nftRegenBonus = await getWalletRegenBonus(wallet);
+  } catch (e) {
+    app.log.warn('[NFT] Failed to get regen bonus for', wallet, e.message);
+  }
+
+  const totalRpm = baseRpm + nftRegenBonus;
+  if (totalRpm <= 0) return row;
 
   const nowS  = nowSec();
   const lastS = row.updated_at ? Math.floor(new Date(row.updated_at).getTime() / 1000) : nowS;
   const deltaS = Math.max(0, nowS - lastS);
-  const gain   = Math.floor((deltaS * rpm) / 3600);
+
+  // Regen calculation: (elapsed_seconds * regen_per_hour) / 3600
+  const gain = Math.floor((deltaS * totalRpm) / 3600);
   if (gain <= 0) return row;
 
   const before = row.energy | 0;
@@ -232,6 +486,9 @@ async function regenEnergyIfDue(wallet) {
       returning *`,
     [wallet, after]
   );
+
+  app.log.info(`[Regen] ${wallet}: ${before} -> ${after} (+${gain}E, base=${baseRpm}/h, nft=+${nftRegenBonus}/h, elapsed=${deltaS}s)`);
+
   return rows[0] || row;
 }
 
@@ -520,7 +777,14 @@ app.get('/profile', async (req, reply) => {
   const rowR = await regenEnergyIfDue(req.wallet);
   const row  = rowR || await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error: 'not_found' });
-  reply.send(toClient(row));
+
+  // Get NFT regen bonus for client display
+  let nftRegenBonus = 0;
+  try {
+    nftRegenBonus = await getWalletRegenBonus(req.wallet);
+  } catch {}
+
+  reply.send(toClient(row, nftRegenBonus));
 });
 
 app.get('/ms/costs', async (req, reply) => {
@@ -813,5 +1077,6 @@ app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
   } else {
     app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
   }
+  // Pre-load the registry on startup
+  loadRegistry(true).catch(() => {});
 });
-
