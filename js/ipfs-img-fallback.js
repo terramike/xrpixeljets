@@ -2,7 +2,7 @@
 // Global image fallback for Jet thumbnails/cards.
 // If an image fails to load, swap to the ghost placeholder.
 
-const PLACEHOLDER = 'https://mykeygo.io/jets/assets/ghost.png';
+const PLACEHOLDER = window.JETS_PLACEHOLDER_IMG || 'https://mykeygo.io/jets/assets/ghost.png';
 
 // Attach a one-time error handler to an <img>
 function attachFallback(img) {
@@ -51,3 +51,4 @@ export function setNFTImg(imgEl, url) {
   attachFallback(imgEl);
   try { imgEl.src = url || PLACEHOLDER; } catch { imgEl.src = PLACEHOLDER; }
 }
+

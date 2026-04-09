@@ -201,17 +201,30 @@
     </div>
   </div>
 
-  <!-- Modular scripts (unchanged IDs) -->
-  <script type="module" src="js/constants.js"></script>
-  <script type="module" src="js/state.js"></script>
-  <script type="module" src="js/utils.js"></script>
-  <script type="module" src="js/time.js"></script>
-  <script type="module" src="js/missions.js"></script>
-  <script type="module" src="js/mothership.js"></script>
-  <script type="module" src="js/jets.js"></script>
-  <script type="module" src="js/serverApi.js"></script>
-  <script type="module" src="js/ui.js"></script>
-  <script type="module" src="js/scene.js"></script>
-  <script type="module" src="js/main.js"></script>
-</body>
+  <script src="js/runtime-config.js"></script>
+  <script>
+    const jetsClientAssetBase = (window.JETS_CLIENT_ASSET_BASE || 'js').replace(/\/+$/, '');
+    const jetsModules = [
+      'constants.js',
+      'state.js',
+      'utils.js',
+      'time.js',
+      'missions.js',
+      'mothership.js',
+      'jets.js',
+      'serverApi.js',
+      'ui.js',
+      'scene.js',
+      'main.js'
+    ];
+
+    for (const moduleName of jetsModules) {
+      const script = document.createElement('script');
+      script.type = 'module';
+      script.src = `${jetsClientAssetBase}/${moduleName}`;
+      document.body.appendChild(script);
+    }
+  </script></body>
 </html>
+
+
