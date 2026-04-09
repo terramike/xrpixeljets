@@ -213,28 +213,55 @@ function parseCostsShape(res){
     hit:toNum(c?.hit), crit:toNum(c?.crit), dodge:toNum(c?.dodge)
   };
 }
+function parseLevelsShape(res){
+  const lv = res?.levels || {};
+  return {
+    health: toNum(lv?.health),
+    energyCap: toNum(lv?.energyCap),
+    regenPerMin: toNum(lv?.regenPerMin),
+    hit: toNum(lv?.hit),
+    crit: toNum(lv?.crit, 10),
+    dodge: toNum(lv?.dodge)
+  };
+}
+function previewTierFor(stat, levels){
+  if (stat === 'crit') return Math.max(0, toNum(levels?.crit, 10) - 10);
+  return Math.max(0, toNum(levels?.[stat]));
+}
+function previewUnitCost(stat, levels){
+  const base = 10 + previewTierFor(stat, levels);
+  return stat === 'regenPerMin' ? Math.round(base * 2.5) : base;
+}
+function previewQueuedTotal(levels, queue){
+  const sim = { ...levels };
+  let total = 0;
+  for (const stat of ['health','energyCap','regenPerMin','hit','crit','dodge']) {
+    const want = Math.max(0, toNum(queue?.[stat]));
+    for (let i = 0; i < want; i++) {
+      total += previewUnitCost(stat, sim);
+      sim[stat] = toNum(sim[stat]) + 1;
+    }
+  }
+  return total;
+}
 async function previewCost(){
   try{
     const raw = await SrvAPI.getMsCosts({ econScale: ECON_SCALE });
     const n = parseCostsShape(raw);
+    const levels = parseLevelsShape(raw);
 
-    // Persist for upgrades-fix.js stepped preview (non-destructive)
     try {
       if (!GameState.ms) GameState.ms = {};
       GameState.ms.costs = n;
+      GameState.ms.costLevels = levels;
       GameState.costs = n;
+      GameState.costLevels = levels;
       window.ECON_SCALE = ECON_SCALE;
-      window.dispatchEvent(new CustomEvent('jets:mscosts', { detail: n }));
+      window.dispatchEvent(new CustomEvent('jets:mscosts', { detail: { costs: n, levels } }));
     } catch {}
 
     const q = readQueueFromDOM();
-    let total=0;
-    total+=n.health*(q.health||0);
-    total+=n.energyCap*(q.energyCap||0);
-    total+=n.regenPerMin*(q.regenPerMin||0);
-    total+=n.hit*(q.hit||0);
-    total+=n.crit*(q.crit||0);
-    total+=n.dodge*(q.dodge||0);
+    const total = previewQueuedTotal(levels, q);
 
     const qEl=$('#q-cost'); if(qEl) qEl.textContent=String(total);
     [['cost-hp',n.health],['cost-cap',n.energyCap],['cost-reg',n.regenPerMin],['cost-hit',n.hit],['cost-crit',n.crit],['cost-dodge',n.dodge]]
@@ -769,3 +796,4 @@ async function init(){
 // Auto-run
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
 else init();
+

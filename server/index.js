@@ -431,18 +431,25 @@ function levelsFromRow(row) {
     dodge:       toInt(row?.ms_dodge, 0)
   };
 }
-function unitCost(level, s) {
-  const raw = BASE_PER_LEVEL * (toInt(level, 0) + 1);
-  return Math.max(1, Math.round(raw * s));
+function costTierFor(stat, levels) {
+  if (stat === 'crit') return Math.max(0, toInt(levels.crit, 10) - 10);
+  return Math.max(0, toInt(levels[stat], 0));
 }
-function calcCosts(levels, s) {
+function baseUpgradeCost(tier) {
+  return 10 + Math.max(0, toInt(tier, 0));
+}
+function unitCost(stat, levels) {
+  const base = baseUpgradeCost(costTierFor(stat, levels));
+  return stat === 'regenPerMin' ? Math.round(base * 2.5) : base;
+}
+function calcCosts(levels) {
   return {
-    health:      unitCost(levels.health, s),
-    energyCap:   unitCost(levels.energyCap, s),
-    regenPerMin: unitCost(levels.regenPerMin, s),
-    hit:         unitCost(levels.hit, s),
-    crit:        unitCost(levels.crit, s),
-    dodge:       unitCost(levels.dodge, s)
+    health:      unitCost('health', levels),
+    energyCap:   unitCost('energyCap', levels),
+    regenPerMin: unitCost('regenPerMin', levels),
+    hit:         unitCost('hit', levels),
+    crit:        unitCost('crit', levels),
+    dodge:       unitCost('dodge', levels)
   };
 }
 
@@ -477,7 +484,7 @@ app.get('/ms/costs', async (req, reply) => {
   const row = await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error: 'not_found' });
   const levels = levelsFromRow(row);
-  reply.send({ costs: calcCosts(levels, scale), levels, scale });
+  reply.send({ costs: calcCosts(levels), levels, scale });
 });
 
 app.post('/ms/upgrade', async (req, reply) => {
@@ -500,7 +507,7 @@ app.post('/ms/upgrade', async (req, reply) => {
         ? levels[key]
         : (key === 'hit' ? levels.hit : (key === 'crit' ? levels.crit : levels.dodge));
 
-      const price = Math.max(1, Math.round(BASE_PER_LEVEL * (lvlNow + 1) * getEconScaleFrom(scale)));
+      const price = unitCost(key, levels);
       if (jf < price) break;
 
       jf    -= price;
@@ -784,5 +791,7 @@ const start = async () => {
   }
 };
 await start();
+
+
 
 
