@@ -1,4 +1,4 @@
-/* XRPixel Jets — wallet-jets-meta.js (2025-11-21-jets19-ds)
+/* XRPixel Jets — wallet-jets-meta.js (2025-11-21-jets19-ds1)
    Jets-only XLS-20 loader w/ resilient IPFS + caching.
    - Filters NFTokenTaxon === 200 (Jets)
    - Accessories (taxon 201) are ignored here; handled by accessories.js
@@ -158,21 +158,35 @@
   }
 
   async function listAllNFTs(addr){
-    if (!window.xrpl) throw new Error('xrpl.js not loaded');
-    const client = new xrpl.Client(window.XRPL_NET || 'wss://xrplcluster.com');
-    await client.connect();
-    const out=[]; let marker=null;
-    try{
-      do{
-        const req = { command:'account_nfts', account:addr, limit:400 };
-        if (marker) req.marker=marker;
-        const resp = await client.request(req);
-        out.push(...(resp.result.account_nfts||[]));
-        marker = resp.result.marker;
-      } while (marker);
-    } finally { try { await client.disconnect(); } catch {} }
-    return out;
+  const XRPL = window.XRPL_LIB || window.xrpl; // prefer pinned lib
+  const ClientCtor = XRPL?.Client;
+
+  if (typeof ClientCtor !== 'function') {
+    // Helpful debug: show what we actually have
+    console.error('[JetsMeta] XRPL missing Client. window.xrpl keys:', Object.keys(window.xrpl || {}));
+    console.error('[JetsMeta] window.XRPL_LIB keys:', Object.keys(window.XRPL_LIB || {}));
+    throw new Error('xrpl.js Client constructor missing');
   }
+
+  const client = new ClientCtor(window.XRPL_NET || 'wss://xrplcluster.com');
+  await client.connect();
+
+  const out=[]; let marker=null;
+  try{
+    do{
+      const req = { command:'account_nfts', account:addr, limit:400 };
+      if (marker) req.marker=marker;
+      const resp = await client.request(req);
+      out.push(...(resp?.result?.account_nfts || []));
+      marker = resp?.result?.marker;
+    } while (marker);
+  } finally {
+    try { await client.disconnect(); } catch {}
+  }
+  return out;
+}
+
+
 
   async function metadataAwareLoader(addr){
     if (!isR(addr)) return [];

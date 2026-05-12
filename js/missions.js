@@ -10,14 +10,31 @@ export function isBoss(id){ return String(id).toUpperCase() === BOSS_ID; }
 
 // Base 5 fixed missions; waves auto-extend past 5
 const BASE_MISSIONS = [
-  { id: 1, name: 'Skirmish Intro',  enemyHP: 20, enemyAtk: 5, enemyDef: 3, enemySpd: 4, rewardFuel: 100 },
-  { id: 2, name: 'Raider Patrol',   enemyHP: 22, enemyAtk: 6, enemyDef: 4, enemySpd: 5, rewardFuel: 150 },
-  { id: 3, name: 'Blockade Line',   enemyHP: 24, enemyAtk: 7, enemyDef: 5, enemySpd: 6, rewardFuel: 200 },
-  { id: 4, name: 'Carrier Escort',  enemyHP: 26, enemyAtk: 8, enemyDef: 6, enemySpd: 7, rewardFuel: 250 },
-  { id: 5, name: 'Siege Breaker',   enemyHP: 30, enemyAtk: 9, enemyDef: 7, enemySpd: 8, rewardFuel: 300 },
+  { id: 1, name: 'Skirmish Intro',  enemyHP: 20, enemyAtk: 5, enemyDef: 3, enemySpd: 4 },
+  { id: 2, name: 'Raider Patrol',   enemyHP: 22, enemyAtk: 6, enemyDef: 4, enemySpd: 5 },
+  { id: 3, name: 'Blockade Line',   enemyHP: 24, enemyAtk: 7, enemyDef: 5, enemySpd: 6 },
+  { id: 4, name: 'Carrier Escort',  enemyHP: 26, enemyAtk: 8, enemyDef: 6, enemySpd: 7 },
+  { id: 5, name: 'Siege Breaker',   enemyHP: 30, enemyAtk: 9, enemyDef: 7, enemySpd: 8 },
 ];
 
 function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
+function rewardScale(){
+  const n = Number(window?.JETS_REWARD_SCALE ?? 0.10);
+  return Number.isFinite(n) && n > 0 ? n : 0.10;
+}
+export function getServerRewardPreview(level){
+  const lvl = Math.max(1, Number(level) || 1);
+  let base;
+  if (lvl <= 5) {
+    const table = [0, 1, 1, 2, 2, 3];
+    base = table[lvl] || 1;
+  } else {
+    const k = lvl - 6;
+    const block = Math.floor(k / 3);
+    base = 4 + block;
+  }
+  return Math.max(1, Math.round(base * rewardScale()));
+}
 
 /** Server is authoritative for rewards/unlocks. This helper only updates local UI. */
 export function unlockNextIfNeeded(currentWave, victory, unlockedFromServer){
@@ -37,7 +54,10 @@ export function unlockNextIfNeeded(currentWave, victory, unlockedFromServer){
 
 export function getMission(level){
   const lvl = Math.max(1, Number(level) || 1);
-  if (lvl <= 5) return BASE_MISSIONS[lvl - 1];
+  if (lvl <= 5) {
+    const mission = BASE_MISSIONS[lvl - 1];
+    return { ...mission, rewardFuel: getServerRewardPreview(lvl), rewardSource: 'server-estimate' };
+  }
 
   const k = Math.max(0, (lvl|0) - 5);
   const last = BASE_MISSIONS[4];
@@ -46,15 +66,14 @@ export function getMission(level){
   let atk  = Math.round(last.enemyAtk * Math.pow(1.02, k));
   let def  = Math.round(last.enemyDef * Math.pow(1.02, k));
   let spd  = Math.round(last.enemySpd * Math.pow(1.01, k));
-  let fuel = Math.round(last.rewardFuel * Math.pow(1.01, k));
+  const fuel = getServerRewardPreview(lvl);
 
   hp   = clamp(hp,   1,  9999);
   atk  = clamp(atk,  1,   999);
   def  = clamp(def,  0,   999);
   spd  = clamp(spd,  1,   200);
-  fuel = clamp(fuel, 1, 10000);
 
-  return { id: lvl, name:`Wave ${lvl}`, enemyHP: hp, enemyAtk: atk, enemyDef: def, enemySpd: spd, rewardFuel: fuel };
+  return { id: lvl, name:`Wave ${lvl}`, enemyHP: hp, enemyAtk: atk, enemyDef: def, enemySpd: spd, rewardFuel: fuel, rewardSource: 'server-estimate' };
 }
 
 export function buildMissionOptions(unlocked){
@@ -74,7 +93,7 @@ export function buildMissionOptions(unlocked){
     const opt = document.createElement('option');
     const m = getMission(i);
     opt.value = String(i);
-    opt.textContent = `${m.name}`;
+    opt.textContent = `${m.name} - est. ${m.rewardFuel} JF`;
     sel.appendChild(opt);
   }
 
@@ -87,3 +106,8 @@ export function buildMissionOptions(unlocked){
   }
   sel.value = String(lastRaw);
 }
+
+
+
+
+

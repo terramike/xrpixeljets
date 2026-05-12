@@ -1,6 +1,8 @@
-// server/index.js — XRPixel Jets API (2025-01-09 NFT regen bonuses r1)
-// Adds: Server-side NFT scanning for regen bonuses (offline regen now includes +regen NFTs)
-// Fixes: hardened claims + daily cap; CORS; reduced DB churn on /profile creation.
+// server.js — XRPixel Jets API (freshie 2025-12-18r3)
+// Base: last working index.js you provided; small additions:
+//  - GET /healthz
+//  - Guarded Bazaar registration (unchanged behavior, safer logs)
+//  - Optional Xaman plugin (dynamic import; only when keys present)
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -14,12 +16,24 @@ import { registerBazaarHotRoutes } from './bazaar-hot.js';
 import { sendIssued } from './claimJetFuel.js';
 
 const { Pool } = pkg;
-const app = Fastify({ logger: true, ajv: { customOptions: { removeAdditional: false, useDefaults: true, coerceTypes: true, allErrors: false } } });
+const app = Fastify({ logger: true });
 
 /* ============================ ENV / CONSTANTS ============================ */
 const PORT = Number(process.env.PORT || 10000);
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_only_change_me';
-const ALLOW = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeygo.io,http://localhost:8000')
+const WEB_BASE_URL = process.env.WEB_BASE_URL || 'https://mykeygo.io/jets';
+const CLIENT_ASSET_BASE_URL = process.env.CLIENT_ASSET_BASE_URL || `${WEB_BASE_URL}/js`;
+const ICON_URL = process.env.ICON_URL || `${WEB_BASE_URL}/assets/favicon.png`;
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://mykeygo.io',
+  'https://www.mykeygo.io',
+  'https://xrpixeljets.com',
+  'https://www.xrpixeljets.com',
+  'https://terramike.github.io',
+  'http://localhost:8000',
+  'http://127.0.0.1:8000'
+];
+const ALLOW = (process.env.CORS_ORIGIN || DEFAULT_ALLOWED_ORIGINS.join(','))
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
@@ -32,15 +46,11 @@ const REGEN_STEP        = Number(process.env.REGEN_STEP || 0.1);
 // Reward tuning
 const REWARD_SCALE = Number.isFinite(Number(process.env.REWARD_SCALE))
   ? Number(process.env.REWARD_SCALE)
-  : ECON_SCALE_ENV; // default to old behavior if not set
-const REWARD_MAX   = Number(process.env.REWARD_MAX || 0); // optional hard cap per mission (0 = no cap)
+  : ECON_SCALE_ENV;
+const REWARD_MAX   = Number(process.env.REWARD_MAX || 0); // 0 = no cap
 
 // Claim fee (basis points: 100 = 1%, 1500 = 15%)
 const CLAIM_FEE_BPS = Number(process.env.CLAIM_FEE_BPS || 0);
-
-// NFT Bonus scanning config
-const REGISTRY_URL = process.env.REGISTRY_URL || 'https://mykeygo.io/jets/asset/accessory-registry.json';
-const NFT_BONUS_CACHE_SEC = Number(process.env.NFT_BONUS_CACHE_SEC || 300); // 5 min cache
 
 /** XRPL */
 const XRPL_WSS = process.env.XRPL_WSS || 'wss://xrplcluster.com';
@@ -97,7 +107,6 @@ app.setErrorHandler((err, req, reply) => {
   const origin = req.headers.origin;
   if (origin && ALLOW.includes(origin)) {
     reply.header('Access-Control-Allow-Origin', origin);
-    reply.header('Vary', 'Origin');
   }
   const code = err.statusCode && Number.isFinite(err.statusCode) ? err.statusCode : 500;
   req.log.error({ err }, 'request_error');
@@ -114,7 +123,6 @@ const pool = new Pool({
 const toInt  = (x, d = 0) => { const n = Number(x); return Number.isFinite(n) ? Math.trunc(n) : d; };
 const nowSec = () => Math.floor(Date.now() / 1000);
 const asciiToHex = (s) => Buffer.from(String(s), 'utf8').toString('hex').toUpperCase();
-const hexToAscii = (h) => { try { return Buffer.from(String(h), 'hex').toString('utf8'); } catch { return ''; } };
 
 const isSecpPublicKeyHex    = (pk) => typeof pk === 'string' && /^(02|03)[0-9A-Fa-f]{64}$/.test(pk);
 const isEd25519PublicKeyHex = (pk) => typeof pk === 'string' && /^ED[0-9A-Fa-f]{64}$/.test(pk);
@@ -132,7 +140,8 @@ const OPEN_ROUTES = [
   '/bazaar/skus',
   '/bazaar/hot/ping',
   '/bazaar/hot/check',
-  '/bazaar/hot/live'
+  '/bazaar/hot/live',
+  '/xaman/payload' // note: also allows /xaman/payload/:uuid via startsWith check below
 ];
 
 app.addHook('onRequest', async (req, reply) => {
@@ -157,240 +166,8 @@ app.addHook('onRequest', async (req, reply) => {
   }
 });
 
-/* ========================= NFT BONUS SCANNING ============================= */
-// Server-side NFT scanning for regen bonuses (mirrors client accessories.js logic)
-
-let REGISTRY = null;
-let REGISTRY_TS = 0;
-const BONUS_CACHE = new Map(); // wallet -> { ts, regenBonus }
-
-const ACCESSORY_STATS = { attack:1, speed:1, defense:1, health:1, energyCap:1, regen:1, hit:1, crit:1, dodge:1 };
-
-async function loadRegistry(force = false) {
-  const now = Date.now();
-  if (!force && REGISTRY && (now - REGISTRY_TS < 300_000)) return REGISTRY; // 5 min cache
-
-  try {
-    const res = await fetch(REGISTRY_URL, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    REGISTRY = await res.json();
-    REGISTRY_TS = now;
-    app.log.info('[NFT] Registry loaded:', REGISTRY?.version || 'unknown');
-    return REGISTRY;
-  } catch (e) {
-    app.log.warn('[NFT] Registry fetch failed:', e.message);
-    // Fallback embedded registry
-    if (!REGISTRY) {
-      REGISTRY = {
-        version: 'embedded-fallback',
-        rules: {
-          evaluation: 'presencePerCollection_bestOfInside_sumAcrossCollections',
-          globalCaps: { attack:999, speed:999, defense:999, health:9999, energyCap:9999, regen:999, hit:100, crit:100, dodge:100 }
-        },
-        collections: []
-      };
-      REGISTRY_TS = now;
-    }
-    return REGISTRY;
-  }
-}
-
-async function fetchMeta(uri) {
-  if (!uri) return null;
-  try {
-    // Handle IPFS
-    let url = uri;
-    if (uri.startsWith('ipfs://')) {
-      url = 'https://ipfs.io/ipfs/' + uri.slice(7);
-    }
-    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-function matchesAny(haystack, needles) {
-  const hay = String(haystack || '').toLowerCase();
-  return (needles || []).some(nx => hay.includes(String(nx || '').toLowerCase()));
-}
-
-function metaHay(meta, uri, nft) {
-  return [
-    meta?.collection?.name, meta?.collection, meta?.name, meta?.series,
-    meta?.external_url, meta?.website, meta?.description,
-    meta?.image, meta?.animation_url, uri,
-    nft?.Issuer, nft?.NFTokenTaxon
-  ].filter(Boolean).join(' | ');
-}
-
-function nftMatchesRegistryCollection(nft, coll, hay) {
-  // 1) Issuer hard match (fast path)
-  const issuer = String(coll?.issuer || '').trim();
-  if (issuer && String(nft?.Issuer).trim() === issuer) {
-    const txs = Array.isArray(coll?.taxons) ? coll.taxons.map(Number).filter(Number.isFinite) : null;
-    if (txs && txs.length > 0) {
-      return txs.includes(Number(nft?.NFTokenTaxon || NaN));
-    }
-    return true;
-  }
-  // 2) Fallback to match strings (URLs/keywords)
-  if (Array.isArray(coll?.match) && coll.match.length) {
-    return matchesAny(hay, coll.match);
-  }
-  return false;
-}
-
-// Parse gear NFT for regen bonus
-async function parseGearRegen(nft) {
-  const uriHex = nft.URI || nft.NFTokenURI || '';
-  const uri = /^[0-9A-Fa-f]+$/.test(String(uriHex)) ? hexToAscii(uriHex) : String(uriHex || '');
-  if (!uri) return 0;
-
-  const j = await fetchMeta(uri);
-  if (!j) return 0;
-
-  let stat = (j.stat || '').toString().trim().toLowerCase();
-  let bonus = Number(j.bonus);
-  const props = j.properties || {};
-
-  if (!stat && props.stat != null) stat = String(props.stat).toLowerCase();
-  if (!Number.isFinite(bonus) && props.bonus != null) bonus = Number(props.bonus);
-
-  // Check attributes array
-  if ((!stat || !Number.isFinite(bonus)) && Array.isArray(j.attributes)) {
-    for (const a of j.attributes) {
-      const k = String(a.trait_type || a.type || '').toLowerCase();
-      const v = a.value;
-      if (!stat && k === 'stat' && v != null) stat = String(v).toLowerCase();
-      if (!Number.isFinite(bonus) && k === 'bonus' && v != null) bonus = Number(v);
-    }
-  }
-
-  // Only care about regen stat
-  if (stat === 'regen' && Number.isFinite(bonus) && bonus > 0) {
-    return bonus;
-  }
-  return 0;
-}
-
-// Detect registry collection regen bonuses
-async function detectRegistryRegen(nft) {
-  const uriHex = nft.URI || nft.NFTokenURI || '';
-  const uri = /^[0-9A-Fa-f]+$/.test(String(uriHex)) ? hexToAscii(uriHex) : String(uriHex || '');
-
-  await loadRegistry(false);
-  if (!REGISTRY?.collections) return 0;
-
-  const meta = uri ? await fetchMeta(uri) : null;
-  const hay = metaHay(meta, uri, nft);
-
-  let totalRegen = 0;
-  const seenColls = new Set();
-
-  for (const coll of REGISTRY.collections) {
-    if (!coll?.bonuses) continue;
-    if (seenColls.has(coll.id)) continue; // Only count each collection once (presence-based)
-    if (!nftMatchesRegistryCollection(nft, coll, hay)) continue;
-
-    const regenVal = Number(coll.bonuses.regen || 0);
-    if (regenVal > 0) {
-      totalRegen += regenVal;
-      seenColls.add(coll.id);
-    }
-  }
-
-  return totalRegen;
-}
-
-// Main function: get total regen bonus for a wallet
-async function getWalletRegenBonus(wallet) {
-  if (!wallet || !/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(wallet)) return 0;
-
-  const now = Date.now();
-  const cached = BONUS_CACHE.get(wallet);
-  if (cached && (now - cached.ts < NFT_BONUS_CACHE_SEC * 1000)) {
-    return cached.regenBonus;
-  }
-
-  let totalRegen = 0;
-  let client = null;
-
-  try {
-    client = new XRPLClient(XRPL_WSS);
-    await client.connect();
-
-    const nfts = [];
-    let marker = null;
-
-    do {
-      const req = { command: 'account_nfts', account: wallet, limit: 400 };
-      if (marker) req.marker = marker;
-      const res = await client.request(req);
-      nfts.push(...(res.result?.account_nfts || []));
-      marker = res.result?.marker;
-    } while (marker);
-
-    // Process NFTs in parallel batches (limit concurrency)
-    const BATCH_SIZE = 10;
-    const seenCollections = new Set();
-
-    for (let i = 0; i < nfts.length; i += BATCH_SIZE) {
-      const batch = nfts.slice(i, i + BATCH_SIZE);
-      const results = await Promise.allSettled(batch.map(async (nft) => {
-        // Gear-based regen (stacks additively)
-        const gearRegen = await parseGearRegen(nft);
-
-        // Registry-based regen (presence per collection)
-        let registryRegen = 0;
-        const uriHex = nft.URI || nft.NFTokenURI || '';
-        const uri = /^[0-9A-Fa-f]+$/.test(String(uriHex)) ? hexToAscii(uriHex) : String(uriHex || '');
-        await loadRegistry(false);
-
-        if (REGISTRY?.collections) {
-          const meta = uri ? await fetchMeta(uri) : null;
-          const hay = metaHay(meta, uri, nft);
-
-          for (const coll of REGISTRY.collections) {
-            if (!coll?.bonuses || seenCollections.has(coll.id)) continue;
-            if (!nftMatchesRegistryCollection(nft, coll, hay)) continue;
-
-            const regenVal = Number(coll.bonuses.regen || 0);
-            if (regenVal > 0) {
-              registryRegen += regenVal;
-              seenCollections.add(coll.id); // Only count collection once
-            }
-          }
-        }
-
-        return gearRegen + registryRegen;
-      }));
-
-      for (const r of results) {
-        if (r.status === 'fulfilled') totalRegen += r.value;
-      }
-    }
-
-    // Apply global cap
-    const cap = REGISTRY?.rules?.globalCaps?.regen || 999;
-    totalRegen = Math.min(totalRegen, cap);
-
-  } catch (e) {
-    app.log.warn('[NFT] getWalletRegenBonus failed for', wallet, e.message);
-    totalRegen = 0;
-  } finally {
-    if (client) {
-      try { await client.disconnect(); } catch {}
-    }
-  }
-
-  // Cache the result
-  BONUS_CACHE.set(wallet, { ts: now, regenBonus: totalRegen });
-  app.log.info(`[NFT] Wallet ${wallet} regen bonus: +${totalRegen}`);
-
-  return totalRegen;
-}
+/* =============================== HEALTHZ ================================== */
+app.get('/healthz', async () => ({ ok: true }));
 
 /* ============================= PROFILES ============================= */
 async function ensureProfile(wallet) {
@@ -431,7 +208,7 @@ function recomputeCurrent(b, lv) {
   };
 }
 
-function toClient(row, nftRegenBonus = 0) {
+function toClient(row) {
   const cur = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
   return {
     ms:   { base: row.ms_base, level: row.ms_level, current: cur },
@@ -439,9 +216,7 @@ function toClient(row, nftRegenBonus = 0) {
     jetFuel:    row.jet_fuel    | 0,
     energy:     row.energy      | 0,
     energyCap:  row.energy_cap  | 0,
-    unlockedLevel: row.unlocked_level | 0,
-    // NEW: surface the NFT regen bonus so client can display it
-    nftRegenBonus: nftRegenBonus | 0
+    unlockedLevel: row.unlocked_level | 0
   };
 }
 
@@ -451,25 +226,13 @@ async function regenEnergyIfDue(wallet) {
 
   const cur = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
   const cap = Number(cur.energyCap ?? row.energy_cap ?? 100) || 100;
-  const baseRpm = Number(cur.regenPerMin || 0);
-
-  // NEW: Fetch NFT regen bonus and add to base regen
-  let nftRegenBonus = 0;
-  try {
-    nftRegenBonus = await getWalletRegenBonus(wallet);
-  } catch (e) {
-    app.log.warn('[NFT] Failed to get regen bonus for', wallet, e.message);
-  }
-
-  const totalRpm = baseRpm + nftRegenBonus;
-  if (totalRpm <= 0) return row;
+  const rpm = Number(cur.regenPerMin || 0);
+  if (rpm <= 0) return row;
 
   const nowS  = nowSec();
   const lastS = row.updated_at ? Math.floor(new Date(row.updated_at).getTime() / 1000) : nowS;
   const deltaS = Math.max(0, nowS - lastS);
-
-  // Regen calculation: (elapsed_seconds * regen_per_hour) / 3600
-  const gain = Math.floor((deltaS * totalRpm) / 3600);
+  const gain   = Math.floor((deltaS * rpm) / 60);
   if (gain <= 0) return row;
 
   const before = row.energy | 0;
@@ -486,9 +249,6 @@ async function regenEnergyIfDue(wallet) {
       returning *`,
     [wallet, after]
   );
-
-  app.log.info(`[Regen] ${wallet}: ${before} -> ${after} (+${gain}E, base=${baseRpm}/h, nft=+${nftRegenBonus}/h, elapsed=${deltaS}s)`);
-
   return rows[0] || row;
 }
 
@@ -527,7 +287,7 @@ function requireJWT(req, reply) {
   }
 }
 
-/* ================= XRPL helpers for WC tx-proof (secp only) ================ */
+/* ============== XRPL helpers for WC tx-proof (secp only) ================== */
 async function ensureXRPL() {
   if (!xrpl.wallet) throw new Error('hot_wallet_missing');
   if (!xrpl.client.isConnected()) await xrpl.client.connect();
@@ -541,9 +301,11 @@ app.get('/config', async (_req, reply) => {
     currencyCode: CURRENCY_CODE,
     currencyHex: CURRENCY_HEX,
     issuer: ISSUER_ADDR,
-    // New: surface claim economics to the client
-    claimFeeBps: CLAIM_FEE_BPS,        // e.g. 1500 = 15%
-    claimMaxPer24h: CLAIM_MAX_PER_24H  // e.g. 15000 JetFuel/day
+    webBaseUrl: WEB_BASE_URL,
+    clientAssetBaseUrl: CLIENT_ASSET_BASE_URL,
+    iconUrl: ICON_URL,
+    claimFeeBps: CLAIM_FEE_BPS,
+    claimMaxPer24h: CLAIM_MAX_PER_24H
   });
 });
 
@@ -620,71 +382,7 @@ async function verifyOrFinish(req, reply) {
     }
   }
 
-  // GEM WALLET: Now uses txProof path (lines 330-363)
-  // This custom detection is DISABLED to avoid conflicts with Crossmark
-  // Both Crossmark and Gem can have ~140 char signatures!
-  const isLikelyGemWallet = false; // DISABLED - Gem uses txProof now
-  
-  if (isLikelyGemWallet) {
-    
-    try {
-      const pub = String(publicKey || '').toUpperCase();
-      if (!(pub.startsWith('02') || pub.startsWith('03'))) {
-        return reply.code(400).send({ error: 'bad_key_algo', detail: 'secp_required' });
-      }
-      
-      // Expected message format: nonce||scope||ts||address
-      const expectedMessage = `${taken.nonce}||${scope}||${tsNum}||${address}`;
-      const expectedMessageHex = asciiToHex(expectedMessage).toUpperCase();
-      
-      // Verify payloadHex matches
-      if (!payloadHex || payloadHex.toUpperCase() !== expectedMessageHex) {
-        req.log.warn('[Auth] Gem Wallet: payloadHex mismatch');
-        return reply.code(401).send({ error: 'bad_signature', detail: 'payload_mismatch' });
-      }
-      
-      // Reconstruct the AccountSet transaction to verify signature
-      const reconstructedTx = {
-        TransactionType: 'AccountSet',
-        Account: address,
-        Memos: [{
-          Memo: {
-            MemoType: asciiToHex('XRPixelJets'),
-            MemoData: expectedMessageHex
-          }
-        }],
-        SigningPubKey: pub,
-        TxnSignature: signature.toUpperCase()
-      };
-      
-      // Encode for signing (without signature field)
-      const { TxnSignature, ...txWithoutSig } = reconstructedTx;
-      const preimageHex = encodeForSigning(txWithoutSig).toUpperCase();
-      
-      // Verify signature
-      const okSig = keypairs.verify(preimageHex, signature.toUpperCase(), pub) === true;
-      if (!okSig) {
-        req.log.warn('[Auth] Gem Wallet: signature verification failed');
-        return reply.code(401).send({ error: 'bad_signature' });
-      }
-      
-      // Verify publicKey derives to address
-      const derived = keypairs.deriveAddress(pub);
-      if (derived !== address) {
-        req.log.warn('[Auth] Gem Wallet: derived address mismatch');
-        return reply.code(401).send({ error: 'unauthorized' });
-      }
-      
-      req.log.info('[Auth] ✅ Gem Wallet auth successful');
-      return reply.send({ ok: true, jwt: signJWT(address, scope) });
-      
-    } catch (err) {
-      req.log.error({ err }, '[Auth] Gem Wallet verification error');
-      return reply.code(401).send({ error: 'bad_signature', detail: 'gem_verify_failed' });
-    }
-  }
-
-  // Simple signMessage path (secp only) - CROSSMARK and others
+  // Simple signMessage path (secp only)
   if (!signature) return reply.code(400).send({ error: 'bad_signature' });
   if (!publicKey) return reply.code(400).send({ error: 'bad_key' });
   if (isEd25519PublicKeyHex(publicKey)) {
@@ -733,58 +431,52 @@ function levelsFromRow(row) {
     dodge:       toInt(row?.ms_dodge, 0)
   };
 }
-function unitCost(level, s) {
-  const raw = BASE_PER_LEVEL * (toInt(level, 0) + 1);
-  return Math.max(1, Math.round(raw * s));
+function costTierFor(stat, levels) {
+  if (stat === 'crit') return Math.max(0, toInt(levels.crit, 10) - 10);
+  return Math.max(0, toInt(levels[stat], 0));
 }
-function calcCosts(levels, s) {
+function baseUpgradeCost(tier) {
+  return 10 + Math.max(0, toInt(tier, 0));
+}
+function unitCost(stat, levels) {
+  const base = baseUpgradeCost(costTierFor(stat, levels));
+  return stat === 'regenPerMin' ? Math.round(base * 2.5) : base;
+}
+function calcCosts(levels) {
   return {
-    health:      unitCost(levels.health, s),
-    energyCap:   unitCost(levels.energyCap, s),
-    regenPerMin: unitCost(levels.regenPerMin, s),
-    hit:         unitCost(levels.hit, s),
-    crit:        unitCost(levels.crit, s),
-    dodge:       unitCost(levels.dodge, s)
+    health:      unitCost('health', levels),
+    energyCap:   unitCost('energyCap', levels),
+    regenPerMin: unitCost('regenPerMin', levels),
+    hit:         unitCost('hit', levels),
+    crit:        unitCost('crit', levels),
+    dodge:       unitCost('dodge', levels)
   };
 }
 
-// NEW: missionReward curve (Mike's spec) + REWARD_SCALE + optional cap
+// NEW: missionReward curve + REWARD_SCALE + optional cap
 function missionReward(l) {
   const level = Math.max(1, Number(l) || 1);
   let base;
 
   if (level <= 5) {
-    // 1–5: [1,1,2,2,3]
     const table = [0, 1, 1, 2, 2, 3];
     base = table[level] || 1;
   } else {
-    // Then +1 every 3 levels, starting at 4 JF at level 6:
-    // 6–8: 4, 9–11: 5, 12–14: 6, etc.
     const k = level - 6;
-    const block = Math.floor(k / 3); // 0 for 6–8, 1 for 9–11...
+    const block = Math.floor(k / 3);
     base = 4 + block;
   }
 
   let reward = Math.round(base * (REWARD_SCALE || 1));
-  if (REWARD_MAX > 0 && reward > REWARD_MAX) {
-    reward = REWARD_MAX;
-  }
+  if (REWARD_MAX > 0 && reward > REWARD_MAX) reward = REWARD_MAX;
   return Math.max(1, reward);
 }
 
 app.get('/profile', async (req, reply) => {
-  // profile row is created during /session/start; no need to ensure here
   const rowR = await regenEnergyIfDue(req.wallet);
   const row  = rowR || await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error: 'not_found' });
-
-  // Get NFT regen bonus for client display
-  let nftRegenBonus = 0;
-  try {
-    nftRegenBonus = await getWalletRegenBonus(req.wallet);
-  } catch {}
-
-  reply.send(toClient(row, nftRegenBonus));
+  reply.send(toClient(row));
 });
 
 app.get('/ms/costs', async (req, reply) => {
@@ -792,7 +484,7 @@ app.get('/ms/costs', async (req, reply) => {
   const row = await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error: 'not_found' });
   const levels = levelsFromRow(row);
-  reply.send({ costs: calcCosts(levels, scale), levels, scale });
+  reply.send({ costs: calcCosts(levels), levels, scale });
 });
 
 app.post('/ms/upgrade', async (req, reply) => {
@@ -815,7 +507,7 @@ app.post('/ms/upgrade', async (req, reply) => {
         ? levels[key]
         : (key === 'hit' ? levels.hit : (key === 'crit' ? levels.crit : levels.dodge));
 
-      const price = Math.max(1, Math.round(BASE_PER_LEVEL * (lvlNow + 1) * getEconScaleFrom(scale)));
+      const price = unitCost(key, levels);
       if (jf < price) break;
 
       jf    -= price;
@@ -949,7 +641,6 @@ app.post('/claim/start', async (req, reply) => {
     return reply.code(429).send({ error: 'cooldown' });
   }
 
-  // Daily cap is based on gross JetFuel spent (amount)
   if (CLAIM_MAX_PER_24H > 0) {
     try {
       const { rows: dayRows } = await pool.query(
@@ -973,7 +664,6 @@ app.post('/claim/start', async (req, reply) => {
     }
   }
 
-  // Compute claim fee and net payout (in-game JetFuel -> JETS on-ledger)
   const feeBps = Math.max(0, Number.isFinite(CLAIM_FEE_BPS) ? CLAIM_FEE_BPS : 0);
   const fee = feeBps > 0 ? Math.floor((amount * feeBps) / 10000) : 0;
   const net = amount - fee;
@@ -982,7 +672,6 @@ app.post('/claim/start', async (req, reply) => {
     return reply.code(400).send({ error: 'claim_fee_too_high' });
   }
 
-  // Debit JetFuel by the full amount
   const debit = await pool.query(
     `update player_profiles
         set jet_fuel = jet_fuel - $2,
@@ -998,12 +687,10 @@ app.post('/claim/start', async (req, reply) => {
   }
 
   try {
-    // Send only the net amount as JETS on-ledger
     const { ok, txid = null, txJSON = null, error: sendErr, detail } =
       await sendIssued({ to: req.wallet, amount: net });
 
     if (!ok && TOKEN_MODE === 'hot') {
-      // Refund the full amount of JetFuel if XRPL send failed
       await pool.query(
         `update player_profiles
             set jet_fuel = jet_fuel + $2,
@@ -1016,7 +703,6 @@ app.post('/claim/start', async (req, reply) => {
       return reply.code(code).send({ error: sendErr || 'claim_failed', detail });
     }
 
-    // Record last_claim_at and audit the gross amount (JetFuel spent)
     await pool.query(
       `update player_profiles
           set last_claim_at = now(),
@@ -1042,7 +728,6 @@ app.post('/claim/start', async (req, reply) => {
       profile: toClient(latest || debit.rows[0])
     });
   } catch (e) {
-    // On unexpected error, refund the full JetFuel amount
     await pool.query(
       `update player_profiles
           set jet_fuel = jet_fuel + $2,
@@ -1058,25 +743,55 @@ app.post('/claim/start', async (req, reply) => {
 
 /* ================================ BAZAAR ================================== */
 if (BAZAAR_ENABLED) {
-  await registerBazaarHotRoutes(app, {
-    xrpl,
-    XRPL_WSS,
-    HOT_SEED,
-    TOKEN_MODE,
-    CURRENCY_CODE,
-    CURRENCY_HEX,
-    ISSUER_ADDR
-  });
+  try {
+    await registerBazaarHotRoutes(app, {
+      xrpl,
+      XRPL_WSS,
+      HOT_SEED,
+      TOKEN_MODE,
+      CURRENCY_CODE,
+      CURRENCY_HEX,
+      ISSUER_ADDR
+    });
+    app.log.info('[Bazaar] hot routes registered');
+  } catch (e) {
+    app.log.error(e, '[Bazaar] failed to register');
+  }
+}
+
+/* ============================ Optional Xaman ============================== */
+// Loads ONLY when keys are present; otherwise skipped (prevents xumm-sdk crashes)
+try {
+  if (process.env.XAMAN_API_KEY && process.env.XAMAN_API_SECRET) {
+    const { default: xaman } = await import('./xaman.js'); // xaman.js lazily imports xumm-sdk internally
+    await (async () => app.register(xaman))();
+    app.log.info('[Xaman] plugin registered');
+  } else {
+    app.log.info('[Xaman] plugin not configured');
+  }
+} catch (e) {
+  app.log.error(e, '[Xaman] plugin failed to register');
 }
 
 /* ================================ Startup ================================= */
-app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
-  app.log.info(`XRPixel Jets API listening on :${PORT}`);
-  if (xrpl.wallet) {
-    app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
-  } else {
-    app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
+const HOST = process.env.HOST || '0.0.0.0';
+const start = async () => {
+  try {
+    await app.ready();
+    await app.listen({ port: PORT, host: HOST });
+    app.log.info({ host: HOST, port: PORT }, '[Server] listening');
+    if (xrpl.wallet) {
+      app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
+    } else {
+      app.log.warn('[XRPL] HOT_SEED missing — Bazaar offer creation & live claims may fail.');
+    }
+  } catch (err) {
+    app.log.error(err, '[Server] failed to start');
+    process.exit(1);
   }
-  // Pre-load the registry on startup
-  loadRegistry(true).catch(() => {});
-});
+};
+await start();
+
+
+
+

@@ -1,6 +1,7 @@
-// XRPixel Jets — main.js (2025-11-21-thorns1)
+// XRPixel Jets — main.js (2025-01-03 idle-sleep-mode)
 // Root: Energy is SERVER-AUTHORITATIVE. Minimal overlay that paints Squad ATK/SPD/DEF
 // as (Main + Wing + Accessories) and keeps HIT/CRIT/DODGE chips in sync.
+// NEW: Idle detection stops server polling after 5 minutes of inactivity to reduce DB costs.
 
 import * as SrvAPI from './serverApi.js';
 import { GameState } from './state.js';
@@ -13,11 +14,61 @@ import {
 import { renderJets, recalcSquad } from './jets.js';
 import * as SceneMod from './scene.js';
 import { installBattleTuning } from './battle-tuning.js';
-import { getAccessoryBonuses, applyAccessoryBonuses, refreshAccessoryPanel } from '/jets/js/accessories.js';
-import { getCombatEffectsForWallet } from '/jets/js/combat-effects.js';
+import { getAccessoryBonuses, applyAccessoryBonuses, refreshAccessoryPanel } from './accessories.js';
+import { getCombatEffectsForWallet } from './combat-effects.js';
 
 const ECON_SCALE = 0.10;
 const KEY_LAST   = 'JETS_LAST_MISSION';
+
+// ============================================================================
+// IDLE DETECTION: Stop polling when inactive to reduce database compute costs
+// ============================================================================
+const IDLE_TIMEOUT = 5 * 60 * 1000; // 5 minutes of inactivity
+let lastActivityTime = Date.now();
+let isSleeping = false;
+
+function markActivity() {
+  lastActivityTime = Date.now();
+  if (isSleeping) {
+    isSleeping = false;
+    console.log('[Jets] ☀️ Waking up - resuming server sync');
+    // Immediate refresh on wake to get current state
+    if (hasJwt()) {
+      loadProfileAndHUD().catch(() => {});
+    }
+  }
+}
+
+function checkIdleState() {
+  const idleTime = Date.now() - lastActivityTime;
+  if (!isSleeping && idleTime > IDLE_TIMEOUT) {
+    isSleeping = true;
+    console.log('[Jets] 😴 Sleeping - pausing server sync (idle 5min)');
+  }
+}
+
+function isClientSleeping() {
+  return isSleeping;
+}
+
+// Check idle state every 60 seconds
+setInterval(checkIdleState, 60_000);
+
+// Wake on tab focus
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    markActivity();
+  }
+});
+
+// ============================================================================
+// AUTH GATE
+// ============================================================================
+function hasJwt(){
+  const tok = (typeof SrvAPI.getAuthToken === 'function') ? (SrvAPI.getAuthToken() || '') : '';
+  if (tok && String(tok).trim()) return true;
+  try { return !!(localStorage.getItem('JWT') || '').trim(); } catch { return false; }
+}
 
 const $ = (s) => document.querySelector(s);
 const log = (...a) => console.log('[Jets]', ...a);
@@ -103,7 +154,7 @@ function resolveSceneInstance() {
   }
   if (typeof SceneMod?.BattleScene === 'function') { try { return new SceneMod.BattleScene(); } catch {} }
   if (typeof window !== 'undefined' && typeof window.SCENE === 'object') return window.SCENE;
-  console.warn('[Jets] scene.js didn’t export a usable instance; using a stub.');
+  console.warn('[Jets] scene.js did not export a usable instance; using a stub.');
   return { inBattle:false, seed(){}, simulateTurn(){}, startBattle(){}, nextTurn(){}, resetBattle(){}, playerHP:20, playerMaxHP:20, enemyHP:20, enemyMaxHP:20 };
 }
 const SCENE = resolveSceneInstance();
@@ -136,6 +187,17 @@ function renderQueue(){
   const ids = { health:'q-hp', energyCap:'q-cap', regenPerMin:'q-reg', hit:'q-hit', crit:'q-crit', dodge:'q-dodge' };
   for (const k in ids){ const el = $('#'+ids[k]); if (el) el.textContent = String(Queue[k]||0); }
 }
+
+function readQueueFromDOM(){
+  const ids = { health:'q-hp', energyCap:'q-cap', regenPerMin:'q-reg', hit:'q-hit', crit:'q-crit', dodge:'q-dodge' };
+  const out = {};
+  for (const k in ids){
+    const el = document.getElementById(ids[k]);
+    const v = parseInt(String(el?.textContent || '0').replace(/[^0-9-]/g,''), 10);
+    out[k] = Number.isFinite(v) ? Math.max(0, v) : 0;
+  }
+  return out;
+}
 function parseCostsShape(res){
   let c=res?.costs;
   if(!c){
@@ -151,21 +213,62 @@ function parseCostsShape(res){
     hit:toNum(c?.hit), crit:toNum(c?.crit), dodge:toNum(c?.dodge)
   };
 }
+function parseLevelsShape(res){
+  const lv = res?.levels || {};
+  return {
+    health: toNum(lv?.health),
+    energyCap: toNum(lv?.energyCap),
+    regenPerMin: toNum(lv?.regenPerMin),
+    hit: toNum(lv?.hit),
+    crit: toNum(lv?.crit, 10),
+    dodge: toNum(lv?.dodge)
+  };
+}
+function previewTierFor(stat, levels){
+  if (stat === 'crit') return Math.max(0, toNum(levels?.crit, 10) - 10);
+  return Math.max(0, toNum(levels?.[stat]));
+}
+function previewUnitCost(stat, levels){
+  const base = 10 + previewTierFor(stat, levels);
+  return stat === 'regenPerMin' ? Math.round(base * 2.5) : base;
+}
+function previewQueuedTotal(levels, queue){
+  const sim = { ...levels };
+  let total = 0;
+  for (const stat of ['health','energyCap','regenPerMin','hit','crit','dodge']) {
+    const want = Math.max(0, toNum(queue?.[stat]));
+    for (let i = 0; i < want; i++) {
+      total += previewUnitCost(stat, sim);
+      sim[stat] = toNum(sim[stat]) + 1;
+    }
+  }
+  return total;
+}
 async function previewCost(){
   try{
     const raw = await SrvAPI.getMsCosts({ econScale: ECON_SCALE });
     const n = parseCostsShape(raw);
-    let total=0;
-    total+=n.health*(Queue.health||0);
-    total+=n.energyCap*(Queue.energyCap||0);
-    total+=n.regenPerMin*(Queue.regenPerMin||0);
-    total+=n.hit*(Queue.hit||0);
-    total+=n.crit*(Queue.crit||0);
-    total+=n.dodge*(Queue.dodge||0);
+    const levels = parseLevelsShape(raw);
+
+    try {
+      if (!GameState.ms) GameState.ms = {};
+      GameState.ms.costs = n;
+      GameState.ms.costLevels = levels;
+      GameState.costs = n;
+      GameState.costLevels = levels;
+      window.ECON_SCALE = ECON_SCALE;
+      window.dispatchEvent(new CustomEvent('jets:mscosts', { detail: { costs: n, levels } }));
+    } catch {}
+
+    const q = readQueueFromDOM();
+    const total = previewQueuedTotal(levels, q);
+
     const qEl=$('#q-cost'); if(qEl) qEl.textContent=String(total);
     [['cost-hp',n.health],['cost-cap',n.energyCap],['cost-reg',n.regenPerMin],['cost-hit',n.hit],['cost-crit',n.crit],['cost-dodge',n.dodge]]
       .forEach(([id,val])=>{ const el=$('#'+id); if(el) el.textContent=String(val); });
-  } catch { const qEl=$('#q-cost'); if(qEl) qEl.textContent='—'; }
+  } catch {
+    const qEl=$('#q-cost'); if(qEl) qEl.textContent='—';
+  }
 }
 
 // ------- wallet/session -------
@@ -194,6 +297,9 @@ function dispatchProfile() {
 }
 
 async function loadProfileAndHUD(){
+  if (!hasJwt()) {
+    throw new Error('not_signed_in');
+  }
   const prof = await SrvAPI.getProfile(); // server applies regen here
   GameState.ms = prof.ms;
   GameState.pct = prof.pct;
@@ -210,10 +316,18 @@ async function loadProfileAndHUD(){
 }
 
 // Periodic sync to surface regen (no client prediction)
+// NOW WITH IDLE DETECTION: Skip polling when client is sleeping
 let syncTimer = null;
+let DID_PROFILE = false;
 function startServerEnergySync(){
+  if (!hasJwt()) return;
   if (syncTimer) clearInterval(syncTimer);
   syncTimer = setInterval(async ()=>{
+    // ⭐ IDLE CHECK: Skip polling when sleeping to save database compute
+    if (isClientSleeping()) {
+      return;
+    }
+    
     try{
       const prof = await SrvAPI.getProfile();
       GameState.ms = prof.ms; GameState.pct = prof.pct;
@@ -222,7 +336,7 @@ function startServerEnergySync(){
       paintMSBasics(); paintMSPct(); updateHPBars();
       renderSquadTotalsAdjusted();
     } catch(e){ /* transient; ignore */ }
-  }, 25000);
+  }, 60000); // Poll every 60 seconds (was 25s, increased for efficiency)
 }
 
 // ------- Accessories wiring (additive, non-invasive) -------
@@ -399,16 +513,29 @@ function refreshActionButtons(){
 
   const canFly = hasPixelJet(); // NEW
 
-  if (start) start.disabled = inBattle || !canSpend(10) || !canFly;
-  if (next)  next.disabled  = !inBattle || !canSpend(1);
+  // Must be authenticated to spend energy / run server battles
+  const authed = hasJwt();
+
+  if (start) start.disabled = inBattle || !authed || !canSpend(10) || !canFly;
+  if (next)  next.disabled  = !authed || !inBattle || !canSpend(1);
   if (reset) reset.disabled = false;
 }
 
 // ------- battle handlers (no optimistic spending) -------
 async function handleStart(){
+  // ⭐ Mark activity on battle start
+  markActivity();
+  
   // NEW: hard gate start if no Jet loaded
   if (!hasPixelJet()) {
     logLine('⛔ You need an XRPixel Jet to fly missions. Load your Jets from the XRPL first.');
+    refreshActionButtons();
+    return;
+  }
+
+  // Auth gate
+  if (!hasJwt()) {
+    logLine('⛔ Not signed in. Click the Crossmark Sign In button to load your profile and energy.');
     refreshActionButtons();
     return;
   }
@@ -436,7 +563,16 @@ async function handleStart(){
 }
 
 async function handleNextTurn(){
+  // ⭐ Mark activity on each turn
+  markActivity();
+  
+  if (!hasJwt()) {
+    logLine('⛔ Not signed in. Click the Crossmark Sign In button.');
+    refreshActionButtons();
+    return;
+  }
   if (!SCENE?.inBattle) { logLine('⛔ No active battle. Press Start (10⚡).'); refreshActionButtons(); return; }
+
   if (!canSpend(1)) { logLine('Not enough energy for next turn (1⚡).'); return; }
 
   const next = $('#btn-next'); if (next) next.disabled = true;
@@ -480,6 +616,9 @@ async function handleNextTurn(){
 }
 
 function handleReset(){
+  // ⭐ Mark activity on reset
+  markActivity();
+  
   sceneReset();
   SCENE.inBattle = false;
   updateHPBars();
@@ -496,6 +635,7 @@ function bindUpgradeButtons(){
   map.forEach(([id,key])=>{
     const b = $('#'+id); if (!b) return;
     b.addEventListener('click', async ()=>{
+      markActivity(); // ⭐ Mark activity on upgrade queue
       Queue[key] = (Queue[key]||0) + 1;
       renderQueue();
       await previewCost();
@@ -504,6 +644,7 @@ function bindUpgradeButtons(){
 
   const btnClear = $('#btn-clear-queue');
   if (btnClear) btnClear.addEventListener('click', async ()=>{
+    markActivity(); // ⭐ Mark activity
     Object.keys(Queue).forEach(k=>Queue[k]=0);
     renderQueue();
     await previewCost();
@@ -511,8 +652,14 @@ function bindUpgradeButtons(){
 
   const btnApply = $('#btn-apply-upgrades');
   if (btnApply) btnApply.addEventListener('click', async ()=>{
+    markActivity(); // ⭐ Mark activity on upgrade apply
+    if (!hasJwt()) {
+      logLine('⛔ Not signed in. Click the Crossmark Sign In button to load your profile.');
+      return;
+    }
     try{
-      const res = await SrvAPI.msUpgrade(Queue);
+      const q = readQueueFromDOM();
+      const res = await SrvAPI.msUpgrade({ ...q, econScale: ECON_SCALE });
       Object.keys(Queue).forEach(k=>Queue[k]=0);
       renderQueue();
 
@@ -535,6 +682,7 @@ function bindUI(){
   const sel = document.getElementById('sel-mission') || document.getElementById('mission');
   if (sel) {
     sel.addEventListener('change', ()=>{
+      markActivity(); // ⭐ Mark activity on mission change
       const lvl = getSelectedLevel();
       setSelectedLevel(lvl);
       sceneSeed(lvl);
@@ -549,12 +697,52 @@ function bindUI(){
   const bNext  = $('#btn-next');    if (bNext)  bNext.addEventListener('click', handleNextTurn);
   const bReset = $('#btn-restart'); if (bReset) bReset.addEventListener('click', handleReset);
 
+  // ⭐ Also track activity on claim button clicks
+  const bClaim = $('#btn-claim');
+  if (bClaim) bClaim.addEventListener('click', () => markActivity());
+  const bClaimWc = $('#btn-claim-wc');
+  if (bClaimWc) bClaimWc.addEventListener('click', () => markActivity());
+
   // Repaint on wallet auth, accessory refresh, and profile repaint events
-  window.addEventListener('jets:auth', (ev) => {
-    const w = ev?.detail?.address || window.CURRENT_WALLET;
-    updateAccessoriesForWallet(w);
-    updateCombatEffectsForWallet(w);
+  window.addEventListener('jets:auth', async (ev) => {
+    markActivity(); // ⭐ Mark activity on auth
+    const w = (ev?.detail?.address || window.CURRENT_WALLET || '').trim();
+    if (w) setWallet(w);
+
+    // Always refresh addons (even without JWT)
+    await updateAccessoriesForWallet(w);
+    await updateCombatEffectsForWallet(w);
     renderSquadTotalsAdjusted();
+
+    const isAuthedEvent = !!ev?.detail?.authed;
+    if (!hasJwt() && !isAuthedEvent) {
+      logLine('Wallet connected. Click Crossmark Sign In to load energy/profile.');
+      refreshActionButtons();
+      return;
+    }
+
+    if (DID_PROFILE) {
+      refreshActionButtons();
+      return;
+    }
+
+    try {
+      await loadProfileAndHUD();
+      DID_PROFILE = true;
+
+      const lvl = getSelectedLevel();
+      setSelectedLevel(lvl);
+      sceneSeed(lvl);
+      updateHPBars();
+
+      startServerEnergySync();
+      logLine('Profile loaded.');
+    } catch (e) {
+      console.warn(e);
+      logLine('Sign-in required (profile not loaded).');
+    }
+
+    refreshActionButtons();
   });
   window.addEventListener('jets:accessories', ()=>renderSquadTotalsAdjusted());
   window.addEventListener('jets:profile',     ()=>renderSquadTotalsAdjusted());
@@ -565,7 +753,7 @@ function bindUI(){
 
 // ------- boot -------
 async function init(){
-  log('Booting… energy-single-writer');
+  log('Booting… energy-single-writer + idle-detection');
 
   bindUI();
 
@@ -576,8 +764,13 @@ async function init(){
     await updateCombatEffectsForWallet(addr);
   }
 
-  await loadProfileAndHUD();
+  // Paint a safe, signed-out state first. Profile will overwrite after sign-in.
+  GameState.energy = Number(GameState.energy || 0);
+  GameState.jetFuel = Number(GameState.jetFuel || 0);
+  updateEnergyUI();
+  updateJetFuelUI();
 
+  buildMissionOptions(1);
   const lvl = getSelectedLevel();
   setSelectedLevel(lvl);
   sceneSeed(lvl);
@@ -585,13 +778,22 @@ async function init(){
 
   if (addr) await loadAndRenderJets(addr);
 
-  // Start gentle server sync to surface regen (no client prediction)
-  startServerEnergySync();
+  if (hasJwt()) {
+    try {
+      await loadProfileAndHUD();
+      DID_PROFILE = true;
+      startServerEnergySync();
+    } catch (e) {
+      console.warn(e);
+      logLine('Sign-in required (profile not loaded).');
+    }
+  }
 
-  log('Ready.');
+  log('Ready. Idle timeout: 5 minutes.');
   refreshActionButtons();
 }
 
 // Auto-run
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
 else init();
+

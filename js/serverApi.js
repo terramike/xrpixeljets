@@ -98,7 +98,8 @@ export async function sessionVerify({
   scope = 'play,upgrade,claim',
   ts,
   payload,
-  payloadHex
+  payloadHex,
+  txProof
 } = {}) {
   const addr = (address || '').trim();
   if (!addr || !addr.startsWith('r')) throw new Error('bad_address');
@@ -109,7 +110,7 @@ export async function sessionVerify({
   const res = await fetchJSON('/session/verify', {
     method: 'POST',
     headers: hdrs,
-    body: JSON.stringify({ address: addr, signature, publicKey, scope, ts, payload, payloadHex })
+    body: JSON.stringify({ address: addr, signature, publicKey, scope, ts, payload, payloadHex, txProof })
   });
 
   if (res?.jwt) setAuthToken(res.jwt);
