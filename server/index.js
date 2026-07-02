@@ -27,7 +27,6 @@ const ALLOW = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeyg
   .filter(Boolean);
 
 const ECON_SCALE_ENV    = Number(process.env.ECON_SCALE || 0.10);
-const CLAIM_MAX_PER_24H = Number(process.env.CLAIM_MAX_PER_24H || 15000);
 const BASE_PER_LEVEL    = Number(process.env.BASE_PER_LEVEL || 300);
 const REGEN_STEP        = Number(process.env.REGEN_STEP || 0.1);
 
@@ -147,6 +146,10 @@ app.addHook('onRequest', async (req, reply) => {
     return reply.code(400).send({ error: 'missing_or_bad_X-Wallet' });
   }
   req.wallet = w;
+
+  if (url === '/claim/start') {
+    return;
+  }
 
   const key = `${req.ip}|${w}`;
   const now = Date.now();
@@ -315,7 +318,7 @@ app.get('/config', async (_req, reply) => {
     currencyHex: CURRENCY_HEX,
     issuer: ISSUER_ADDR,
     claimFeeBps: CLAIM_FEE_BPS,
-    claimMaxPer24h: CLAIM_MAX_PER_24H
+      claimMaxPer24h: 0
   });
 });
 
@@ -641,38 +644,6 @@ app.post('/claim/start', async (req, reply) => {
   const row = await getProfileRaw(req.wallet);
   if (!row) return reply.code(404).send({ error: 'not_found' });
 
-  const nowS  = nowSec();
-  const lastS = row.last_claim_at
-    ? Math.floor(new Date(row.last_claim_at).getTime() / 1000)
-    : 0;
-  const COOL = Number(process.env.CLAIM_COOLDOWN_SEC || 300);
-  if (COOL > 0 && (nowS - lastS) < COOL) {
-    return reply.code(429).send({ error: 'cooldown' });
-  }
-
-  if (CLAIM_MAX_PER_24H > 0) {
-    try {
-      const { rows: dayRows } = await pool.query(
-        `select coalesce(sum(amount), 0)::int as total
-           from claim_audit
-          where wallet = $1
-            and created_at >= now() - interval '24 hours'`,
-        [req.wallet]
-      );
-      const claimed   = (dayRows[0]?.total | 0);
-      const projected = claimed + amount;
-      if (projected > CLAIM_MAX_PER_24H) {
-        const remaining = Math.max(0, CLAIM_MAX_PER_24H - claimed);
-        return reply.code(400).send({
-          error: 'daily_cap',
-          detail: { max: CLAIM_MAX_PER_24H, claimed, remaining }
-        });
-      }
-    } catch (e) {
-      req.log.error({ e }, '[claim] daily_cap_query_failed');
-    }
-  }
-
   const feeBps = Math.max(0, Number.isFinite(CLAIM_FEE_BPS) ? CLAIM_FEE_BPS : 0);
   const fee = feeBps > 0 ? Math.floor((amount * feeBps) / 10000) : 0;
   const net = amount - fee;
@@ -714,8 +685,7 @@ app.post('/claim/start', async (req, reply) => {
 
     await pool.query(
       `update player_profiles
-          set last_claim_at = now(),
-              updated_at    = now()
+          set updated_at = now()
         where wallet = $1`,
       [req.wallet]
     );
