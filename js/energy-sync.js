@@ -1,5 +1,5 @@
 // jets/js/energy-sync.js — event-driven HUD sync (2025-01-04-hourly)
-import { GameState } from '/jets/js/state.js';
+import { GameState } from './state.js?v=2025-10-24y';
 
 function updateHUD(detail) {
   const energy = Number(detail?.energy ?? GameState.energy ?? 0);
