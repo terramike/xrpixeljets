@@ -74,8 +74,9 @@ function calcPlayerDamage() {
   const adj = SCENE?.adj;
   const atk = Math.max(0, adj ? Number(adj.attack||0) : Number(GameState?.squad?.attack||0));
   const syn = Math.max(1, Number(GameState?.squad?.synergy || 1));
-  const base = Math.ceil((atk * syn) / 5);
-  return Math.max(1, base);
+  const lowAttackAssist = Math.max(0, 7 - atk) * 0.35;
+  const base = Math.ceil(((atk + 1 + lowAttackAssist) * syn) / 4);
+  return Math.max(2, base);
 }
 
 // Returns { dmg, defUsed } and uses the SAME adj.defense as in HP calc
