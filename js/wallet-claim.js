@@ -53,7 +53,10 @@ import { Signers } from './signers.js';
     try { body = await r.json(); } catch {}
     if (!r.ok) {
       const err = (body && (body.error || body.message)) ? `${body.error}${body.detail? ' '+JSON.stringify(body.detail):''}` : `http_${r.status}`;
-      throw new Error(err);
+      const e = new Error(err);
+      e.status = r.status;
+      e.body = body;
+      throw e;
     }
     return body;
   }
@@ -128,7 +131,6 @@ import { Signers } from './signers.js';
 ⚠️  IMPORTANT:
   • You need a JETS trustline to receive tokens
   • Claim fee is burned (not refundable)
-  • 5 minute cooldown between claims
   • Max 15,000 JF can be claimed per 24 hours
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -233,8 +235,6 @@ Do you want to proceed with this claim?
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ${res.txid ? `🔗 Transaction Hash:\n  ${fullTxHash}\n\n  View on explorer:\n  https://xrpscan.com/tx/${fullTxHash}\n\n  Copy hash: ${fullTxHash}` : ''}
-
-⏰ Next claim available in 5 minutes
         `.trim();
         
         alert(successMsg);
@@ -274,6 +274,7 @@ ${res.txid ? `🔗 Transaction Hash:\n  ${fullTxHash}\n\n  View on explorer:\n  
 
     } catch (e) {
       const msg = String(e?.message || '');
+      const statusCode = Number(e?.status || 0);
       
       // Handle specific errors
       if (msg.includes('unauthorized') || msg.includes('401')) {
@@ -292,9 +293,15 @@ ${res.txid ? `🔗 Transaction Hash:\n  ${fullTxHash}\n\n  View on explorer:\n  
         return;
       }
       
-      if (msg.includes('cooldown') || msg.includes('429')) {
+      if (msg.includes('cooldown')) {
         alert('⏰ Claim Cooldown Active\n\nYou must wait 5 minutes between claims.\n\nPlease try again in a few minutes.');
         hud('❌ Claim on cooldown (5 minute wait)');
+        return;
+      }
+
+      if (statusCode === 429 || msg.includes('rate_limited') || msg.includes('http_429')) {
+        alert('⏳ Too Many Requests\n\nThe server is receiving requests too quickly.\n\nPlease wait a moment and try again.');
+        hud('❌ Claim rate limited; wait a moment and try again');
         return;
       }
       
