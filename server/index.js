@@ -644,9 +644,6 @@ app.post('/claim/start', async (req, reply) => {
     return reply.code(400).send({ error: 'bad_amount' });
   }
 
-  const row = await getProfileRaw(req.wallet);
-  if (!row) return reply.code(404).send({ error: 'not_found' });
-
   const feeBps = Math.max(0, Number.isFinite(CLAIM_FEE_BPS) ? CLAIM_FEE_BPS : 0);
   const fee = feeBps > 0 ? Math.floor((amount * feeBps) / 10000) : 0;
   const net = amount - fee;
@@ -654,6 +651,40 @@ app.post('/claim/start', async (req, reply) => {
   if (net <= 0) {
     return reply.code(400).send({ error: 'claim_fee_too_high' });
   }
+
+  if (authOk.mode === 'shared_secret') {
+    try {
+      const { ok, txid = null, txJSON = null, error: sendErr, detail } =
+        await sendIssued({ to: req.wallet, amount: net });
+
+      if (!ok && TOKEN_MODE === 'hot') {
+        const code = (sendErr === 'trustline_required') ? 400 : 500;
+        return reply.code(code).send({ error: sendErr || 'claim_failed', detail, requestId });
+      }
+
+      await pool.query(
+        `insert into claim_audit (wallet, amount, tx_hash)
+         values ($1, $2, $3)`,
+        [req.wallet, amount, txid]
+      ).catch(() => {});
+
+      return reply.send({
+        ok: true,
+        requestId,
+        txid,
+        txJSON,
+        amount,
+        fee,
+        net
+      });
+    } catch (e) {
+      req.log.error({ e }, '[claim] service payout failed');
+      return reply.code(500).send({ error: e?.code || e?.message || 'claim_failed', requestId });
+    }
+  }
+
+  const row = await getProfileRaw(req.wallet);
+  if (!row) return reply.code(404).send({ error: 'not_found' });
 
   const debit = await pool.query(
     `update player_profiles
