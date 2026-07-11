@@ -5,213 +5,370 @@
   <title>XRPixel Jets: Mothership Mode</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
-  <!-- Font -->
+  <!-- Font + Phaser -->
   <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
-  <!-- Phaser -->
   <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
 
+  <!-- XRPL vendor (must load before wallet loaders) -->
+  <script src="https://cdn.jsdelivr.net/npm/xrpl@4.4.2/build/xrpl-latest-min.js"></script>
+
+  <link rel="icon" type="image/png" sizes="32x32" href="/jets/assets/favicon.png?v=1">
+
+  <!-- Global config -->
+  <script>
+    window.JETS_JS_BASE = "https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js";
+    window.JETS_XRPL_VENDOR = "https://cdn.jsdelivr.net/npm/xrpl@4.4.2/build/xrpl-latest-min.js";
+    window.WC_PROJECT_ID = "606093bde37a19e5b81134d4dee96047";
+    window.JETS_API_BASE = "https://xrpixeljets.onrender.com";
+  </script>
+
   <style>
-    :root{
-      --bg:#0b0f1a; --panel:#0f1524; --line:#2a3550;
-      --ink:#e6f3ff; --muted:#9db0c4; --good:#65f0a0; --bad:#ff6e86; --accent:#49f3ff;
-    }
-    *{ box-sizing:border-box }
-    html,body{ margin:0; background:var(--bg); color:var(--ink); font-family:"Press Start 2P", monospace }
-    a{ color:var(--accent); text-decoration:none }
-
-    .wrap{ max-width:800px; margin:8px auto 64px; padding:0 8px }
-    #game-root{ width:100%; height:600px; margin:0 auto; border:1px solid var(--line); background:#000; border-radius:10px }
-
-    /* stacked UI (tight) */
-    .stack{ display:flex; flex-direction:column; gap:6px; margin-top:8px }
+    :root{ --bg:#0b0f1a; --panel:#0f1524; --line:#2a3550; --ink:#e6f3ff; --muted:#9db0c4; --good:#65f0a0; --bad:#ff6e86; --accent:#49f3ff; }
+    *{ box-sizing:border-box } html,body{ height:100% }
+    body{ margin:0; background:var(--bg); color:var(--ink); font-family:'Press Start 2P',system-ui,monospace; font-size:12px; }
+    .wrap{ max-width:800px; margin:8px auto 64px; padding:0 8px } .stack{ display:flex; flex-direction:column; gap:6px; margin-top:8px }
     .box{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:6px }
-    .row{ display:flex; gap:6px; align-items:center }
-    .row.wrap{ flex-wrap:wrap }
-    .col{ display:flex; flex-direction:column; gap:4px }
-
-    .tiny{ font-size:10px; line-height:1.2; color:var(--muted) }
-    h4{ margin:0 0 4px 0; font-size:12px }
-
-    /* pills & buttons */
+    .row{ display:flex; gap:6px; align-items:center } .row.wrap{ flex-wrap:wrap } .col{ display:flex; flex-direction:column; gap:4px }
+    .tiny{ font-size:10px; line-height:1.2; color:var(--muted) } h4{ margin:0 0 4px 0; font-size:12px }
     .pill{ display:inline-flex; gap:6px; align-items:center; background:#0b1120; border:1px solid var(--line); border-radius:8px; padding:4px 6px }
     .k{ color:var(--muted) } .v{ color:var(--ink) }
-    button{ font-family:inherit; font-size:11px; background:#10182a; color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:6px 8px; cursor:pointer }
+    button{
+      font-family:inherit; font-size:11px; background:#101a2f; border:1px solid var(--line);
+      border-radius:8px; padding:6px 8px; cursor:pointer; color:#e6f3ff; text-shadow:0 0 4px rgba(73,243,255,.65);
+    }
     button.primary{ background:linear-gradient(180deg,#1a2440,#121a30) }
     button:disabled{ opacity:.5; cursor:not-allowed }
+    .btn-buy{ background:#1d3b24; border:1px solid #2a5c35; border-radius:10px; padding:8px 10px; color:#cfead6; cursor:pointer }
+    .btn-buy[disabled]{ opacity:.5; cursor:not-allowed }
     .danger{ color:#ff9aa3; background:#16111a; border-color:#4f2a3a }
-
-    /* bars */
     .bar{ position:relative; height:12px; border:1px solid var(--line); border-radius:7px; background:#091020; overflow:hidden }
-    .fill{ position:absolute; left:0; top:0; bottom:0; width:0%; transition:width .25s ease }
-    .energyfill{ background:linear-gradient(90deg,#3de1ff,#49f3ff) }
-    .youfill{ background:linear-gradient(90deg,#65f0a0,#38e48e) }
-    .enemyfill{ background:linear-gradient(90deg,#ff99ab,#ff6e86) }
-
-    /* log */
-    #log{ height:130px; overflow:auto; background:#0b1120; border:1px solid var(--line); border-radius:8px; padding:6px }
-    .log-line{ margin:2px 0; font-size:11px }
-    .log-line.good{ color:var(--good) }
-    .log-line.bad{ color:var(--bad) }
-
-    /* jets grid — HARD image cap */
+    .fill{ position:absolute; left:0; top:0; bottom:0; width:0%; transition:width .25s } .energyfill{ background:linear-gradient(90deg,#3de1ff,#49f3ff) }
+    .playerfill{ background:linear-gradient(90deg,#65f0a0,#38e48e) } .enemyfill{ background:linear-gradient(90deg,#ff99ab,#ff6e86) }
+    #log{ height:130px; overflow:auto; background:#0b1120; border:1px solid var(--line); border-radius:8px; padding:6px } .log-line{ margin:2px 0; font-size:11px }
+    #game-root{display:none !important; height:0 !important; margin:0 !important; padding:0 !important; border:0 !important;}
     .jet-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(84px,1fr)); gap:6px }
     .jet-tile{ background:#0f1729; border:1px solid var(--line); border-radius:8px; padding:5px; cursor:pointer }
-    .jet-grid img,
-    #jet-grid img,
-    #jets img{
-      width:100% !important;
-      height:66px !important;
-      max-height:66px !important;
-      object-fit:contain !important;
-      image-rendering:pixelated;
-      display:block;
-    }
-
-    /* selected cards — HARD cap */
+    .jet-grid img{ width:100% !important; height:66px !important; object-fit:contain !important; image-rendering:pixelated; display:block }
     #squad-cards{ display:grid; grid-template-columns:1fr 1fr; gap:8px; width:100% }
     #squad-cards .card{ background:#0b1120; border:1px solid var(--line); border-radius:8px; padding:6px; display:flex; gap:8px; align-items:center }
-    #squad-cards img{
-      width:54px !important;
-      height:54px !important;
-      max-height:54px !important;
-      object-fit:contain !important;
-      image-rendering:pixelated;
-      display:block;
-    }
-
-    /* subtle divider inside MS box */
+    #squad-cards img{ width:54px !important; height:54px !important; object-fit:contain !important; image-rendering:pixelated; display:block }
     .sep{ height:1px; background:#13203a; border-radius:1px; margin:2px 0 }
     .ms-section{ display:flex; gap:6px; align-items:center; flex-wrap:wrap }
     .ms-compact{ display:flex; gap:6px; align-items:center; flex-wrap:wrap; justify-content:space-between }
-    .grow{ flex:1 }
+    .mint-btn{ display:inline-block; text-decoration:none; padding:8px 12px; border:1px solid var(--line); border-radius:8px; background:linear-gradient(180deg,#1a2440,#121a30); color:#e6f3ff; }
+    .mint-btn:hover{ filter:brightness(1.08); }
+    #accessory-panel { background:#0b1120; border:1px solid var(--line); border-radius:10px; padding:6px; }
+    #accessory-panel h4 { margin:0 0 4px 0; font-size:12px; }
+    #accessory-panel .tiny { line-height:1.3; color:var(--muted); }
+    #accessory-panel #accessory-list > div { padding:2px 0; }
+    #accessory-panel img { width:24px; height:24px; object-fit:contain; image-rendering:pixelated; margin-right:6px; border-radius:4px; border:1px solid var(--line); background:#0f1729; }
+    #accessory-panel #accessory-totals { margin-top:6px; color:#e6f3ff; }
+
+    /* Wallet connect chooser modal */
+    .wallet-modal-backdrop{ position:fixed; inset:0; background:rgba(3,7,18,0.82); display:none; align-items:center; justify-content:center; z-index:2147483600; }
+    .wallet-modal-backdrop.open{ display:flex; }
+    .wallet-modal{ background:#020617; border:1px solid var(--line); border-radius:12px; padding:12px; width:90vw; max-width:360px; box-shadow:0 12px 40px rgba(0,0,0,0.7); }
+    .wallet-modal-header{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
+    .wallet-modal-header h3{ margin:0; font-size:12px; }
+    .wallet-modal-close{ background:none; border:0; color:var(--muted); cursor:pointer; padding:0 4px; font-size:14px; }
+    .wallet-modal-options{ display:flex; flex-direction:column; gap:6px; }
+    .wallet-modal-option{ background:#0b1120; border:1px solid var(--line); border-radius:10px; padding:8px 10px; text-align:left; cursor:pointer; display:flex; flex-direction:column; gap:2px; }
+    .wallet-modal-option.primary{ background:#1d293b; }
+    .wallet-modal-option.coming-soon{ opacity:.5; cursor:not-allowed; }
+    .wallet-modal-sub{ margin:0 0 6px 0; }
+    @media (max-width:600px){ .wallet-modal{ border-radius:10px; padding:10px; } }
+    .walletconnect-modal__overlay { position: fixed !important; z-index: 2147483647 !important; }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <!-- Phaser Canvas -->
-    <div id="game-root"></div>
-
     <div class="stack">
-      <!-- A) Mission + battle buttons -->
-      <div class="box row wrap">
-        <div class="row">
-          <label class="tiny">Mission</label>
-          <select id="sel-mission"></select>
-        </div>
-        <div class="row" style="margin-left:auto">
-          <button id="btn-start" class="primary">Start (10⚡)</button>
-          <button id="btn-next">Next Turn (1⚡)</button>
-          <button id="btn-restart">Restart</button>
-        </div>
-      </div>
+      <!-- 1) HUD -->
+      <section class="box col" id="hud-top">
+        <div class="row"><div class="tiny" style="min-width:56px">Energy ⚡</div><div class="bar" style="flex:1"><div class="fill energyfill"></div></div><div id="energy-text" class="tiny">0/100 (+1.0/min)</div></div>
+        <div class="row"><div class="tiny" style="min-width:56px">You ❤️</div><div class="bar" style="flex:1"><div class="fill playerfill"></div></div><div id="player-hp-text" class="tiny">20/20</div></div>
+        <div class="row"><div class="tiny" style="min-width:56px">Enemy 💀</div><div class="bar" style="flex:1"><div class="fill enemyfill"></div></div><div id="enemy-hp-text" class="tiny">20/20</div></div>
+      </section>
 
-      <!-- B) Energy + HP (compact farming cluster) -->
-      <div class="box col">
-        <div class="row">
-          <div class="tiny" style="min-width:56px">Energy ⚡</div>
-          <div class="bar" style="flex:1"><div class="fill energyfill"></div></div>
-          <div id="energy-text" class="tiny">Energy ⚡: —/— +0/min</div>
-        </div>
-        <div class="row">
-          <div class="tiny" style="min-width:56px">You ❤️</div>
-          <div class="bar" style="flex:1"><div class="fill youfill"></div></div>
-          <div id="you-hp-text" class="tiny">—/—</div>
-        </div>
-        <div class="row">
-          <div class="tiny" style="min-width:56px">Enemy ❤️</div>
-          <div class="bar" style="flex:1"><div class="fill enemyfill"></div></div>
-          <div id="enemy-hp-text" class="tiny">—/—</div>
-        </div>
-      </div>
+      <!-- 2) Combat Log -->
+      <section class="box col" id="combat-log">
+        <h4>Combat Log</h4>
+        <div id="log" class="tiny">—</div>
+      </section>
 
-      <!-- C) Combat log directly under bars -->
-      <div class="box"><div id="log"></div></div>
+      <!-- 3) Controls -->
+      <section class="box col" id="controls">
+        <div class="row wrap">
+          <div class="col" style="flex:1">
+            <label class="tiny" for="sel-mission">Mission/Wave</label>
+            <select id="sel-mission"></select>
+          </div>
+          <div class="row">
+            <button id="btn-start" class="primary">Start (10⚡)</button>
+            <button id="btn-next">Next Turn (1⚡)</button>
+            <button id="btn-restart">Reset</button>
+          </div>
+        </div>
+        <div style="height:8px"></div>
+        <div id="game-root"></div>
+      </section>
 
-      <!-- D) Mothership box — reorganized & compact -->
-      <div class="box col">
-        <!-- 1) Name + core stats -->
+      <!-- 5) Wallet + Jets + Sign/Claim -->
+      <section class="box col" id="wallet-jets">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <h4 style="margin:0">Your Jets</h4>
+          <div class="row" style="gap:6px; flex-wrap:wrap;">
+            <button id="btn-connect" class="primary" title="Connect a wallet">Connect</button>
+
+            <input id="xrpl-address" class="tiny" placeholder="r..." aria-label="XRPL classic address"
+              style="border:1px solid var(--line);border-radius:8px;background:#0b1120;color:#e6f3ff;width:210px" />
+
+            <!-- Crossmark inline sign/claim -->
+
+            <input id="claim-amount" class="tiny" type="number" min="1" step="1" value="100" placeholder="Amount to claim"
+              style="border:1px solid var(--line);border-radius:8px;background:#0b1120;color:#e6f3ff" />
+            <button id="btn-claim" class="primary" title="Claim via Crossmark">Claim</button>
+
+
+            <button id="btn-wc-trustline" title="Open trustline modal">Set Trustline</button>
+            <a
+  class="mint-btn"
+  href="https://mykeygo.io/jets/crew"
+  target="_blank"
+  rel="noopener"
+  title="View Crew Registry"
+>View Crew</a>
+          </div>
+        </div>
+
+        <div id="session-status" class="tiny" style="margin:4px 0 2px">Not connected</div>
+        <div id="claim-fee-info" class="tiny" style="margin:0 0 2px;"></div>
+        <div id="claim-status" class="tiny" style="margin:0 0 6px;"></div>
+
+        <div id="jets" class="jet-grid"></div>
+      </section>
+
+
+
+      <!-- 4) Mothership Upgrades -->
+      <section class="box col" id="mothership-upgrades">
         <div class="ms-section">
           <span class="pill"><span class="k">Mothership</span><span id="ms-name" class="v">Starter Mothership</span></span>
           <span class="pill"><span class="k">HP ❤️</span><span id="ms-health" class="v">—</span></span>
           <span class="pill"><span class="k">ENERGY ⚡</span><span id="ms-cap" class="v">—</span></span>
           <span class="pill"><span class="k">REGEN 🔌</span><span id="ms-regen" class="v">—</span></span>
-          <span class="pill"><span class="k">JetFuel 🚀</span><span id="jetfuel" class="v">0</span></span>
+          <span class="pill"><span class="k">JetFuel 🚀</span><span id="jetfuel-ms" class="v"><span id="jetfuel">0</span></span></span>
+          <span class="pill"><span class="k">HIT%</span><span id="ms-hit" class="v">—</span></span>
+          <span class="pill"><span class="k">CRIT%</span><span id="ms-crit" class="v">—</span></span>
+          <span class="pill"><span class="k">DODGE%</span><span id="ms-dodge" class="v">—</span></span>
         </div>
-
-        <!-- 2) Upgrades row (buttons + queue + total) -->
         <div class="ms-compact">
           <div class="row wrap">
-            <button id="btn-up-hp">+ HP ❤️</button>
-            <button id="btn-up-cap">+ ENERGY ⚡</button>
-            <button id="btn-up-reg">+ REGEN 🔌</button>
-            <button id="btn-up-hit">+ HIT%</button>
-            <button id="btn-up-crit">+ CRIT%</button>
-            <button id="btn-up-dodge">+ DODGE%</button>
+            <button id="btn-up-hp">+ HP ❤️</button><button id="btn-up-cap">+ ENERGY ⚡</button><button id="btn-up-reg">+ REGEN 🔌</button>
+            <button id="btn-up-hit">+ HIT%</button><button id="btn-up-crit">+ CRIT%</button><button id="btn-up-dodge">+ DODGE%</button>
           </div>
           <div class="row tiny" style="margin-left:auto">
             <span>Queued → HP:<span id="q-hp">0</span> ENERGY:<span id="q-cap">0</span> REGEN:<span id="q-reg">0</span> HIT:<span id="q-hit">0</span> CRIT:<span id="q-crit">0</span> DODGE:<span id="q-dodge">0</span></span>
-            <span style="margin-left:10px">Total Cost: <span id="q-cost">0</span> JF 🚀</span>
+            <span style="margin-left:10px">Total Cost: <span id="q-cost">0</span> JF 🚀 <span id="q-reg-proj" class="tiny"></span></span>
           </div>
         </div>
-
-        <!-- 3) Percent readouts + Apply/Clear -->
-        <div class="ms-compact">
-          <div class="row wrap">
-            <span class="pill"><span class="k">HIT</span><span id="ms-hit" class="v">0%</span></span>
-            <span class="pill"><span class="k">CRIT</span><span id="ms-crit" class="v">10%</span></span>
-            <span class="pill"><span class="k">DODGE</span><span id="ms-dodge" class="v">0%</span></span>
-          </div>
-          <div class="row" style="margin-left:auto">
-            <button id="btn-apply" class="primary">Apply Upgrades</button>
-            <button id="btn-clear-q" class="danger">Clear</button>
-          </div>
+        <div class="row" style="margin-top:6px">
+          <button id="btn-apply-upgrades" class="primary">Apply Changes</button>
+          <button id="btn-clear-queue" class="danger">Clear</button>
+          <span class="tiny" id="upgrades-status" style="margin-left:auto">—</span>
         </div>
 
         <div class="sep"></div>
+        <div id="squad-cards">
+          <div class="card"><img id="main-img" alt="Main Jet" src="/jets/assets/placeholder.png" /><div id="main-card" class="tiny">—</div></div>
+          <div class="card"><img id="wing-img" alt="Wing Jet" src="/jets/assets/placeholder.png" /><div id="wing-card" class="tiny">—</div></div>
+        </div>
 
-        <!-- 4) Selected Main/Wing cards — compact two-up grid -->
-        <div id="squad-cards"></div>
-      </div>
-
-      <!-- E) Squad stats -->
-      <div class="box col">
+        <div class="sep"></div>
         <h4>Squad Stats –</h4>
         <div class="row wrap">
-          <span class="pill"><span class="k">Attack</span> <span id="sq-atk" class="v">—</span></span>
-          <span class="pill"><span class="k">Speed</span>  <span id="sq-spd" class="v">—</span></span>
-          <span class="pill"><span class="k">Defense</span><span id="sq-def" class="v">—</span></span>
-          <span class="pill"><span class="k">Synergy</span><span id="sq-syn" class="v">—</span></span>
+          <span class="pill"><span class="k">Attack</span> <span id="squad-atk" class="v">—</span></span>
+          <span class="pill"><span class="k">Speed</span>  <span id="squad-spd" class="v">—</span></span>
+          <span class="pill"><span class="k">Defense</span><span id="squad-def" class="v">—</span></span>
+          <span class="pill"><span class="k">Synergy</span><span id="squad-syn" class="v">—</span></span>
           <span class="tiny" style="margin-left:auto">Set: <span id="squad-detail">—</span></span>
         </div>
-        <div class="tiny">Solo bonus: +50% ATK, +20% SPD</div>
-      </div>
+      </section>
 
-      <!-- F) Jet selection (Connect Wallet here) -->
-      <div class="box col">
-        <div class="row" style="justify-content:space-between;align-items:center">
-          <h4 style="margin:0">Your Jets</h4>
-          <button id="btn-connect" class="primary">Connect Wallet (mock)</button>
+      <!-- Cross-window wallet hookup -->
+      <script>
+        (function(){
+          const ALLOWED = [location.origin, "https://mykeygo.io", "https://www.mykeygo.io"];
+          const isR = s => typeof s === "string" && /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(s);
+          const setWallet = (addr) => {
+            try { localStorage.setItem("WALLET", addr); } catch {}
+            try { window.dispatchEvent(new CustomEvent("jets:auth", { detail: { address: addr } })); } catch {}
+            const el = document.getElementById("session-status");
+            if (el) el.textContent = `Connected: ${addr}`;
+          };
+          const extractAddr = (data) => {
+            if (isR(data?.account)) return data.account;
+            if (isR(data?.address)) return data.address;
+            if (isR(data?.wallet?.address)) return data.wallet.address;
+            try { const m = JSON.stringify(data).match(/r[1-9A-HJ-NP-Za-km-z]{25,35}/); return m ? m[0] : null; } catch { return null; }
+          };
+          window.addEventListener("message", (ev) => {
+            if (!ALLOWED.includes(ev.origin)) return;
+            const addr = extractAddr(ev.data);
+            if (isR(addr)) setWallet(addr);
+          }, false);
+        })();
+      </script>
+
+      <!-- Trustline -->
+      <section class="box col" id="trustline-jets">
+        <h4>Set Trustline</h4>
+        <div class="row wrap" style="gap:8px">
+          <button id="btn-trust-xmag" class="primary">Set JETS Trustline (xMagnetic)</button>
         </div>
-        <div id="jet-grid" class="jet-grid"></div>
-        <div id="jets" class="jet-grid"></div>
-        <div class="row" style="justify-content:flex-end;margin-top:2px">
-          <button id="btn-clear-wing" class="danger">Clear Wingman</button>
+        <div class="tiny" style="margin-top:4px">
+          Issuer: rHz5qqAo57UnEsrMtw5croE4WnK3Z3J52e · Currency HEX: 4A45545300000000000000000000000000000000 · Network: XRPL Mainnet
+        </div>
+      </section>
+
+            <!-- Quick Start: Crossmark + GemWallet -->
+      <section class="wrap" id="quickstart-crossmark" style="margin-top:16px;">
+        <section class="box col">
+          <h4 style="margin:0 0 6px 0;">How to Play & Claim JETS (Crossmark or GemWallet)</h4>
+
+          <ol class="tiny" style="line-height:1.5; margin:6px 0 10px 18px;">
+            <li>
+              Install a wallet:
+              <strong>Crossmark</strong> (<a href="https://crossmark.io/download" target="_blank" rel="noopener">download</a>)
+              or <strong>GemWallet</strong> (<a href="https://gemwallet.app/" target="_blank" rel="noopener">download</a>).
+            </li>
+            <li>Open <a href="https://mykeygo.io/jets" target="_blank" rel="noopener">mykeygo.io/jets</a> and click <strong>Connect</strong>, then choose your wallet.</li>
+            <li>
+              Click <strong>Set Trustline</strong> to add <code>JETS</code>.
+              Need a direct link?
+              <a id="doc-xmag-human" href="#" target="_blank" rel="noopener">Trustline (JETS)</a> ·
+              <a id="doc-xmag-hex" href="#" target="_blank" rel="noopener">Trustline (HEX)</a>
+            </li>
+            <li>
+              Mint or bring an XRPixel Jet NFT, then pick <strong>Main</strong> and <strong>Wing</strong> jets.
+              <a href="https://xrp.cafe/collection/jets" target="_blank" rel="noopener">Mint Jets</a>
+            </li>
+            <li>Play → earn <strong>JetFuel</strong> (in-game). Claim to receive on-ledger <strong>JETS</strong>.</li>
+          </ol>
+
+          <div class="sep" style="margin:6px 0;"></div>
+
+          <div class="tiny" style="line-height:1.5;">
+            <strong>Distribution</strong> — No presale. No airdrop. No staking. At launch, the only way to get <strong>JETS</strong> is to play and claim.
+          </div>
+
+          <div class="row" style="gap:8px; margin-top:8px; flex-wrap:wrap;">
+            <a class="mint-btn" href="https://crossmark.io/download" target="_blank" rel="noopener">Install Crossmark</a>
+            <a class="mint-btn" href="https://gemwallet.app/" target="_blank" rel="noopener">Install GemWallet</a>
+            <a class="mint-btn" href="https://xrp.cafe/collection/jets" target="_blank" rel="noopener">Mint Jets</a>
+            <a class="mint-btn" href="https://xrp.cafe/collection/jetupgrades" target="_blank" rel="noopener">Mint Upgrades</a>
+            <a class="mint-btn" href="https://github.com/terramike/xrpixeljets/wiki" target="_blank" rel="noopener">Learn to Play</a>
+          </div>
+        </section>
+      </section>
+
+
+      <script>
+        (function(){
+          const ISSUER = window.ISSUER_ADDR || window.ISSUER_ADDRESS || 'rHz5qqAo57UnEsrMtw5croE4WnK3Z3J52e';
+          const CODE   = window.CURRENCY_CODE || 'JETS';
+          const HEX    = window.CURRENCY_HEX || '4A45545300000000000000000000000000000000';
+          const mk = (base, lhs, rhs) => `${base}/${encodeURIComponent(lhs)}_${encodeURIComponent(rhs)}?network=mainnet&currency=${encodeURIComponent(lhs.includes('+')? lhs.split('+')[0] : lhs)}&issuer=${ISSUER}`;
+          const human = mk('https://xmagnetic.org/dex', `${CODE}+${ISSUER}`, 'XRP+XRP');
+          const hex   = mk('https://xmagnetic.org/dex', `${HEX}+${ISSUER}`,  'XRP+XRP');
+          const a = document.getElementById('doc-xmag-human');
+          const b = document.getElementById('doc-xmag-hex');
+          if (a) a.href = human;
+          if (b) b.href = hex;
+        })();
+      </script>
+
+      <!-- WC Trustline modal -->
+      <dialog id="wc-trustline-modal" style="border:1px solid var(--line); background:var(--panel); color:var(--ink); padding:16px; border-radius:12px;">
+        <form method="dialog" class="col" style="gap:10px; min-width:320px;">
+          <div style="font-weight:600; margin-bottom:6px;">Set JETS Trustline</div>
+          <div class="tiny">Issuer</div>
+          <div class="tiny muted" id="wc-issuer">rHz5qqAo57UnEsrMtw5croE4WnK3Z3J52e</div>
+          <div class="tiny" style="margin-top:8px;">Currency (hex)</div>
+          <div class="tiny muted" id="wc-hex">4A45545300000000000000000000000000000000</div>
+          <label class="tiny" style="margin-top:8px;">Limit</label>
+          <input name="limit" class="inpt" value="10000000" />
+          <div class="row" style="gap:8px; justify-content:flex-end; margin-top:12px;">
+            <button data-cancel type="button">Cancel</button>
+            <button type="submit" class="primary">Confirm</button>
+          </div>
+        </form>
+      </dialog>
+
+      <!-- Wallet choice modal (SINGLE instance) -->
+      <div id="wallet-modal" class="wallet-modal-backdrop" aria-hidden="true">
+        <div class="wallet-modal">
+          <div class="wallet-modal-header">
+            <h3>Connect Wallet</h3>
+            <button type="button" id="wallet-modal-close" class="wallet-modal-close" aria-label="Close">✕</button>
+          </div>
+          <p class="tiny wallet-modal-sub">Choose how you’d like to connect:</p>
+          <div class="wallet-modal-options">
+            <button type="button" id="wallet-modal-crossmark" class="wallet-modal-option primary">
+              <span>Crossmark</span><span class="tiny">Desktop extension</span>
+            </button>
+            <button type="button" id="wallet-modal-gem" class="wallet-modal-option primary">
+              <span>GemWallet</span><span class="tiny">Desktop extension</span>
+            </button>
+            <button type="button" id="wallet-modal-wc" class="wallet-modal-option">
+              <span>WalletConnect</span><span class="tiny">Bifrost & others</span>
+            </button>
+            <button type="button" id="wallet-modal-xaman" class="wallet-modal-option coming-soon" disabled>
+              <span>Xaman</span><span class="tiny">Coming soon</span>
+            </button>
+          </div>
+          <p class="tiny wallet-modal-sub" style="margin-top:10px;">You can also type a classic address manually in the “Your Jets” panel.</p>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- Modular scripts (unchanged IDs) -->
-  <script type="module" src="js/constants.js"></script>
-  <script type="module" src="js/state.js"></script>
-  <script type="module" src="js/utils.js"></script>
-  <script type="module" src="js/time.js"></script>
-  <script type="module" src="js/missions.js"></script>
-  <script type="module" src="js/mothership.js"></script>
-  <script type="module" src="js/jets.js"></script>
-  <script type="module" src="js/serverApi.js"></script>
-  <script type="module" src="js/ui.js"></script>
-  <script type="module" src="js/scene.js"></script>
-  <script type="module" src="js/main.js"></script>
+    <!-- XRPL helpers (non-module; must load before any modules that use window.xrpl) -->
+  <script src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/wallet-xrpl.js?v=2025-11-20w3"></script>
+
+  <!-- Core game modules (order preserved) -->
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/serverApi.js?v=2025-12-20x8"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/missions.js?v=2025-10-24y"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/mothership.js?v=2025-10-24y"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/jets.js?v=2025-11-01revert1"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/time.js?v=2025-10-24y1"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/ui.js?v=2025-11-19mothership-level4"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/combat-effects.js?v=2025-12-24-1"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/accessories.js?v=2025-01-03-cachebust4"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/scene.js?v=2025-11-21-thorns2"></script>
+    <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/wallet-jets-meta.js?v=2025-11-21jets19ds7"></script>
+<script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/wallet-wc-connect.js?v=2025-01-16-mobile-bifrost-v2"></script>
+
+
+
+
+
+
+  <!-- Main game boot (must be after modules above) -->
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/main.js?v=2025-01-03-idle"></script>
+
+  <!-- Post-boot helpers -->
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/upgrades-fix.js?v=2025-10-28b"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/ipfs-img-fallback.js?v=2025-10-28-ghost1"></script>
+
+  <!-- Wallet UX + Auth + Claim (Crossmark-only right now) -->
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/signers.js?v=2025-12-18r6"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/wallet-modal.js?v=2025-01-16-wc-mobile-v1"></script>
+  <!-- ADD THIS LINE - Gem Wallet SDK Integration -->
+<script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/auth-gem-sdk.js?v=2025-12-20-sdk13"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/auth-claim.js?v=2025-12-20x11"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/terramike/xrpixeljets@main/js/wallet-claim.js?v=2025-12-20x7"></script>
+
+
 </body>
 </html>

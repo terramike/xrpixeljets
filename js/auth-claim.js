@@ -1,12 +1,12 @@
 // /jets/js/auth-claim.js - v=2025-12-20-crossmark-only
 // CROSSMARK ONLY - Gem Wallet handled by auth-gem-sdk.js
 
-import { sessionStart, sessionVerify, setAuthToken, claimStart } from '/jets/js/serverApi.js';
+import { sessionStart, sessionVerify, setAuthToken, claimStart } from './serverApi.js?v=2025-12-20x8';
 
 (function () {
   const $ = (id) => document.getElementById(id);
   const hud = (m) => console.log(`[auth] ${m}`);
-  
+
   function status(msg) {
     const el = $('claim-status') || $('session-status');
     if (el) el.textContent = msg;
@@ -27,16 +27,16 @@ import { sessionStart, sessionVerify, setAuthToken, claimStart } from '/jets/js/
     const clean = (addr || '').trim();
     try { localStorage.setItem('WALLET', clean); } catch {}
     window.CURRENT_WALLET = clean;
-    
+
     const inp = $('xrpl-address');
     if (inp && clean) inp.value = clean;
-    
+
     const st = $('session-status');
     if (st) st.textContent = clean ? `Connected: ${clean}` : 'Not connected';
-    
+
     try {
-      window.dispatchEvent(new CustomEvent('jets:auth', { 
-        detail: { address: clean, authed: !!clean } 
+      window.dispatchEvent(new CustomEvent('jets:auth', {
+        detail: { address: clean, authed: !!clean }
       }));
     } catch {}
   }
@@ -47,19 +47,19 @@ import { sessionStart, sessionVerify, setAuthToken, claimStart } from '/jets/js/
 
   function extractSigData(obj) {
     let sig = null, pub = null, addr = null;
-    
+
     function search(o, depth = 0) {
       if (!o || typeof o !== 'object' || depth > 5) return;
-      
+
       if (!sig && typeof o.signature === 'string') sig = o.signature;
       if (!pub && typeof o.publicKey === 'string') pub = o.publicKey;
       if (!addr && typeof o.address === 'string' && o.address.startsWith('r')) addr = o.address;
-      
+
       for (const v of Object.values(o)) {
         if (v && typeof v === 'object') search(v, depth + 1);
       }
     }
-    
+
     search(obj);
     return { signature: sig, publicKey: pub, address: addr };
   }
@@ -73,13 +73,13 @@ import { sessionStart, sessionVerify, setAuthToken, claimStart } from '/jets/js/
 
     try {
       status('Opening Crossmark…');
-      
+
       const cm = getCrossmark();
       if (!cm) throw new Error('Crossmark not installed');
 
       // 1. Get address
       let addr = ($('xrpl-address')?.value || '').trim();
-      
+
       if (!isAddress(addr)) {
         try {
           addr = (localStorage.getItem('WALLET') || '').trim();
@@ -94,7 +94,7 @@ import { sessionStart, sessionVerify, setAuthToken, claimStart } from '/jets/js/
       }
 
       if (!isAddress(addr)) throw new Error('No wallet address');
-      
+
       setWallet(addr);
       hud(`Wallet: ${addr}`);
 

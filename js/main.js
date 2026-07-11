@@ -300,7 +300,7 @@ function startServerEnergySync(){
     if (isClientSleeping()) {
       return;
     }
-    
+
     try{
       const prof = await SrvAPI.getProfile();
       GameState.ms = prof.ms; GameState.pct = prof.pct;
@@ -395,9 +395,11 @@ function loadScriptOnce(src){
   });
 }
 async function ensureXRPLStack() {
-  if (!window.xrpl) await loadScriptOnce('/jets/js/vendor/xrpl-latest-min.js');
-  await loadScriptOnce('/jets/js/wallet-xrpl.js?v=2025-11-20w2');
-  await loadScriptOnce('/jets/js/wallet-jets-meta.js?v=2025-11-21jets19ds1');
+  const jsBase = window.JETS_JS_BASE || '/jets/js';
+  const xrplVendor = window.JETS_XRPL_VENDOR || 'https://cdn.jsdelivr.net/npm/xrpl@4.4.2/build/xrpl-latest-min.js';
+  if (!window.xrpl) await loadScriptOnce(xrplVendor);
+  await loadScriptOnce(`${jsBase}/wallet-xrpl.js?v=2025-11-20w2`);
+  await loadScriptOnce(`${jsBase}/wallet-jets-meta.js?v=2025-11-21jets19ds1`);
   if (!window.XRPLWallet || typeof window.XRPLWallet.loadXRPLJets !== 'function') {
     console.warn('[Jets] XRPLWallet.loadXRPLJets not available after meta load.');
   }
@@ -498,7 +500,7 @@ function refreshActionButtons(){
 async function handleStart(){
   // ⭐ Mark activity on battle start
   markActivity();
-  
+
   // NEW: hard gate start if no Jet loaded
   if (!hasPixelJet()) {
     logLine('⛔ You need an XRPixel Jet to fly missions. Load your Jets from the XRPL first.');
@@ -538,7 +540,7 @@ async function handleStart(){
 async function handleNextTurn(){
   // ⭐ Mark activity on each turn
   markActivity();
-  
+
   if (!hasJwt()) {
     logLine('⛔ Not signed in. Click the Crossmark Sign In button.');
     refreshActionButtons();
@@ -591,7 +593,7 @@ async function handleNextTurn(){
 function handleReset(){
   // ⭐ Mark activity on reset
   markActivity();
-  
+
   sceneReset();
   SCENE.inBattle = false;
   updateHPBars();
@@ -647,7 +649,7 @@ function bindUpgradeButtons(){
   });
 }
 
-// ------- bindings -------  
+// ------- bindings -------
 let BOUND = false;
 function bindUI(){
   if (BOUND) return; BOUND = true;
