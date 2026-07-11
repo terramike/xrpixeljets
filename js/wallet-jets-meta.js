@@ -1,103 +1,225 @@
-/* XRPixel Jets — wallet-jets-meta.js (2025-11-21-jets19-ds)
-   Jets-only XLS-20 loader w/ resilient IPFS + caching.
-   - Filters NFTokenTaxon === 200 (Jets)
-   - Accessories (taxon 201) are ignored here; handled by accessories.js
-   - Parses attributes: Attack aN, Speed sN, Defense dN (N = 1..19)
-   - Legendary hook: Damage Shield Per Hit → jet.damageShieldPerHit / jet.dmgShield
+/* XRPixel Jets — wallet-jets-meta.js
+   Multi-collection Jets loader
+
+   Supports:
+   - Original XRPixel Jets (Taxon 200)
+   - LadyCafe Jets (Taxon 1938110184)
+
+   Features:
+   - IPFS metadata loading
+   - LadyCafe API metadata loading
+   - Bonus Attacks Per Turn
+   - Damage Shield Per Hit
+   - Multi-taxon support
+   - Better logging
+   - Safe fallbacks
 */
+
 (function(){
+
   const IPFS_GATEWAYS = [
     'https://nftstorage.link/ipfs/',
     'https://ipfs.io/ipfs/',
-    'https://cloudflare-ipfs.com/ipfs/',
-    'https://gateway.pinata.cloud/ipfs/',
-    'https://cf-ipfs.com/ipfs/'
+    'https://gateway.pinata.cloud/ipfs/'
   ];
-  const JETS_TAXON = 200;
-  const metaCache = new Map(); // uriAscii -> parsed meta
-  const isR = s => typeof s==='string' && /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(s);
 
-  // Allow stats up to 19 instead of capping at 9
-  const clampStat = n => Math.max(1, Math.min(19, Number(n) || 0));
+  const JETS_TAXONS = [
+    200,
+    1938110184
+  ];
+
+  const LADYCAFE_TAXON = 1938110184;
+
+  const metaCache = new Map();
+
+  const isR = s =>
+    typeof s === 'string' &&
+    /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(s);
+
+  const clampStat = n =>
+    Math.max(1, Math.min(19, Number(n) || 0));
 
   function hexToAscii(hex){
     try{
-      if (!hex) return null;
+      if(!hex) return null;
+
       hex = String(hex);
-      if (/^0x/i.test(hex)) hex = hex.slice(2);
-      if (hex.length % 2 !== 0) return null;
-      const bytes = new Uint8Array(hex.match(/.{1,2}/g).map(b => parseInt(b,16)));
+
+      if(/^0x/i.test(hex)){
+        hex = hex.slice(2);
+      }
+
+      if(hex.length % 2 !== 0){
+        return null;
+      }
+
+      const bytes = new Uint8Array(
+        hex.match(/.{1,2}/g).map(x => parseInt(x,16))
+      );
+
       return new TextDecoder().decode(bytes);
-    }catch{ return null; }
+
+    }catch(e){
+      return null;
+    }
   }
 
-  const ipfsCandidates = (uri) =>
-    IPFS_GATEWAYS.map(g =>
-      g + uri.replace(/^ipfs:\/\//,'').replace(/^ipfs\//,'')
-    );
+  function ipfsCandidates(uri){
+    const cid = uri
+      .replace(/^ipfs:\/\//,'')
+      .replace(/^ipfs\//,'');
 
-  const candidatesFor = (uri) => !uri
-    ? []
-    : (uri.startsWith('ipfs://') ? ipfsCandidates(uri) : [uri]);
+    return IPFS_GATEWAYS.map(g => g + cid);
+  }
+
+  function candidatesFor(uri){
+
+    if(!uri) return [];
+
+    if(uri.startsWith('ipfs://')){
+      return ipfsCandidates(uri);
+    }
+
+    return [uri];
+  }
+
+  async function fetchJson(url){
+
+    const r = await fetch(url);
+
+    if(!r.ok){
+      throw new Error(`HTTP ${r.status}`);
+    }
+
+    return await r.json();
+  }
 
   async function fetchWithFallback(urls){
+
     let lastErr;
-    for (const u of urls){
+
+    for(const url of urls){
+
       try{
-        const r = await fetch(u, { mode:'cors' });
-        if (r.ok) return await r.json();
-        lastErr = new Error('HTTP '+r.status);
-      }catch(e){ lastErr = e; }
+
+        const r = await fetch(url);
+
+        if(r.ok){
+          return await r.json();
+        }
+
+        lastErr = new Error(`HTTP ${r.status}`);
+
+      }catch(e){
+        lastErr = e;
+      }
     }
-    throw lastErr || new Error('meta fetch failed');
+
+    throw lastErr || new Error('fetch failed');
   }
 
   function parseAttrs(arr){
-    let attack=null,
-        speed=null,
-        defense=null,
-        topGun=null,
-        bottomGun=null,
-        jetId=null,
-        damageShieldPerHit=null;
 
-    if (Array.isArray(arr)){
-      for (const a of arr){
-        const t = String(a.trait_type || a.type || '').toLowerCase();
+    let attack = null;
+    let speed = null;
+    let defense = null;
+
+    let topGun = null;
+    let bottomGun = null;
+
+    let jetId = null;
+
+    let damageShieldPerHit = null;
+    let bonusAttacksPerTurn = null;
+
+    if(Array.isArray(arr)){
+
+      for(const a of arr){
+
+        const t = String(
+          a.trait_type ||
+          a.type ||
+          ''
+        ).toLowerCase().trim();
+
         const rawVal = a.value;
-        const v = String(rawVal ?? '').toLowerCase();
 
-        const num = (prefix)=>{
-          const m = v.match(new RegExp(`^${prefix}?(\\d+)`));
-          return m ? clampStat(parseInt(m[1],10)) : null;
+        const v = String(rawVal || '')
+          .toLowerCase()
+          .trim();
+
+        const num = prefix => {
+
+          const m = v.match(
+            new RegExp(`^${prefix}?(\\d+)`)
+          );
+
+          return m
+            ? clampStat(parseInt(m[1],10))
+            : null;
         };
 
-        if (t==='attack' || t==='atk') {
+        if(t === 'attack' || t === 'atk'){
           attack = num('a');
-        } else if (t==='speed' || t==='spd') {
-          speed = num('s');
-        } else if (t==='defense' || t==='def') {
-          defense = num('d');
-        } else if (t==='top gun' || t==='topgun' || t==='gun_top') {
-          topGun = a.value;
-        } else if (t==='bottom gun' || t==='bottomgun' || t==='gun_bottom') {
-          bottomGun = a.value;
-        } else if (t==='xrpixeljet' || t==='jet' || t==='xrpxmj') {
-          jetId = a.value;
         }
-        // Legendary hook: Damage Shield on the jet itself
-        else if (
+
+        else if(t === 'speed' || t === 'spd'){
+          speed = num('s');
+        }
+
+        else if(t === 'defense' || t === 'def'){
+          defense = num('d');
+        }
+
+        else if(
+          t === 'top gun' ||
+          t === 'topgun' ||
+          t === 'gun_top'
+        ){
+          topGun = rawVal;
+        }
+
+        else if(
+          t === 'bottom gun' ||
+          t === 'bottomgun' ||
+          t === 'gun_bottom'
+        ){
+          bottomGun = rawVal;
+        }
+
+        else if(
+          t === 'xrpixeljet' ||
+          t === 'jet'
+        ){
+          jetId = rawVal;
+        }
+
+        else if(
           t === 'damage shield per hit' ||
           t === 'damage shield' ||
           t === 'thorns'
-        ) {
+        ){
           const n = Number(rawVal);
-          if (Number.isFinite(n)) {
-            damageShieldPerHit = clampStat(n);
+
+          if(Number.isFinite(n)){
+            damageShieldPerHit = n;
+          }
+        }
+
+        else if(
+          t === 'bonus attacks per turn' ||
+          t === 'bonus attack' ||
+          t === 'extra attacks'
+        ){
+          const n = Number(rawVal);
+
+          if(Number.isFinite(n)){
+            bonusAttacksPerTurn = n;
           }
         }
       }
     }
+
     return {
       attack,
       speed,
@@ -105,135 +227,424 @@
       topGun,
       bottomGun,
       jetId,
-      damageShieldPerHit
+      damageShieldPerHit,
+      bonusAttacksPerTurn
     };
   }
 
-  async function resolveMeta(nft){
-    const uriHex = nft.URI || nft.uri || null;
-    const ascii  = hexToAscii(uriHex);
-    if (!ascii) return {};
-    if (metaCache.has(ascii)) return metaCache.get(ascii);
+  async function resolveLadyCafeMeta(nft){
 
-    const urls = candidatesFor(ascii);
+    const cacheKey = `lady:${nft.NFTokenID}`;
+
+    if(metaCache.has(cacheKey)){
+      return metaCache.get(cacheKey);
+    }
+
     try{
-      const j = await fetchWithFallback(urls);
-      const attrs  = parseAttrs(j.attributes);
-      const image  = j.image || j.image_url || j.imageURI || null;
-      const imgURL = image ? candidatesFor(image)[0] : null;
-      const meta   = {
-        meta:j,
+
+      const url =
+        `https://ladycafe.io/api/nfts/token/${nft.NFTokenID}`;
+
+      console.log(
+        '[JetsMeta] LadyCafe lookup:',
+        nft.NFTokenID
+      );
+
+      const j = await fetchJson(url);
+
+      const attrs = parseAttrs(
+        j.attributes ||
+        j.traits ||
+        j.nft?.traits ||
+        []
+      );
+
+      const meta = {
+
+        meta: j,
+
         ...attrs,
-        image:imgURL,
-        name:j.name||null,
-        descr:j.description||null,
-        source:ascii
+
+        image:
+          j.image ||
+          j.nft?.image ||
+          null,
+
+        name:
+          j.name ||
+          j.nft?.name ||
+          'XRPixel Jet',
+
+        descr:
+          j.description ||
+          j.nft?.description ||
+          null,
+
+        source: url
       };
-      metaCache.set(ascii, meta);
-      console.log('[JetsMeta] meta for', (nft.NFTokenID||'').slice(0,12), '→', ascii);
+
+      metaCache.set(cacheKey, meta);
+
+      console.log(
+        '[JetsMeta] LadyCafe success:',
+        meta.name
+      );
+
       return meta;
-    } catch(e){
-      console.warn('[JetsMeta] meta fetch failed', ascii, e);
-      const fallback = {};
-      metaCache.set(ascii, fallback);
-      return fallback;
+
+    }catch(e){
+
+      console.warn(
+        '[JetsMeta] LadyCafe failed:',
+        nft.NFTokenID,
+        e
+      );
+
+      // TEMPORARY HARDCODED FALLBACK for Lady Jets while CORS issue is resolved
+      const fallbackMeta = {
+        name: 'Lady Jet',
+        image: '/jets/assets/jet.png',
+        attack: 11,
+        speed: 11,
+        defense: 11,
+        damageShieldPerHit: 3,
+        bonusAttacksPerTurn: 1
+      };
+      console.log(
+        '[JetsMeta] Using hardcoded Lady Jet fallback for',
+        nft.NFTokenID
+      );
+      return fallbackMeta;
     }
   }
 
-  // Fallback path when metadata is missing: map ledger fields into 1..19 band
+  async function resolveIPFSMeta(nft){
+
+    const uriHex = nft.URI;
+
+    const ascii = hexToAscii(uriHex);
+
+    if(!ascii){
+      return {};
+    }
+
+    if(metaCache.has(ascii)){
+      return metaCache.get(ascii);
+    }
+
+    try{
+
+      const urls = candidatesFor(ascii);
+
+      const j = await fetchWithFallback(urls);
+
+      const attrs = parseAttrs(j.attributes);
+
+      const image =
+        j.image ||
+        j.image_url ||
+        null;
+
+      const imgURL =
+        image
+          ? candidatesFor(image)[0]
+          : null;
+
+      const meta = {
+
+        meta: j,
+
+        ...attrs,
+
+        image: imgURL,
+
+        name:
+          j.name ||
+          'XRPixel Jet',
+
+        descr:
+          j.description ||
+          null,
+
+        source: ascii
+      };
+
+      metaCache.set(ascii, meta);
+
+      return meta;
+
+    }catch(e){
+
+      console.warn(
+        '[JetsMeta] IPFS meta failed:',
+        ascii,
+        e
+      );
+
+      return {};
+    }
+  }
+
   function fallbackStats(nft){
-    const fee   = Number(nft.transfer_fee ?? nft.TransferFee ?? 0);
-    const flags = Number(nft.flags ?? nft.Flags ?? 0);
-    const taxon = Number(nft.nftoken_taxon ?? nft.NFTokenTaxon ?? 0);
-    const toStat = (n) => {
+
+    const fee =
+      Number(
+        nft.TransferFee ||
+        nft.transfer_fee ||
+        0
+      );
+
+    const flags =
+      Number(
+        nft.Flags ||
+        nft.flags ||
+        0
+      );
+
+    const taxon =
+      Number(
+        nft.NFTokenTaxon ||
+        nft.nftoken_taxon ||
+        0
+      );
+
+    const toStat = n => {
+
       const x = Number(n) || 0;
+
       const r = x % 19;
-      return r === 0 ? 19 : r;   // map into 1..19
+
+      return r === 0
+        ? 19
+        : r;
     };
+
     return {
-      attack:  toStat(fee),
-      speed:   toStat(flags),
+      attack: toStat(fee),
+      speed: toStat(flags),
       defense: toStat(taxon)
     };
   }
 
   async function listAllNFTs(addr){
-    if (!window.xrpl) throw new Error('xrpl.js not loaded');
-    const client = new xrpl.Client(window.XRPL_NET || 'wss://xrplcluster.com');
+
+    const XRPL =
+      window.XRPL_LIB ||
+      window.xrpl;
+
+    const ClientCtor = XRPL?.Client;
+
+    if(typeof ClientCtor !== 'function'){
+      throw new Error(
+        'xrpl Client missing'
+      );
+    }
+
+    const client =
+      new ClientCtor(
+        window.XRPL_NET ||
+        'wss://xrplcluster.com'
+      );
+
     await client.connect();
-    const out=[]; let marker=null;
+
+    const out = [];
+
+    let marker = null;
+
     try{
+
       do{
-        const req = { command:'account_nfts', account:addr, limit:400 };
-        if (marker) req.marker=marker;
-        const resp = await client.request(req);
-        out.push(...(resp.result.account_nfts||[]));
-        marker = resp.result.marker;
-      } while (marker);
-    } finally { try { await client.disconnect(); } catch {} }
+
+        const req = {
+          command:'account_nfts',
+          account:addr,
+          limit:400
+        };
+
+        if(marker){
+          req.marker = marker;
+        }
+
+        const resp =
+          await client.request(req);
+
+        out.push(
+          ...(resp?.result?.account_nfts || [])
+        );
+
+        marker =
+          resp?.result?.marker;
+
+      }while(marker);
+
+    }finally{
+
+      try{
+        await client.disconnect();
+      }catch{}
+    }
+
     return out;
   }
 
   async function metadataAwareLoader(addr){
-    if (!isR(addr)) return [];
-    console.log('[JetsMeta] Loading NFTs for', addr);
-    let nfts = [];
-    try { nfts = await listAllNFTs(addr); }
-    catch(e){
-      console.error('[JetsMeta] account_nfts failed', e);
+
+    if(!isR(addr)){
       return [];
     }
-    console.log('[JetsMeta] account_nfts:', nfts.length);
+
+    console.log(
+      '[JetsMeta] loading wallet:',
+      addr
+    );
+
+    let nfts = [];
+
+    try{
+      nfts = await listAllNFTs(addr);
+    }
+    catch(e){
+
+      console.error(
+        '[JetsMeta] NFT load failed',
+        e
+      );
+
+      return [];
+    }
+
+    console.log(
+      '[JetsMeta] total NFTs:',
+      nfts.length
+    );
 
     const jets = [];
-    for (const nft of nfts){
-      const taxon = Number(nft.NFTokenTaxon ?? nft.nftoken_taxon ?? 0);
-      if (taxon !== JETS_TAXON) continue; // ← only Jets
 
-      const meta = await resolveMeta(nft);
-      const has  = (v)=> typeof v==='number' && Number.isFinite(v);
+    for(const nft of nfts){
 
-      const fb    = fallbackStats(nft);
-      const atk   = has(meta.attack)  ? meta.attack  : fb.attack;
-      const spd   = has(meta.speed)   ? meta.speed   : fb.speed;
-      const def   = has(meta.defense) ? meta.defense : fb.defense;
-      const img   = meta.image || '/jets/assets/jet.png';
-      const name  = meta.name  || 'XRPixel Jet';
-      const ds    = has(meta.damageShieldPerHit) ? meta.damageShieldPerHit : 0;
+      const taxon =
+        Number(
+          nft.NFTokenTaxon ||
+          nft.nftoken_taxon ||
+          0
+        );
 
-      jets.push({
-        id: nft.NFTokenID || nft.nft_id || nft.id,
-        name,
-        image: img,
+      if(
+        !JETS_TAXONS.includes(taxon)
+      ){
+        continue;
+      }
+
+      let meta;
+
+      if(taxon === LADYCAFE_TAXON){
+
+        meta =
+          await resolveLadyCafeMeta(nft);
+
+      }else{
+
+        meta =
+          await resolveIPFSMeta(nft);
+      }
+
+      const fb =
+        fallbackStats(nft);
+
+      const atk =
+        Number.isFinite(meta.attack)
+          ? meta.attack
+          : fb.attack;
+
+      const spd =
+        Number.isFinite(meta.speed)
+          ? meta.speed
+          : fb.speed;
+
+      const def =
+        Number.isFinite(meta.defense)
+          ? meta.defense
+          : fb.defense;
+
+      const jet = {
+
+        id:
+          nft.NFTokenID,
+
+        taxon:
+          taxon,
+
+        name:
+          meta.name ||
+          'XRPixel Jet',
+
+        image:
+          meta.image ||
+          '/jets/assets/jet.png',
 
         attack: atk,
-        speed:  spd,
-        defense:def,
-        atk: atk,
-        spd: spd,
-        def: def,
+        speed: spd,
+        defense: def,
 
-        topGun:     meta.topGun || null,
-        bottomGun:  meta.bottomGun || null,
-        top_gun:    meta.topGun || null,
-        bottom_gun: meta.bottomGun || null,
+        atk,
+        spd,
+        def,
 
-        // Legendary DS fields
-        damageShieldPerHit: ds,
-        dmgShield:          ds,
+        topGun:
+          meta.topGun || null,
 
-        jetKey: meta.jetId || null,
-        _uri:   meta.source || null,
-        _meta:  meta.meta || null,
-        _raw:   nft
-      });
+        bottomGun:
+          meta.bottomGun || null,
+
+        top_gun:
+          meta.topGun || null,
+
+        bottom_gun:
+          meta.bottomGun || null,
+
+        damageShieldPerHit:
+          meta.damageShieldPerHit || 0,
+
+        dmgShield:
+          meta.damageShieldPerHit || 0,
+
+        bonusAttacksPerTurn:
+          meta.bonusAttacksPerTurn || 0,
+
+        jetKey:
+          meta.jetId || null,
+
+        _taxon: taxon,
+        _meta: meta.meta || null,
+        _raw: nft
+      };
+
+      console.log(
+        '[JetsMeta] loaded jet:',
+        jet.name,
+        'taxon:',
+        taxon
+      );
+
+      jets.push(jet);
     }
-    console.log('[JetsMeta] jets parsed:', jets.length);
+
+    console.log(
+      '[JetsMeta] final jet count:',
+      jets.length
+    );
+
     return jets;
   }
 
-  window.XRPLWallet = window.XRPLWallet || {};
-  window.XRPLWallet.loadXRPLJets = metadataAwareLoader;
-  window.XRPLWallet.debugListNFTs = listAllNFTs;
-  window.XRPLWallet.__metaLoader  = true;
+  window.XRPLWallet =
+    window.XRPLWallet || {};
+
+  window.XRPLWallet.loadXRPLJets =
+    metadataAwareLoader;
+
+  window.XRPLWallet.debugListNFTs =
+    listAllNFTs;
+
 })();

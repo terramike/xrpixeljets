@@ -1,6 +1,6 @@
 // jets/js/missions.js — XRPixel Jets MKG (2025-11-01-boss1)
-import { GameState } from './state.js';
-import { LS } from './constants.js';
+import { GameState } from './state.js?v=2025-10-24y';
+import { LS } from './constants.js?v=2025-10-24y';
 
 const KEY_LAST = 'JETS_LAST_MISSION';
 

@@ -1,8 +1,8 @@
-// jets/js/ui.js — XRPixel Jets MKG (2025-11-19 mothership-level2)
+// jets/js/ui.js — XRPixel Jets MKG (2025-01-04 hourly-regen)
 // Rebuilt HUD/UI module with Mothership Level + squad, HP, energy and cards.
 
-import { GameState } from './state.js';
-import { DEFAULT_MS } from './constants.js';
+import { GameState } from './state.js?v=2025-10-24y';
+import { DEFAULT_MS } from './constants.js?v=2025-10-24y';
 
 // -------- small DOM helpers --------
 const $ = (s) => document.querySelector(s);
@@ -195,6 +195,7 @@ export function updateEnergyUI() {
     DEFAULT_MS.current.energyCap
   );
   const val = Number(GameState?.energy ?? 0);
+  // NOTE: regenPerMin is now interpreted as "per hour"
   const regen = Number(
     ms.current?.regenPerMin ??
     ms.base?.regenPerMin ??
@@ -203,7 +204,7 @@ export function updateEnergyUI() {
 
   const textEl = document.getElementById('energy-text');
   if (textEl) {
-    textEl.textContent = `${val}/${cap} (+${regen.toFixed(1)}/min)`;
+    textEl.textContent = `${val}/${cap} (+${regen.toFixed(1)}/hr)`;
   }
 
   const fillEl = document.querySelector('#hud-top .energyfill');
@@ -270,6 +271,7 @@ export function paintMSBasics() {
     ms.base?.energyCap ??
     DEFAULT_MS.current.energyCap
   );
+  // NOTE: regenPerMin is now interpreted as "per hour"
   const reg = Number(
     ms.current?.regenPerMin ??
     ms.base?.regenPerMin ??

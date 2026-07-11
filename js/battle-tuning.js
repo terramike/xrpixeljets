@@ -1,7 +1,7 @@
-// XRPixel Jets — battle-tuning.js (2025-11-21-combat5-thorns)
+// XRPixel Jets — battle-tuning.js (2025-12-24-combat6-bonus-attacks)
 // Fixes: Respect battle state + clear it on KO so Next Turn can't bypass 10⚡ entry.
 // Features: initiative per turn, hit/crit/dodge, damage variance, emoji logs.
-// New: Damage Shield (thorns) from scene.effects / GameState.combatEffects.
+// New: Damage Shield (thorns) + Bonus Attacks from scene.effects / GameState.combatEffects.
 
 import { GameState } from './state.js';
 
@@ -85,7 +85,7 @@ function getCombatEffects(scene){
 export function installBattleTuning({ scene, getMission, getCurrentLevel }){
   if (!scene || scene.__jetsTuningInstalled) return;
   scene.__jetsTuningInstalled = true;
-  console.log('[Jets] Combat tuning active (initiative + variance + energy gate + thorns)');
+  console.log('[Jets] Combat tuning active (initiative + variance + energy gate + thorns + bonus attacks)');
 
   const tuned = function tunedNextTurn(){
     // HARD GATE: must be in an active battle (set by startBattle → 10⚡ server spend)
@@ -105,7 +105,7 @@ export function installBattleTuning({ scene, getMission, getCurrentLevel }){
     const E       = getEnemyDerived(mission);
     const fx      = getCombatEffects(scene);
     const damageShieldPerHit   = fx.damageShieldPerHit;
-    const bonusAttacksPerTurn  = fx.bonusAttacksPerTurn; // reserved for future use
+    const bonusAttacksPerTurn  = fx.bonusAttacksPerTurn;
 
     // Initiative per turn
     const pRoll = P.spd + rint(0, Math.max(1, Math.ceil(P.spd / 2)));
@@ -154,23 +154,49 @@ export function installBattleTuning({ scene, getMission, getCurrentLevel }){
       return { pHP, eHP };
     }
 
-    if (playerFirst) {
+    // Player turn: base attack + bonus attacks
+    function playerAttackPhase(){
+      if (eHP <= 0) return; // Enemy already dead
+
+      // Base attack
       const dealt = resolve('you', P, E);
       eHP = clamp(eHP - dealt.dmg, 0, eMax);
 
-      if (eHP > 0) {
-        const taken = resolve('enemy', E, P);
-        pHP = clamp(pHP - taken.dmg, 0, pMax);
-        ({ pHP, eHP } = applyThornsIfAny(taken));
+      // Bonus attacks (if any)
+      if (bonusAttacksPerTurn > 0 && eHP > 0) {
+        for (let i = 0; i < bonusAttacksPerTurn; i++) {
+          if (eHP <= 0) break; // Stop if enemy dies
+          
+          const bonusDealt = resolve('you', P, E);
+          eHP = clamp(eHP - bonusDealt.dmg, 0, eMax);
+          
+          if (i === 0 && bonusAttacksPerTurn > 0) {
+            // Only show the emoji once at the start of bonus attacks
+            emit(`⚔️ Bonus attack ${i + 1}!`);
+          }
+        }
       }
-    } else {
+    }
+
+    // Enemy turn: single attack
+    function enemyAttackPhase(){
+      if (pHP <= 0) return; // Player already dead
+
       const taken = resolve('enemy', E, P);
       pHP = clamp(pHP - taken.dmg, 0, pMax);
       ({ pHP, eHP } = applyThornsIfAny(taken));
+    }
 
+    // Execute turn based on initiative
+    if (playerFirst) {
+      playerAttackPhase();
+      if (eHP > 0) {
+        enemyAttackPhase();
+      }
+    } else {
+      enemyAttackPhase();
       if (pHP > 0) {
-        const dealt = resolve('you', P, E);
-        eHP = clamp(eHP - dealt.dmg, 0, eMax);
+        playerAttackPhase();
       }
     }
 

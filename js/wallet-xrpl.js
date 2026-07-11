@@ -5,14 +5,31 @@
   g.__JETS_WALLET_XRPL__.inited = true;
 })(window);
 
-/* XRPixel Jets — wallet-jets-meta.js (2025-11-20stat19)
+/* XRPixel Jets — wallet-xrpl.js (patched: pin XRPL lib + resilient Client)
    Metadata-aware loader for XLS-20 NFTs with resilient IPFS gateways + caching.
+   - Pins xrpl.js library to window.XRPL_LIB (prevents Crossmark/other injectors clobbering window.xrpl)
    - Fetches account_nfts (mainnet)
    - Resolves NFT URI (hex → ascii; ipfs:// → http gateways)
    - Parses attributes: Attack aN, Speed sN, Defense dN (N = 1..19), Top/Bottom Gun, Jet ID
    - Exposes camelCase + snake_case fields for UI compatibility
 */
 (function(){
+  // Pin xrpl.js as early as possible (extensions may overwrite window.xrpl later)
+  (function pinXRPL(){
+    // Only pin if it looks like the real xrpl.js (has Client)
+    const maybe = window.xrpl;
+    if (!window.XRPL_LIB && maybe && (typeof maybe.Client === 'function' || typeof maybe?.default?.Client === 'function')){
+      window.XRPL_LIB = maybe;
+      console.debug('[wallet-xrpl] pinned XRPL lib to window.XRPL_LIB');
+    } else if (window.XRPL_LIB) {
+      // already pinned
+    } else {
+      // Not pinned yet; could be timing (vendor not loaded) or already clobbered.
+      // We’ll still try later when functions run, but best-case is pinning at load time.
+      console.warn('[wallet-xrpl] XRPL lib not pinned at load time (window.xrpl missing Client). Keys:', Object.keys(window.xrpl || {}));
+    }
+  })();
+
   const IPFS_GATEWAYS = [
     'https://nftstorage.link/ipfs/',
     'https://ipfs.io/ipfs/',
@@ -116,9 +133,27 @@
     return { attack: toStat(fee), speed: toStat(flags), defense: toStat(taxon) };
   }
 
+  function getXRPLClientCtor(){
+    // Prefer pinned real xrpl.js lib
+    const XRPL = window.XRPL_LIB || window.xrpl;
+    const ClientCtor = XRPL?.Client || XRPL?.default?.Client;
+
+    if (typeof ClientCtor !== 'function') {
+      console.error('[JetsMeta] XRPL Client missing.');
+      console.error('[JetsMeta] window.xrpl keys:', Object.keys(window.xrpl || {}));
+      console.error('[JetsMeta] window.XRPL_LIB keys:', Object.keys(window.XRPL_LIB || {}));
+      return null;
+    }
+    return ClientCtor;
+  }
+
   async function listAllNFTs(addr){
-    if (!window.xrpl) throw new Error('xrpl.js not loaded');
-    const client = new xrpl.Client(window.XRPL_NET || 'wss://xrplcluster.com');
+    const ClientCtor = getXRPLClientCtor();
+    if (!ClientCtor) throw new Error('xrpl.js Client constructor missing');
+
+    const NET = window.XRPL_NET || 'wss://xrplcluster.com';
+    const client = new ClientCtor(NET);
+
     await client.connect();
     const out=[]; let marker=null;
     try{
@@ -126,20 +161,24 @@
         const req = { command:'account_nfts', account:addr, limit:400 };
         if (marker) req.marker=marker;
         const resp = await client.request(req);
-        const rows = (resp.result.account_nfts||[]);
+        const rows = (resp?.result?.account_nfts || []);
         out.push(...rows);
-        marker = resp.result.marker;
+        marker = resp?.result?.marker;
       } while (marker);
-    } finally { try { await client.disconnect(); } catch {} }
+    } finally {
+      try { await client.disconnect(); } catch {}
+    }
     return out;
   }
 
   async function metadataAwareLoader(addr){
     if (!isR(addr)) return [];
     console.log('[JetsMeta] Loading NFTs for', addr);
+
     let nfts = [];
     try { nfts = await listAllNFTs(addr); }
     catch(e){ console.error('[JetsMeta] account_nfts failed', e); return []; }
+
     console.log('[JetsMeta] account_nfts:', nfts.length);
 
     const jets = [];

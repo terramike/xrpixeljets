@@ -1,16 +1,13 @@
-/* /jets/js/combat-effects.js — Combat NFT effects reader (Damage Shield + hooks)
-   v2025-11-20fx1
+/* /jets/js/combat-effects.js — Combat NFT effects reader (Damage Shield + Bonus Attacks)
+   v2025-12-24-jets-combat-fx
 
-   - Scans XLS-20 NFTs for a dedicated "Combat Upgrade" taxon
-   - Reads metadata:
-       properties.issuer == COMBAT_ISSUER
-       properties.game.category == "combat"
-       properties.game.taxon == COMBAT_TAXON
-       attributes:
-         Type  = "Combat Upgrade"
-         Effect = "Damage Shield" | "Bonus Attack"
-         Damage Shield Per Hit   (number)
-         Bonus Attacks Per Turn  (number)
+   - Scans XLS-20 NFTs for combat effects
+   - TWO MODES:
+     1. Dedicated Combat Upgrades (taxon 777): strict validation
+     2. Jets with combat bonuses (taxon 200): reads bonus attacks directly
+   - Reads metadata attributes:
+       Damage Shield Per Hit   (number)
+       Bonus Attacks Per Turn  (number)
    - Aggregates into:
        { damageShieldPerHit, bonusAttacksPerTurn }
    - Safe defaults: if no combat NFTs => {0,0}
@@ -25,8 +22,9 @@ const COMBAT_ISSUER = window.COMBAT_ISSUER
 const COMBAT_TAXON  = Number(
   window.COMBAT_TAXON != null ? window.COMBAT_TAXON : 777
 );
+const JETS_TAXON = 200; // XRPixel Jets
 
-// Soft caps so a whale stack doesn’t break the game
+// Soft caps so a whale stack doesn't break the game
 const MAX_DAMAGE_SHIELD_PER_HIT   = 10;
 const MAX_BONUS_ATTACKS_PER_TURN  = 2;
 
@@ -134,38 +132,21 @@ async function listAllNFTsDirect(account){
   return out;
 }
 
-// Extracts combat effects from NFT metadata JSON, or null if not a combat upgrade
-function extractCombatEffectFromMeta(meta){
+// Extracts combat effects from NFT metadata JSON
+function extractCombatEffectFromMeta(meta, nftTaxon){
   try{
     if (!meta || typeof meta !== 'object') return null;
 
-    const props = meta.properties || {};
-    const issuer = props.issuer || props.Issuer || props.ISSUER || '';
-    const game = props.game || {};
-    const category = String(game.category || game.Category || '').toLowerCase();
-    const taxon = game.taxon ?? game.NFTokenTaxon ?? game.taxon_id;
-
-    if (COMBAT_ISSUER && issuer && issuer !== COMBAT_ISSUER) return null;
-    if (Number.isFinite(COMBAT_TAXON) && COMBAT_TAXON > 0) {
-      if (Number(taxon) !== COMBAT_TAXON) return null;
-    }
-    if (category && category !== 'combat') return null;
-
     const attrs = Array.isArray(meta.attributes) ? meta.attributes : [];
-    let type = '';
-    let effect = '';
     let shield = 0;
     let bonus = 0;
 
+    // Scan attributes for combat effects
     for (const a of attrs){
       const key = String(a.trait_type || a.type || '').toLowerCase();
       const val = a.value;
 
-      if (key === 'type' && val != null) {
-        type = String(val).toLowerCase();
-      } else if (key === 'effect' && val != null) {
-        effect = String(val).toLowerCase();
-      } else if (key === 'damage shield per hit' && val != null) {
+      if (key === 'damage shield per hit' && val != null) {
         const n = Number(val);
         if (Number.isFinite(n)) shield += n;
       } else if (key === 'bonus attacks per turn' && val != null) {
@@ -174,25 +155,37 @@ function extractCombatEffectFromMeta(meta){
       }
     }
 
-    // Require this to be explicitly flagged as a Combat Upgrade
-    if (type && type !== 'combat upgrade') return null;
+    // If this is a dedicated Combat Upgrade (taxon 777), validate it properly
+    if (Number(nftTaxon) === COMBAT_TAXON) {
+      const props = meta.properties || {};
+      const issuer = props.issuer || props.Issuer || props.ISSUER || '';
+      const game = props.game || {};
+      const category = String(game.category || game.Category || '').toLowerCase();
 
-    const out = {
-      damageShieldPerHit: 0,
-      bonusAttacksPerTurn: 0
-    };
+      // Strict validation for Combat Upgrades
+      if (COMBAT_ISSUER && issuer && issuer !== COMBAT_ISSUER) return null;
+      if (category && category !== 'combat') return null;
 
-    if (!effect || effect === 'damage shield') {
-      if (shield > 0) out.damageShieldPerHit = shield;
-    }
-    if (!effect || effect === 'bonus attack' || effect === 'bonus attacks') {
-      if (bonus > 0) out.bonusAttacksPerTurn = bonus;
+      let type = '';
+      for (const a of attrs){
+        const key = String(a.trait_type || a.type || '').toLowerCase();
+        if (key === 'type' && a.value != null) {
+          type = String(a.value).toLowerCase();
+          break;
+        }
+      }
+      if (type && type !== 'combat upgrade') return null;
     }
 
-    if (out.damageShieldPerHit === 0 && out.bonusAttacksPerTurn === 0) {
-      return null;
+    // Return if we found any combat effects
+    if (shield > 0 || bonus > 0) {
+      return {
+        damageShieldPerHit: shield,
+        bonusAttacksPerTurn: bonus
+      };
     }
-    return out;
+
+    return null;
   } catch {
     return null;
   }
@@ -243,10 +236,15 @@ export async function getCombatEffectsForWallet(wallet, { force = false } = {}){
   for (const nft of nfts){
     const issuer = nft.Issuer || nft.issuer || '';
     const taxon  = nft.NFTokenTaxon ?? nft.nft_taxon ?? nft.Taxon;
-    if (COMBAT_ISSUER && issuer && issuer !== COMBAT_ISSUER) continue;
-    if (Number.isFinite(COMBAT_TAXON) && COMBAT_TAXON > 0) {
-      if (Number(taxon) !== COMBAT_TAXON) continue;
-    }
+    
+    // Only process Jets (taxon 200) or Combat Upgrades (taxon 777)
+    const isJet = Number(taxon) === JETS_TAXON;
+    const isCombatUpgrade = Number(taxon) === COMBAT_TAXON;
+    
+    if (!isJet && !isCombatUpgrade) continue;
+    
+    // For Combat Upgrades, check issuer
+    if (isCombatUpgrade && COMBAT_ISSUER && issuer && issuer !== COMBAT_ISSUER) continue;
 
     const uriHex = nft.URI || nft.Uri || nft.NFTokenURI || nft.nft_uri;
     if (!uriHex) continue;
@@ -258,7 +256,7 @@ export async function getCombatEffectsForWallet(wallet, { force = false } = {}){
     if (!uriStr) continue;
 
     const meta = await fetchMeta(uriStr);
-    const eff = extractCombatEffectFromMeta(meta);
+    const eff = extractCombatEffectFromMeta(meta, taxon);
     if (!eff) continue;
 
     accumulateEffects(effects, eff);
@@ -296,4 +294,5 @@ export function getCombatEffectsSnapshot(wallet){
   g.JETS_COMBATFX.peek = getCombatEffectsSnapshot;
   g.JETS_COMBATFX.__issuer = COMBAT_ISSUER;
   g.JETS_COMBATFX.__taxon  = COMBAT_TAXON;
+  g.JETS_COMBATFX.__jetsTaxon = JETS_TAXON;
 })();

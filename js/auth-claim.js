@@ -1,215 +1,237 @@
-// /jets/js/auth-claim.js — simple, provider-explicit login (Crossmark / Gem / WC)
-// v=2025-12-18-simplogin5
-import { sessionStart, sessionVerify, setAuthToken } from '/jets/js/serverApi.js';
+// /jets/js/auth-claim.js - v=2025-12-20-crossmark-only
+// CROSSMARK ONLY - Gem Wallet handled by auth-gem-sdk.js
 
-(function(){
-  const g = window;
-  const API_BASE = g.JETS_API_BASE || 'https://xrpixeljets.onrender.com';
-  const CHAIN = 'xrpl:mainnet';
+import { sessionStart, sessionVerify, setAuthToken, claimStart } from '/jets/js/serverApi.js';
 
-  // ---------- small utils ----------
-  const $ = (id)=>document.getElementById(id);
-  const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-  const toHexU = (s)=>Array.from(new TextEncoder().encode(s)).map(b=>b.toString(16).padStart(2,'0')).join('').toUpperCase();
-  const hud = (m)=> (g.XRPLWallet?.hud || console.log)(`[auth] ${m}`);
-  const status = (msg, html=false)=>{
-    const el = $('claim-status') || $('session-status') || $('status');
-    if (!el) return;
-    if (html) el.innerHTML = msg; else el.textContent = msg;
-  };
-  const setWalletLocal = (addr)=>{
-    try { localStorage.setItem('WALLET', addr||''); } catch {}
-    g.CURRENT_WALLET = addr||'';
-    const s = $('session-status'); if (s) s.textContent = addr ? `Connected: ${addr}` : 'Not connected';
-    try { g.dispatchEvent(new CustomEvent('jets:auth', { detail:{ address: addr } })); } catch {}
-  };
-  const extractTxBlob = (r)=>{
-    const x = r?.result || r || {};
-    return x.tx_blob || x.txBlob || x.signedTransaction || x.blob || x.signedTx || '';
-  };
-
-  async function waitFor(fn, ms=8000, step=100){
-    const t0 = Date.now();
-    while (Date.now()-t0 < ms){
-      const v = fn();
-      if (v) return v;
-      await sleep(step);
-    }
-    return null;
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const hud = (m) => console.log(`[auth] ${m}`);
+  
+  function status(msg) {
+    const el = $('claim-status') || $('session-status');
+    if (el) el.textContent = msg;
   }
 
-  // ---------- login core (tx-proof, non-submitting if supported) ----------
-  function buildLoginTx({ address, nonce, scope, ts }){
-    const memoType = toHexU('XRPixelJets');
-    const memoData = toHexU(`XRPixelJets|${nonce}|${scope}|${ts}`);
-    return {
-      TransactionType: 'AccountSet',
-      Account: address,
-      // Do NOT change flags; we only need a signable tx with a stable memo
-      Memos: [{ Memo: { MemoType: memoType, MemoData: memoData } }],
-    };
+  function isAddress(a) {
+    return typeof a === 'string' && /^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(a.trim());
   }
 
-  async function verifyWithTxBlob({ address, signer, tx_blob }){
-    const v = await sessionVerify({ address, network: CHAIN, signer, tx_blob });
-    const token = v?.token || v?.jwt;
-    if (!token) throw new Error('no_jwt');
-    setAuthToken(token);
-    status('Signed in.');
-    hud(`Signed in with ${signer} (JWT stored).`);
-    setWalletLocal(address);
-    return true;
+  function toHex(s) {
+    return Array.from(new TextEncoder().encode(String(s)))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('')
+      .toUpperCase();
   }
 
-  // ---------- Crossmark (explicit) ----------
-  async function signInCrossmark(){
-    status('Opening Crossmark…');
-    // give the extension time to inject AFTER the click gesture
-    const xmk = await waitFor(()=> g.crossmark && (g.crossmark.request || g.crossmark.xrpl), 12000);
-    if (!xmk) { status('Crossmark not available.'); throw new Error('crossmark_unavailable'); }
-
-    // Address: prefer field, else Crossmark helper, else WALLET
-    let address = ($('xrpl-address')?.value || '').trim();
-    if (!/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)){
-      // try provider helpers without "detection gating"—just call them
-      try {
-        if (g.crossmark?.request) {
-          const ra = await g.crossmark.request({ method: 'xrpl_getAddress', params: {} }).catch(()=>null);
-          if (typeof ra === 'string' && ra.startsWith('r')) address = ra;
-        } else if (g.crossmark?.getAddress) {
-          const ra = await g.crossmark.getAddress().catch(()=>null);
-          if (typeof ra === 'string' && ra.startsWith('r')) address = ra;
-        }
-      } catch {}
-      if (!address) address = (localStorage.getItem('WALLET')||'').trim();
-    }
-    if (!/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) throw new Error('no_address');
-
-    const { nonce } = await sessionStart(address);
-    const scope = 'play,upgrade,claim';
-    const ts    = Date.now();
-    const tx_json = buildLoginTx({ address, nonce, scope, ts });
-
-    // try a few Crossmark request shapes, do NOT pre-check—just call to pop the UI
-    const attempts = [];
-    if (g.crossmark?.request){
-      attempts.push(()=> g.crossmark.request({ method:'xrpl_signTransaction',    params:{ tx_json, autofill:true, submit:false } }));
-      attempts.push(()=> g.crossmark.request({ method:'xrpl_signTransactionFor', params:{ tx_signer:address, tx_json, autofill:true, submit:false } }));
-      attempts.push(()=> g.crossmark.request({ method:'xrpl_sign',               params:{ tx_json, autofill:true, submit:false } }));
-      attempts.push(()=> g.crossmark.request({ method:'xrpl_signAndSubmit',      params:{ tx_json, autofill:true, submit:true } }));
-    }
-    if (g.crossmark?.xrpl?.signTransaction){
-      attempts.push(()=> g.crossmark.xrpl.signTransaction({ tx_json, autofill:true, submit:false }));
-    }
-
-    let blob = '';
-    let lastErr = null;
-    for (const call of attempts){
-      try {
-        const reply = await call();
-        blob = extractTxBlob(reply);
-        if (blob) break;
-      } catch(e){ lastErr = e; }
-    }
-    if (!blob){ console.warn('[auth] crossmark sign fail:', lastErr); throw new Error('crossmark_sign_failed'); }
-
-    return verifyWithTxBlob({ address, signer:'crossmark', tx_blob: blob });
+  function setWallet(addr) {
+    const clean = (addr || '').trim();
+    try { localStorage.setItem('WALLET', clean); } catch {}
+    window.CURRENT_WALLET = clean;
+    
+    const inp = $('xrpl-address');
+    if (inp && clean) inp.value = clean;
+    
+    const st = $('session-status');
+    if (st) st.textContent = clean ? `Connected: ${clean}` : 'Not connected';
+    
+    try {
+      window.dispatchEvent(new CustomEvent('jets:auth', { 
+        detail: { address: clean, authed: !!clean } 
+      }));
+    } catch {}
   }
 
-  // ---------- GemWallet (explicit) ----------
-  async function signInGem(){
-    status('Opening GemWallet…');
-    // give the extension time to inject AFTER the click gesture
-    const gem = await waitFor(()=> g.gemWallet, 12000);
-    if (!gem) { status('GemWallet not available.'); throw new Error('gemwallet_unavailable'); }
-
-    // Address: prefer field, else gem helper, else WALLET
-    let address = ($('xrpl-address')?.value || '').trim();
-    if (!/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)){
-      try {
-        if (g.gemWallet?.getAddress){
-          const ra = await g.gemWallet.getAddress().catch(()=>null);
-          if (typeof ra === 'string' && ra.startsWith('r')) address = ra;
-        } else if (g.gemWallet?.xrpl?.getAddress){
-          const ra = await g.gemWallet.xrpl.getAddress().catch(()=>null);
-          if (typeof ra === 'string' && ra.startsWith('r')) address = ra;
-        }
-      } catch {}
-      if (!address) address = (localStorage.getItem('WALLET')||'').trim();
-    }
-    if (!/^r[1-9A-HJ-NP-Za-km-z]{25,35}$/.test(address)) throw new Error('no_address');
-
-    const { nonce } = await sessionStart(address);
-    const scope = 'play,upgrade,claim';
-    const ts    = Date.now();
-    const tx_json = buildLoginTx({ address, nonce, scope, ts });
-
-    // call Gem methods directly—no preflight checks; let extension surface the UI
-    const tries = [
-      async ()=> g.gemWallet?.xrpl?.signTransaction?.(tx_json, { autofill:true, submit:false }),
-      async ()=> g.gemWallet?.signTransaction?.(tx_json, { autofill:true, submit:false }),
-      async ()=> g.gemWallet?.xrpl?.signAndSubmitTransaction?.(tx_json, { autofill:true, submit:true }),
-      async ()=> g.gemWallet?.signAndSubmitTransaction?.(tx_json, { autofill:true, submit:true }),
-      async ()=> g.gemWallet?.request?.({ method:'xrpl_signTransaction', params:{ tx_json, autofill:true, submit:false } }),
-      async ()=> g.gemWallet?.request?.({ method:'xrpl_signAndSubmit',   params:{ tx_json, autofill:true, submit:true } }),
-    ];
-
-    let blob = '';
-    let lastErr = null;
-    for (const t of tries){
-      try {
-        const reply = await t();
-        blob = extractTxBlob(reply);
-        if (blob) break;
-      } catch(e){ lastErr = e; }
-    }
-    if (!blob){ console.warn('[auth] gem sign fail:', lastErr); throw new Error('gem_sign_failed'); }
-
-    return verifyWithTxBlob({ address, signer:'gem', tx_blob: blob });
+  function getCrossmark() {
+    return window.crossmark || window.xrpl?.crossmark || null;
   }
 
-  // ---------- WalletConnect (optional, unchanged path) ----------
-  async function signInWalletConnect(){
-    if (!g.XRPLWallet?.wcHasSession?.()) {
-      // simulate the visible WC connect button click to open modal/QR
-      $('btn-wc-connect')?.click?.();
-      // wait until connected
-      const ok = await waitFor(()=> g.XRPLWallet?.wcHasSession?.(), 20000, 200);
-      if (!ok) throw new Error('wc_no_session');
+  function extractSigData(obj) {
+    let sig = null, pub = null, addr = null;
+    
+    function search(o, depth = 0) {
+      if (!o || typeof o !== 'object' || depth > 5) return;
+      
+      if (!sig && typeof o.signature === 'string') sig = o.signature;
+      if (!pub && typeof o.publicKey === 'string') pub = o.publicKey;
+      if (!addr && typeof o.address === 'string' && o.address.startsWith('r')) addr = o.address;
+      
+      for (const v of Object.values(o)) {
+        if (v && typeof v === 'object') search(v, depth + 1);
+      }
     }
-    const address = g.XRPLWallet.wcGetAddress?.();
-    if (!address) throw new Error('wc_no_address');
-
-    const { nonce } = await sessionStart(address);
-    const scope = 'play,upgrade,claim';
-    const ts    = Date.now();
-    const { tx_blob } = await g.XRPLWallet.wcSignLoginTx?.({ address, nonce, scope, ts }) || {};
-    if (!tx_blob) throw new Error('wc_sign_failed');
-
-    return verifyWithTxBlob({ address, signer:'walletconnect', tx_blob });
+    
+    search(obj);
+    return { signature: sig, publicKey: pub, address: addr };
   }
 
-  // ---------- public API ----------
-  async function signIn(which){
-    try{
-      if (which === 'crossmark') return await signInCrossmark();
-      if (which === 'gem')       return await signInGem();
-      if (which === 'walletconnect' || which === 'wc') return await signInWalletConnect();
-      // default: show modal elsewhere
-      throw new Error('unknown_provider');
-    } catch(e){
-      hud(`Sign-in failed: ${e?.message || e}`);
+  let SIGNING = false;
+
+  // CROSSMARK SIGN-IN
+  async function signInCrossmark() {
+    if (SIGNING) return false;
+    SIGNING = true;
+
+    try {
+      status('Opening Crossmark…');
+      
+      const cm = getCrossmark();
+      if (!cm) throw new Error('Crossmark not installed');
+
+      // 1. Get address
+      let addr = ($('xrpl-address')?.value || '').trim();
+      
+      if (!isAddress(addr)) {
+        try {
+          addr = (localStorage.getItem('WALLET') || '').trim();
+        } catch {}
+      }
+
+      if (!isAddress(addr)) {
+        // Show account selector
+        const result = await (cm.async?.signInAndWait?.() || cm.signInAndWait?.() || Promise.reject());
+        const ex = extractSigData(result);
+        addr = ex.address || result?.response?.data?.address || '';
+      }
+
+      if (!isAddress(addr)) throw new Error('No wallet address');
+      
+      setWallet(addr);
+      hud(`Wallet: ${addr}`);
+
+      // 2. Get nonce
+      const { nonce } = await sessionStart(addr);
+      hud(`Nonce: ${nonce}`);
+
+      // 3. Sign message
+      const scope = 'play,upgrade,claim,bazaar';
+      const ts = Math.floor(Date.now() / 1000);
+      const message = `${nonce}||${scope}||${ts}||${addr}`;
+      const messageHex = toHex(message);
+
+      hud('Requesting signature…');
+      const signResult = await (
+        cm.async?.signInAndWait?.(messageHex) ||
+        cm.signInAndWait?.(messageHex) ||
+        Promise.reject(new Error('signInAndWait failed'))
+      );
+
+      const ex = extractSigData(signResult);
+      const signature = ex.signature || signResult?.response?.data?.signature;
+      const publicKey = ex.publicKey || signResult?.response?.data?.publicKey;
+
+      if (!signature || !publicKey) {
+        throw new Error('No signature from Crossmark');
+      }
+
+      hud(`Signature received`);
+
+      // 4. Verify with server
+      const verifyRes = await sessionVerify({
+        address: addr,
+        signature,
+        publicKey,
+        scope,
+        ts,
+        payloadHex: messageHex
+      });
+
+      if (verifyRes?.jwt) {
+        setAuthToken(verifyRes.jwt);
+        hud('✓ Signed in with Crossmark');
+        status('Signed in');
+        return true;
+      }
+
+      throw new Error('No JWT from server');
+
+    } catch (e) {
+      hud(`✗ Crossmark sign-in failed: ${e.message || e}`);
       status('Sign-in failed');
       return false;
+    } finally {
+      SIGNING = false;
     }
   }
 
-  // Expose
-  g.JetsAuth = { signIn };
+  async function claim() {
+    const addr = ($('xrpl-address')?.value || '').trim() || window.CURRENT_WALLET;
+    const amount = parseInt($('claim-amount')?.value || '0', 10);
 
-  // Optional: wire the legacy "Sign In" button to open your modal or call Crossmark directly
-  document.addEventListener('DOMContentLoaded', ()=>{
-    const btn = $('btn-sign'); // legacy button
-    if (btn && !btn.__b){ btn.__b = 1; btn.addEventListener('click', ()=> g.JetsAuth.signIn('crossmark')); }
-  });
+    if (!isAddress(addr)) {
+      status('No wallet');
+      return;
+    }
+
+    if (!amount || amount <= 0) {
+      status('Enter amount');
+      return;
+    }
+
+    const jwt = (localStorage.getItem('JWT') || '').trim();
+    if (!jwt) {
+      status('Not signed in');
+      const ok = await signInCrossmark();
+      if (!ok) return;
+    }
+
+    try {
+      status('Claiming…');
+      const res = await claimStart(amount);
+
+      if (res?.txid) {
+        status(`✓ Claimed! TX: ${res.txid.slice(0, 8)}…`);
+      } else {
+        status('✓ Claim acknowledged');
+      }
+
+      // Refresh profile
+      try {
+        await window.SrvAPI?.profile?.();
+      } catch {}
+
+    } catch (e) {
+      const msg = String(e.message || '');
+      if (msg.includes('unauthorized') || msg.includes('401')) {
+        status('JWT expired - sign in again');
+      } else if (msg.includes('trustline')) {
+        status('Trustline required');
+      } else {
+        status('Claim failed');
+      }
+    }
+  }
+
+  // Wire up buttons
+  function init() {
+    const btnSign = $('btn-sign') || $('btn-connect') || $('btn-login');
+    const btnClaim = $('btn-claim');
+
+    if (btnSign && !btnSign.__wired) {
+      btnSign.__wired = true;
+      btnSign.addEventListener('click', () => void signInCrossmark());
+    }
+
+    if (btnClaim && !btnClaim.__wired) {
+      btnClaim.__wired = true;
+      btnClaim.addEventListener('click', async () => {
+        const jwt = (localStorage.getItem('JWT') || '').trim();
+        if (!jwt) {
+          const ok = await signInCrossmark();
+          if (!ok) return;
+        }
+        await claim();
+      });
+    }
+
+    // Expose for wallet-modal.js
+    // NOTE: signInGem is provided by auth-gem-sdk.js (loaded separately)
+    window.JetsAuth = window.JetsAuth || {};
+    window.JetsAuth.signInCrossmark = signInCrossmark;
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
 })();

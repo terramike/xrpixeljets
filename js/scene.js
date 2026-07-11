@@ -1,10 +1,10 @@
-// jets/js/scene.js — XRPixel Jets MKG (2025-11-21-thorns1)
-// Adds Daily Boss seeding (big HP reset daily) + Damage Shield thorns.
+// jets/js/scene.js — XRPixel Jets MKG (2025-12-24-bonus-attacks)
+// Adds Daily Boss seeding (big HP reset daily) + Damage Shield thorns + BONUS ATTACKS.
 // No change to energy or turn costs.
 
-import { GameState } from './state.js';
-import { updateHPBars } from './ui.js';
-import { applyAccessoryBonuses } from '/jets/js/accessories.js';
+import { GameState } from './state.js?v=2025-10-24y';
+import { updateHPBars } from './ui.js?v=2025-11-19mothership-level4';
+import { applyAccessoryBonuses } from './accessories.js?v=2025-01-03-cachebust4';
 
 const LOG_EL_ID = 'log';
 function logLine(msg) {
@@ -30,7 +30,7 @@ function getLevel() {
   return Number.isFinite(v) && v > 0 ? v : 1;
 }
 
-// Boss HP seed: scales with day-of-year so it “resets” daily without backend state.
+// Boss HP seed: scales with day-of-year so it "resets" daily without backend state.
 function bossMaxHPForToday() {
   const now = new Date();
   const doy = Math.floor((now - new Date(now.getFullYear(),0,0)) / 86400000); // 1..366
@@ -163,7 +163,12 @@ const SCENE = {
   simulateTurn() {
     if (!this.inBattle) return;
 
-    // Player action
+    // Get combat effects (damage shield + bonus attacks)
+    const fx = this.effects || GameState?.combatEffects || {};
+    const bonusAttacks = Math.max(0, Number(fx.bonusAttacksPerTurn || 0));
+    const thorns = Math.max(0, Number(fx.damageShieldPerHit || 0));
+
+    // Player action - base attack
     if (rollPlayerHit()) {
       let dmg = calcPlayerDamage();
       if (rollCrit()) { dmg = Math.round(dmg * 2); logLine(`You hit for ${dmg} (CRIT).`); }
@@ -175,6 +180,25 @@ const SCENE = {
 
     updateHPBars();
     if (this.enemyHP <= 0) { this.inBattle = false; logLine(`🏆 Victory!`); return; }
+
+    // Bonus attacks (if any)
+    if (bonusAttacks > 0) {
+      for (let i = 0; i < bonusAttacks; i++) {
+        if (this.enemyHP <= 0) break; // Stop if enemy dies
+
+        if (rollPlayerHit()) {
+          let dmg = calcPlayerDamage();
+          if (rollCrit()) { dmg = Math.round(dmg * 2); logLine(`⚔️ Bonus attack ${i + 1}: ${dmg} (CRIT).`); }
+          else            { logLine(`⚔️ Bonus attack ${i + 1}: ${dmg}.`); }
+          this.enemyHP = Math.max(0, this.enemyHP - dmg);
+        } else {
+          logLine(`⚔️ Bonus attack ${i + 1}: miss.`);
+        }
+
+        updateHPBars();
+        if (this.enemyHP <= 0) { this.inBattle = false; logLine(`🏆 Victory!`); return; }
+      }
+    }
 
     // Enemy action
     let enemyHit = false;
@@ -191,9 +215,6 @@ const SCENE = {
     }
 
     // Damage Shield / Thorns (from combat effects)
-    const fx = this.effects || GameState?.combatEffects || {};
-    const thorns = Math.max(0, Number(fx.damageShieldPerHit || 0));
-
     if (enemyHit && thorns > 0 && this.playerHP > 0 && this.enemyHP > 0) {
       const reflect = Math.min(thorns, this.enemyHP);
       if (reflect > 0) {

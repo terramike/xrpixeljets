@@ -1,8 +1,8 @@
 // jets/js/jets.js — XRPixel Jets MKG (2025-10-24 squad-fix)
 // Reverted intact (no layout experiments). See ui.js for selected image change.
 
-import { GameState } from './state.js';
-import { renderSquadStats, setMainCard, setWingCard } from './ui.js';
+import { GameState } from './state.js?v=2025-10-24y';
+import { renderSquadStats, setMainCard, setWingCard } from './ui.js?v=2025-11-19mothership-level4';
 
 function gridEl() {
   return document.getElementById('jet-grid')

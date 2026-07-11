@@ -18,7 +18,8 @@ export function startRegen(updateEnergyUI, updateHUD){
     const now=nowSrv(); const last=parseInt(localStorage.getItem(LS.ELAST)||String(now),10);
     let ds=Math.floor((now-last)/1000); if(ds<0) ds=0; ds=Math.min(ds,300);
     if(ds>0){
-      const perSec=(GameState.ms.current.regenPerMin||0)/60;
+      // NOTE: regenPerMin is now interpreted as "per hour" — divide by 3600 (seconds/hour)
+      const perSec=(GameState.ms.current.regenPerMin||0)/3600;
       let acc=getAcc()+perSec*ds; let gain=0;
       while(acc>=1){ gain++; acc-=1; }
       if(gain>0){ setE(Math.min(GameState.ms.current.energyCap, Math.floor(getE())+gain)); }
