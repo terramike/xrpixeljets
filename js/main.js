@@ -12,8 +12,8 @@ import {
   updateHPBars
 } from './ui.js?v=2025-11-19mothership-level4';
 import { renderJets, recalcSquad } from './jets.js?v=2025-11-01revert1';
-import * as SceneMod from './scene.js?v=2025-11-21-thorns2';
-import { installBattleTuning } from './battle-tuning.js?v=2025-10-24y';
+import * as SceneMod from './scene.js?v=2026-07-11-lowwave1';
+import { installBattleTuning } from './battle-tuning.js?v=2026-07-11-lowwave1';
 import { getAccessoryBonuses, applyAccessoryBonuses, refreshAccessoryPanel } from './accessories.js?v=2025-01-03-cachebust4';
 import { getCombatEffectsForWallet } from './combat-effects.js?v=2025-12-24-1';
 

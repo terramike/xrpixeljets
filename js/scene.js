@@ -52,8 +52,8 @@ function pct(n) { return clamp(Number(n)||0, 0, 100); }
 function rollPlayerHit() {
   const adj = SCENE?.adj;
   const baseHit = adj ? pct(adj.hit) : pct(GameState?.pct?.hit);
-  const spdBoost = adj ? Math.min(15, Math.max(0, (adj.speed||0) * 0.5)) : 0; // +0.5% per SPD, cap +15%
-  const chance = clamp(75 + baseHit + spdBoost, 0, 100);
+  const spdBoost = adj ? Math.min(8, Math.max(0, (adj.speed||0) * 0.75)) : 0;
+  const chance = clamp(88 + baseHit + spdBoost, 0, 99);
   return (Math.random() * 100) < chance;
 }
 function rollEnemyHit() {
@@ -74,9 +74,9 @@ function calcPlayerDamage() {
   const adj = SCENE?.adj;
   const atk = Math.max(0, adj ? Number(adj.attack||0) : Number(GameState?.squad?.attack||0));
   const syn = Math.max(1, Number(GameState?.squad?.synergy || 1));
-  const lowAttackAssist = Math.max(0, 7 - atk) * 0.35;
-  const base = Math.ceil(((atk + 1 + lowAttackAssist) * syn) / 4);
-  return Math.max(2, base);
+  const lowAttackAssist = Math.max(0, 8 - atk) * 0.55;
+  const base = Math.ceil(((atk + 2 + lowAttackAssist) * syn) / 2.2);
+  return Math.max(3, base);
 }
 
 // Returns { dmg, defUsed } and uses the SAME adj.defense as in HP calc

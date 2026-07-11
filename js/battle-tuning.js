@@ -6,27 +6,29 @@
 import { GameState } from './state.js';
 
 // --- Tuning knobs ---
-const BASE_PLAYER_HIT = 78;
-const PLAYER_HIT_MIN  = 65;
-const PLAYER_HIT_MAX  = 98;
+const BASE_PLAYER_HIT = 88;
+const PLAYER_HIT_MIN  = 82;
+const PLAYER_HIT_MAX  = 99;
+const PLAYER_SPEED_HIT_SCALE = 0.75;
+const PLAYER_SPEED_HIT_CAP = 8;
 
 const ENEMY_HIT_BASE  = 68;
 const ENEMY_HIT_MIN   = 55;
 const ENEMY_HIT_MAX   = 93;
 const ENEMY_DODGE_CAP = 25;
 
-const VARIANCE_MIN = 0.75;
+const VARIANCE_MIN = 0.90;
 const VARIANCE_MAX = 1.25;
-const DEF_RAND_MIN = 0.25;
-const DEF_RAND_MAX = 0.60;
+const DEF_RAND_MIN = 0.20;
+const DEF_RAND_MAX = 0.45;
 
 const CRIT_MIN = 1.40;
 const CRIT_MAX = 1.80;
 
-const PLAYER_DAMAGE_MIN = 2;
-const PLAYER_ATTACK_FLAT_BONUS = 1;
-const LOW_ATTACK_ASSIST_CUTOFF = 7;
-const LOW_ATTACK_ASSIST_SCALE = 0.35;
+const PLAYER_DAMAGE_MIN = 3;
+const PLAYER_ATTACK_FLAT_BONUS = 2;
+const LOW_ATTACK_ASSIST_CUTOFF = 8;
+const LOW_ATTACK_ASSIST_SCALE = 0.55;
 
 // --------------------------------------
 function emit(line){
@@ -54,7 +56,8 @@ function getPlayerStats(){
   const crit    = Number(GameState?.pct?.crit ?? 10);
   const dodge   = Number(GameState?.pct?.dodge ?? 5);
 
-  const hit = clamp(BASE_PLAYER_HIT + plusHit, PLAYER_HIT_MIN, PLAYER_HIT_MAX);
+  const speedHit = Math.min(PLAYER_SPEED_HIT_CAP, Math.max(0, spd * PLAYER_SPEED_HIT_SCALE));
+  const hit = clamp(BASE_PLAYER_HIT + speedHit + plusHit, PLAYER_HIT_MIN, PLAYER_HIT_MAX);
   return { atk, spd, def, hit, crit, dodge };
 }
 
