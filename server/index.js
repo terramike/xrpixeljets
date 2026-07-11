@@ -38,6 +38,7 @@ const REWARD_MAX   = Number(process.env.REWARD_MAX || 0); // 0 = no cap
 
 // Claim fee (basis points: 100 = 1%, 1500 = 15%)
 const CLAIM_FEE_BPS = Number(process.env.CLAIM_FEE_BPS || 0);
+const CLAIM_COOLDOWN_DISABLED = true;
 
 /** XRPL */
 const XRPL_WSS = process.env.XRPL_WSS || 'wss://xrplcluster.com';
@@ -626,6 +627,8 @@ app.post('/battle/finish', async (req, reply) => {
 });
 
 /* =============================== CLAIM LIVE =============================== */
+// Claim cooldown is intentionally disabled; repeat claims are governed by balance,
+// auth, payout readiness, and the generic API rate limiter outside this route.
 app.post('/claim/start', async (req, reply) => {
   const authOk = requireClaimAuth(req, reply);
   if (!authOk) return;
@@ -760,6 +763,9 @@ const start = async () => {
     await app.ready();
     await app.listen({ port: PORT, host: HOST });
     app.log.info({ host: HOST, port: PORT }, '[Server] listening');
+    if (CLAIM_COOLDOWN_DISABLED) {
+      app.log.info('[Claim] cooldown disabled');
+    }
     if (xrpl.wallet) {
       app.log.info(`[XRPL] Hot wallet: ${xrpl.wallet.address} (algo=${HOT_ALGO})`);
     } else {
