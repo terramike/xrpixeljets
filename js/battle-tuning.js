@@ -23,6 +23,11 @@ const DEF_RAND_MAX = 0.60;
 const CRIT_MIN = 1.40;
 const CRIT_MAX = 1.80;
 
+const PLAYER_DAMAGE_MIN = 2;
+const PLAYER_ATTACK_FLAT_BONUS = 1;
+const LOW_ATTACK_ASSIST_CUTOFF = 7;
+const LOW_ATTACK_ASSIST_SCALE = 0.35;
+
 // --------------------------------------
 function emit(line){
   try {
@@ -62,11 +67,14 @@ function getEnemyDerived(mission){
 }
 
 function dmgRoll(att, def, opts){
-  const { hitPct = 75, critPct = 10 } = opts || {};
+  const { hitPct = 75, critPct = 10, player = false } = opts || {};
   if (Math.random() * 100 > hitPct) return { dmg:0, miss:true, crit:false };
 
   const variance = rfloat(VARIANCE_MIN, VARIANCE_MAX);
-  let base = Math.round(Math.max(1, att * variance - def * rfloat(DEF_RAND_MIN, DEF_RAND_MAX)));
+  const lowAttackAssist = player ? Math.max(0, LOW_ATTACK_ASSIST_CUTOFF - att) * LOW_ATTACK_ASSIST_SCALE : 0;
+  const effectiveAttack = att + (player ? PLAYER_ATTACK_FLAT_BONUS : 0) + lowAttackAssist;
+  let base = Math.round(Math.max(1, effectiveAttack * variance - def * rfloat(DEF_RAND_MIN, DEF_RAND_MAX)));
+  if (player) base = Math.max(PLAYER_DAMAGE_MIN, base);
 
   const isCrit = (Math.random() * 100 < critPct);
   if (isCrit) base = Math.round(base * rfloat(CRIT_MIN, CRIT_MAX));
@@ -120,7 +128,7 @@ export function installBattleTuning({ scene, getMission, getCurrentLevel }){
         return { dmg:0, miss:false, dodged:true, crit:false, label };
       }
 
-      const out = dmgRoll(A.atk, D.def, { hitPct: A.hit, critPct: A.crit });
+      const out = dmgRoll(A.atk, D.def, { hitPct: A.hit, critPct: A.crit, player: label === 'you' });
       if (out.miss) {
         emit(label === 'you' ? '💨 You miss!' : '💨 Enemy misses!');
         return { dmg:0, miss:true, dodged:false, crit:false, label };
