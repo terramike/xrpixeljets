@@ -29,6 +29,8 @@ const ALLOW = (process.env.CORS_ORIGIN || 'https://mykeygo.io,https://www.mykeyg
 const ECON_SCALE_ENV    = Number(process.env.ECON_SCALE || 0.10);
 const BASE_PER_LEVEL    = Number(process.env.BASE_PER_LEVEL || 300);
 const REGEN_STEP        = Number(process.env.REGEN_STEP || 0.1);
+const LEGACY_REGEN_PER_HOUR = Number(process.env.LEGACY_REGEN_PER_HOUR || 4.25);
+const BASE_REGEN_PER_HOUR   = Number(process.env.BASE_REGEN_PER_HOUR || 4.20);
 
 // Reward tuning
 const REWARD_SCALE = Number.isFinite(Number(process.env.REWARD_SCALE))
@@ -195,18 +197,31 @@ async function getProfileRaw(wallet) {
   return rows[0] || null;
 }
 
+function normalizeRegenPerHour(value) {
+  const rate = Number(value || 0);
+  if (!Number.isFinite(rate)) return 0;
+  return Math.abs(rate - LEGACY_REGEN_PER_HOUR) < 0.000001
+    ? BASE_REGEN_PER_HOUR
+    : rate;
+}
+
 function recomputeCurrent(b, lv) {
   const base = b || { health: 20, energyCap: 100, regenPerMin: 1 };
   const L    = lv || { health: 0,  energyCap: 0,   regenPerMin: 0 };
   return {
     health:      (base.health     | 0) + (L.health     | 0),
     energyCap:   (base.energyCap  | 0) + (L.energyCap  | 0),
-    regenPerMin: Number(base.regenPerMin || 0) + Number(L.regenPerMin || 0) * REGEN_STEP
+    regenPerMin: normalizeRegenPerHour(base.regenPerMin) + Number(L.regenPerMin || 0) * REGEN_STEP
   };
 }
 
+function currentForRow(row) {
+  const current = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
+  return { ...current, regenPerMin: normalizeRegenPerHour(current.regenPerMin) };
+}
+
 function toClient(row) {
-  const cur = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
+  const cur = currentForRow(row);
   return {
     ms:   { base: row.ms_base, level: row.ms_level, current: cur },
     pct:  { hit: row.ms_hit | 0, crit: row.ms_crit | 0, dodge: row.ms_dodge | 0 },
@@ -221,15 +236,15 @@ async function regenEnergyIfDue(wallet) {
   let row = await getProfileRaw(wallet);
   if (!row) return null;
 
-  const cur = row.ms_current || recomputeCurrent(row.ms_base, row.ms_level);
+  const cur = currentForRow(row);
   const cap = Number(cur.energyCap ?? row.energy_cap ?? 100) || 100;
-  const rpm = Number(cur.regenPerMin || 0);
-  if (rpm <= 0) return row;
+  const regenPerHour = Number(cur.regenPerMin || 0);
+  if (regenPerHour <= 0) return row;
 
   const nowS  = nowSec();
   const lastS = row.updated_at ? Math.floor(new Date(row.updated_at).getTime() / 1000) : nowS;
   const deltaS = Math.max(0, nowS - lastS);
-  const gain   = Math.floor((deltaS * rpm) / 60);
+  const gain   = Math.floor((deltaS * regenPerHour) / 3600);
   if (gain <= 0) return row;
 
   const before = row.energy | 0;

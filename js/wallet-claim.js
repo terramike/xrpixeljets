@@ -61,7 +61,28 @@ import { Signers } from './signers.js';
     return body;
   }
 
+  async function waitForClaimServer(){
+    let result = null;
+
+    try {
+      if (g.JETS_SERVER_READY) result = await g.JETS_SERVER_READY;
+      if (!result?.ok && typeof g.JETS_WAKE_SERVER === 'function') {
+        result = await g.JETS_WAKE_SERVER({ force:true });
+      }
+    } catch (error) {
+      result = { ok:false, error:String(error?.message || error) };
+    }
+
+    if (result && !result.ok) {
+      const e = new Error('server_waking');
+      e.status = 503;
+      e.body = { error:'server_waking', detail:result.error || null };
+      throw e;
+    }
+  }
+
   async function fetchClaimStart(amount, token, wallet){
+    await waitForClaimServer();
     const base = g.JETS_API_BASE || '';
     const r = await fetch(`${base}/claim/start`, {
       method:'POST',
@@ -302,6 +323,12 @@ ${res.txid ? `🔗 Transaction Hash:\n  ${fullTxHash}\n\n  View on explorer:\n  
       if (statusCode === 429 || msg.includes('rate_limited') || msg.includes('http_429')) {
         alert('⏳ Too Many Requests\n\nThe server is receiving requests too quickly.\n\nPlease wait a moment and try again.');
         hud('❌ Claim rate limited; wait a moment and try again');
+        return;
+      }
+
+      if (msg.includes('server_waking') || [502, 503, 504].includes(statusCode)) {
+        alert('Claim Server Is Waking\n\nThe payout service is starting up. Please wait a moment and try your claim again.');
+        hud('Claim server is waking; please retry shortly');
         return;
       }
       
